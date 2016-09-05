@@ -1,0 +1,18 @@
+[package]
+name = "flux"
+version = "0.1.0"
+authors = ["pzread <netfirewall@gmail.com>"]
+
+[dependencies]
+"dotenv" = "*"
+"iron" = "0.4"
+"mime" = "0.2"
+"persistent" = "0.2"
+"r2d2" = "0.7"
+"r2d2_redis" = { git = "https://github.com/sorccu/r2d2-redis.git" }
+"rand" = "*"
+"redis" = "0.7"
+"router" = "0.3"
+"rust-crypto" = "0.2"
+"rustc-serialize" = "0.3"
+"time" = "0.1"
