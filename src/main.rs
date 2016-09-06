@@ -50,10 +50,10 @@ enum Error {
 type Result<T> = StdResult<T, Error>;
 
 const HOST: &'static str = "127.0.0.1:6000";
-const MIN_SIZE: usize = 4096;
-const MAX_SIZE: usize = 16 * 1024 * 1024;
+const ALIGN_SIZE: usize = 16384;
+const MAX_SIZE: usize = 4 * 1024 * 1024;
 const CHUNK_TIMEOUT: usize = 60;
-const LIFETIME: usize = 86400;
+const LONG_TIMEOUT: usize = 86400;
 const STATE_CONTINUE: u64 = 0;
 const STATE_EOF: u64 = 1;
 const STATE_ERR: u64 = 2;
@@ -84,45 +84,46 @@ fn require_handler(req: &mut Request) -> IronResult<Response> {
 
     let require_rskey = &format!("REQUIRE@{}", channel_hash);
     rs.set::<_, _, String>(require_rskey, &token_hash).unwrap();
-    rs.expire::<_, u64>(require_rskey, LIFETIME).unwrap();
-    rs.expire::<_, u64>(file_rskey, LIFETIME).unwrap();
+    rs.expire::<_, u64>(require_rskey, LONG_TIMEOUT).unwrap();
+    rs.expire::<_, u64>(file_rskey, LONG_TIMEOUT).unwrap();
 
     Ok(Response::with((status::Ok, channel)))
 }
 
 fn balance_chunk_size(cur_size: usize,
-                      under_size: usize,
+                      full_size: usize,
                       len: usize,
                       duration: &Duration) -> (usize, usize) {
-    enum TransPerf {
-        Balance,
-        Over,
-        Under,
-    }
+    enum TransPerf { Balance, Over, Under }
 
     let perf = if duration > &Duration::seconds(2) {
         TransPerf::Over
     } else {
-        let delta = cur_size - len;
-        if delta > MIN_SIZE {
-            TransPerf::Over
-        } else if delta == 0 {
-            TransPerf::Under
-        } else {
-            TransPerf::Balance
+        match cur_size - len {
+            0 => TransPerf::Under,
+            delta if delta >= ALIGN_SIZE => TransPerf::Over,
+            _ => TransPerf::Balance
         }
     };
 
-    match perf {
-        TransPerf::Balance => (cur_size, under_size),
-        TransPerf::Over => cmp::max((MIN_SIZE, MIN_SIZE),
-                                    if cur_size == under_size {
-                                        (under_size / 2, under_size / 2)
-                                    } else {
-                                        ((cur_size + under_size) / 2, under_size)
-                                    }),
-        TransPerf::Under => (cmp::min(MAX_SIZE, cur_size * 2), cur_size),
-    }
+    let align_level = (len + ALIGN_SIZE - 1) / ALIGN_SIZE;
+    let cur_level = (cur_size + ALIGN_SIZE - 1) / ALIGN_SIZE;
+    let full_level = (full_size + ALIGN_SIZE - 1) / ALIGN_SIZE;
+
+    let (next_level, next_full_level) = match perf {
+        TransPerf::Balance => (cur_level, full_level),
+        TransPerf::Over => {
+            if align_level < full_level {
+                (full_level, full_level / 2)
+            } else {
+                ((cur_level + full_level) / 2, full_level)
+            }
+        },
+        TransPerf::Under => (cur_level * 2, cur_level),
+    };
+
+    let next_balance = (next_level * ALIGN_SIZE, next_full_level * ALIGN_SIZE);
+    cmp::max((ALIGN_SIZE, ALIGN_SIZE), cmp::min((MAX_SIZE, MAX_SIZE), next_balance))
 }
 
 fn retrieve_token_hash(rs: &RedisConn, channel_hash: &str) -> Option<String> {
@@ -165,8 +166,8 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
     let send_rskey = format!("SEND@{}", channel_hash);
     let recv_rskey = format!("RECV@{}", channel_hash);
     let mut buf = Vec::<u8>::new();
-    let mut under_size = MIN_SIZE;
-    buf.resize(MIN_SIZE, 0);
+    let mut full_size = ALIGN_SIZE;
+    buf.resize(ALIGN_SIZE, 0);
 
     for index in 0.. {
         // Start time measurement.
@@ -174,7 +175,7 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
 
         let result = read_from_request(req, &mut buf)
             .and_then(|read_len| {
-                let timeout = match index { 0 => LIFETIME, _ => CHUNK_TIMEOUT };
+                let timeout = match index { 0 => LONG_TIMEOUT, _ => CHUNK_TIMEOUT };
                 rs.brpop::<_, Vec<u64>>(&send_rskey, timeout).unwrap().first()
                     .ok_or(Error::Timeout)
                     .and_then(|state| {
@@ -191,7 +192,7 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                                                   CHUNK_TIMEOUT).unwrap();
                         // Ack the receiver;
                         rs.lpush::<_, u64, u64>(&recv_rskey, STATE_CONTINUE).unwrap();
-                        rs.expire::<_, u64>(&recv_rskey, LIFETIME).unwrap();
+                        rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
 
                         read_len
                     })
@@ -199,13 +200,12 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
             .map(|read_len| {
                 // End time measurement.
                 let duration = start_time.to(PreciseTime::now());
-
-                let (new_size, new_under_size) = balance_chunk_size(buf.len(),
-                                                                    under_size,
-                                                                    read_len,
-                                                                    &duration);
-                under_size = new_under_size;
-                buf.resize(new_size, 0);
+                let (next_size, next_full_size) = balance_chunk_size(buf.len(),
+                                                                     full_size,
+                                                                     read_len,
+                                                                     &duration);
+                full_size = next_full_size;
+                buf.resize(next_size, 0);
             });
 
         if let Err(err) = result {
@@ -213,14 +213,14 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                 Error::Eof => {
                     // Notify the receiver of EOF.
                     rs.lpush::<_, u64, u64>(&recv_rskey, STATE_EOF).unwrap();
-                    rs.expire::<_, u64>(&recv_rskey, LIFETIME).unwrap();
+                    rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
                     Ok(Response::with((status::Ok, "ok")))
                 },
                 Error::Timeout => Ok(Response::with(status::InternalServerError)),
                 Error::Other => {
                     // Notify the receiver of error.
                     rs.lpush::<_, u64, u64>(&recv_rskey, STATE_ERR).unwrap();
-                    rs.expire::<_, u64>(&recv_rskey, LIFETIME).unwrap();
+                    rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
                     Ok(Response::with(status::InternalServerError))
                 },
             };
@@ -243,7 +243,7 @@ impl WriteBody for PullWriter {
         // Notify the sender.
         for _ in 0..3 {
             rs.lpush::<_, u64, u64>(send_rskey, STATE_CONTINUE).unwrap();
-            rs.expire::<_, u64>(send_rskey, LIFETIME).unwrap();
+            rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
         }
 
         for index in 0.. {
@@ -268,7 +268,7 @@ impl WriteBody for PullWriter {
                 .map(|_| {
                     // Ack the sender;
                     rs.lpush::<_, _, u64>(send_rskey, STATE_CONTINUE).unwrap();
-                    rs.expire::<_, u64>(send_rskey, LIFETIME).unwrap();
+                    rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
                 });
 
             if let Err(err) = result {
@@ -278,7 +278,7 @@ impl WriteBody for PullWriter {
                     Error::Other => {
                         // Notify the sender of error.
                         rs.lpush::<_, _, u64>(send_rskey, STATE_ERR).unwrap();
-                        rs.expire::<_, u64>(send_rskey, LIFETIME).unwrap();
+                        rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
                         Err(IoError::new(IoErrorKind::BrokenPipe, "error"))
                     },
                 };
