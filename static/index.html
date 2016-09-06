@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Flux</title>
+<link rel="stylesheet" type="text/css" href="index.css">
+<script
+    src="http://code.jquery.com/jquery-3.1.0.min.js"
+    integrity="sha256-cCueBR6CsyA4/9szpPfrX3s49M9vUU5BgtiJj06wt/s="
+    crossorigin="anonymous"></script>
+<script type="text/javascript" src="hashids.min.js"></script>
+<script type="text/javascript">
+'use strict'
+
+let crypto = window.crypto || window.msCrypto;
+let hasher = new Hashids();
+
+function gen_token() {
+    let rnd = new Uint8Array(4);
+    crypto.getRandomValues(rnd);
+    return hasher.encode(Array.from(rnd));
+}
+
+function require() {
+    let defer = $.Deferred();
+    function try_require() {
+        let token = gen_token();
+        $.post("/flux/d/require/" + token).done((res) => {
+            if(res == "duplicate") {
+                try_require();
+            }
+            defer.resolve(token, res);
+        });
+    }
+    try_require();
+    return defer.promise();
+}
+
+$(document).ready(() => {
+    let j_transmit = $("#transmit");
+
+    j_transmit.click(() => {
+        if(!j_transmit.hasClass("box-plus")) {
+            return;
+        }
+        $("#file").trigger("click");
+    });
+    $("#file").change((event) => {
+        j_transmit.removeClass("box-plus");
+        j_transmit.addClass("box-spin");
+        j_transmit.find(".cont").hide();
+
+        require().done((token, channel) => {
+            let file = event.target.files[0];
+            let req = new XMLHttpRequest();
+
+            let link = location.href + "d/pull/" + token + "/" + file.name;
+            $("#link").attr("href", link);
+            $("#link").text(link);
+            $("#link").show();
+            $("#link").css("opacity", "1");
+
+            let counter = 0;
+            req.upload.onprogress = (evt) => {
+                if(evt.loaded / evt.total < 0.01) {
+                    return;
+                }
+                if(counter <= 20) {
+                    counter += 1;
+                    return;
+                }
+                if(j_transmit.hasClass("box-spin")) {
+                    $("#link").hide();
+                    j_transmit.find(".prog").show();
+                    j_transmit.removeClass("box-spin");
+                    j_transmit.css("width", "60%");
+                }
+                j_transmit.find(".prog").css("background-size",
+                        evt.loaded * 100 / evt.total + "% 100%");
+            };
+            req.onload = (evt) => {
+                $("#link").hide();
+                j_transmit.removeClass("box-spin");
+
+                let resp = req.responseText;
+                if(resp == "ok"){
+                    j_transmit.addClass("box-succ");
+                    $("#result").text(resp);
+                } else {
+                    j_transmit.addClass("box-fail");
+                    $("#result").text(resp);
+                }
+                j_transmit.css("width", "");
+                j_transmit.find(".prog").hide();
+                $("#result").css("opacity", "1");
+            }
+            req.open("POST", "/flux/d/push/" + channel, "true");
+            req.send(file);
+        });
+    });
+});
+
+</script>
+</head>
+<input id="file" type="file" class="hide" />
+<div class="item">
+    <div id="transmit" class="button box box-plus">
+        <div class="cont">Transmit</div>
+        <div class="prog hide"></div>
+    </div>
+    <a id="link"></a>
+    <div id="result"></div>
+</div>
+</body>
+</html>
