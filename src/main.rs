@@ -22,10 +22,10 @@ use rand::{Rng, OsRng};
 use redis::{Commands, FromRedisValue};
 use router::*;
 use rustc_serialize::hex::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write};
 use std::result::Result as StdResult;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 use std::{env, cmp, u64};
 
 struct RedisPool;
@@ -48,7 +48,7 @@ enum Error {
 
 type Result<T> = StdResult<T, Error>;
 
-const ALIGN_SIZE: usize = 16384;
+const MIN_SIZE: usize = 4096;
 const MAX_SIZE: usize = 4 * 1024 * 1024;
 const CHUNK_TIMEOUT: usize = 30;
 const LONG_TIMEOUT: usize = 86400;
@@ -88,40 +88,27 @@ fn require_handler(req: &mut Request) -> IronResult<Response> {
     Ok(Response::with((status::Ok, channel)))
 }
 
-fn balance_chunk_size(cur_size: usize,
-                      full_size: usize,
-                      len: usize,
-                      duration: &Duration) -> (usize, usize) {
-    enum TransPerf { Balance, Over, Under }
+fn balance_chunk_size(cur_size: usize, full_size: usize, len: usize, rate: u64) -> (usize, usize) {
+    enum TransProfile { Balance, Under, Over }
 
-    let perf = if duration > &Duration::from_secs(2) {
-        TransPerf::Over
-    } else {
-        match cur_size - len {
-            0 => TransPerf::Under,
-            delta if delta >= ALIGN_SIZE => TransPerf::Over,
-            _ => TransPerf::Balance
-        }
+    let profile =  match cur_size - len {
+        0 if rate > cur_size as u64  => TransProfile::Under,
+        delta if delta > MIN_SIZE => TransProfile::Over,
+        _ if rate < cur_size as u64 * 2 => TransProfile::Over,
+        _ => TransProfile::Balance
     };
 
-    let align_level = (len + ALIGN_SIZE - 1) / ALIGN_SIZE;
-    let cur_level = (cur_size + ALIGN_SIZE - 1) / ALIGN_SIZE;
-    let full_level = (full_size + ALIGN_SIZE - 1) / ALIGN_SIZE;
-
-    let (next_level, next_full_level) = match perf {
-        TransPerf::Balance => (cur_level, full_level),
-        TransPerf::Over => {
-            if align_level < full_level {
-                (full_level, full_level / 2)
+    match profile {
+        TransProfile::Balance => (cur_size, full_size),
+        TransProfile::Under => (cmp::min(MAX_SIZE, cur_size * 2), cur_size),
+        TransProfile::Over => {
+            if cur_size == full_size {
+                (full_size, MIN_SIZE)
             } else {
-                ((cur_level + full_level) / 2, full_level)
+                ((cur_size + full_size) / 2, full_size)
             }
         },
-        TransPerf::Under => (cur_level * 2, cur_level),
-    };
-
-    let next_balance = (next_level * ALIGN_SIZE, next_full_level * ALIGN_SIZE);
-    cmp::max((ALIGN_SIZE, ALIGN_SIZE), cmp::min((MAX_SIZE, MAX_SIZE), next_balance))
+    }
 }
 
 fn retrieve_token_hash(rs: &RedisConn, channel_hash: &str) -> Option<String> {
@@ -163,13 +150,16 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
 
     let send_rskey = format!("SEND@{}", channel_hash);
     let recv_rskey = format!("RECV@{}", channel_hash);
+    let mut rate_record = VecDeque::<(usize, Instant)>::new();
+    let mut rate_accumlator = 0u64;
+    let mut full_size = MIN_SIZE;
     let mut buf = Vec::<u8>::new();
-    let mut full_size = ALIGN_SIZE;
-    buf.resize(ALIGN_SIZE, 0);
+
+    buf.resize(MIN_SIZE, 0);
 
     for index in 0.. {
-        // Start time measurement.
-        let stopwatch = SystemTime::now();
+        // Record start time.
+        let start_instant = Instant::now();
 
         let result = read_from_request(req, &mut buf)
             .and_then(|read_len| {
@@ -180,7 +170,6 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                         if *state == STATE_CONTINUE {
                             Ok(())
                         } else {
-                            println!("stop");
                             Err(Error::Other)
                         }
                     })
@@ -189,7 +178,7 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                         rs.set_ex::<_, _, String>(chunk_rskey,
                                                   &buf[0..read_len],
                                                   CHUNK_TIMEOUT).unwrap();
-                        // Ack the receiver;
+                        // Ack the receiver.
                         rs.lpush::<_, u64, u64>(&recv_rskey, STATE_CONTINUE).unwrap();
                         rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
 
@@ -197,13 +186,28 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                     })
             })
             .map(|read_len| {
-                // End time measurement.
-                let duration = stopwatch.elapsed().unwrap();
+                // Rate measurement.
+                rate_record.push_back((read_len, start_instant));
+                rate_accumlator += read_len as u64;
+
+                let (prev_read_len, prev_instant) = rate_record.front().unwrap().clone();
+                let trust_interval = Duration::from_secs(2);
+                let rate = if rate_record.len() < 2 || prev_instant.elapsed() < trust_interval {
+                    0
+                } else {
+                    let mean_rate = rate_accumlator / prev_instant.elapsed().as_secs();
+                    if rate_record[1].1.elapsed() >= trust_interval {
+                        rate_record.pop_back().unwrap();
+                        rate_accumlator -= prev_read_len as u64;
+                    }
+                    mean_rate
+                };
 
                 let (next_size, next_full_size) = balance_chunk_size(buf.len(),
                                                                      full_size,
                                                                      read_len,
-                                                                     &duration);
+                                                                     rate);
+                println!("{} {} {} {}", read_len, buf.len(), next_size, next_full_size);
                 full_size = next_full_size;
                 buf.resize(next_size, 0);
             });
@@ -246,10 +250,8 @@ impl WriteBody for PullWriter {
         let recv_rskey = &format!("RECV@{}", self.channel);
 
         // Notify the sender.
-        for _ in 0..3 {
-            rs.lpush::<_, u64, u64>(send_rskey, STATE_CONTINUE).unwrap();
-            rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
-        }
+        rs.lpush::<_, u64, u64>(send_rskey, STATE_CONTINUE).unwrap();
+        rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
 
         for index in 0.. {
             let result = rs.brpop::<_, Vec<u64>>(recv_rskey, CHUNK_TIMEOUT).unwrap().first()
@@ -271,7 +273,7 @@ impl WriteBody for PullWriter {
                         .or_else(|err| {println!("{:?}", err); Err(Error::Other)})
                 })
                 .map(|_| {
-                    // Ack the sender;
+                    // Ack the sender.
                     rs.lpush::<_, _, u64>(send_rskey, STATE_CONTINUE).unwrap();
                     rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
                 });
