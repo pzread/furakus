@@ -11,7 +11,6 @@ extern crate redis;
 #[macro_use]
 extern crate router;
 extern crate rustc_serialize;
-extern crate time;
 
 use crypto::digest::Digest;
 use dotenv::dotenv;
@@ -26,8 +25,8 @@ use rustc_serialize::hex::*;
 use std::collections::HashMap;
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read, Write};
 use std::result::Result as StdResult;
-use std::{env, cmp};
-use time::{Duration, PreciseTime};
+use std::time::{Duration, SystemTime};
+use std::{env, cmp, u64};
 
 struct RedisPool;
 
@@ -49,10 +48,9 @@ enum Error {
 
 type Result<T> = StdResult<T, Error>;
 
-const HOST: &'static str = "127.0.0.1:6000";
 const ALIGN_SIZE: usize = 16384;
 const MAX_SIZE: usize = 4 * 1024 * 1024;
-const CHUNK_TIMEOUT: usize = 60;
+const CHUNK_TIMEOUT: usize = 30;
 const LONG_TIMEOUT: usize = 86400;
 const STATE_CONTINUE: u64 = 0;
 const STATE_EOF: u64 = 1;
@@ -96,7 +94,7 @@ fn balance_chunk_size(cur_size: usize,
                       duration: &Duration) -> (usize, usize) {
     enum TransPerf { Balance, Over, Under }
 
-    let perf = if duration > &Duration::seconds(2) {
+    let perf = if duration > &Duration::from_secs(2) {
         TransPerf::Over
     } else {
         match cur_size - len {
@@ -171,7 +169,7 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
 
     for index in 0.. {
         // Start time measurement.
-        let start_time = PreciseTime::now();
+        let stopwatch = SystemTime::now();
 
         let result = read_from_request(req, &mut buf)
             .and_then(|read_len| {
@@ -182,6 +180,7 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                         if *state == STATE_CONTINUE {
                             Ok(())
                         } else {
+                            println!("stop");
                             Err(Error::Other)
                         }
                     })
@@ -199,7 +198,8 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
             })
             .map(|read_len| {
                 // End time measurement.
-                let duration = start_time.to(PreciseTime::now());
+                let duration = stopwatch.elapsed().unwrap();
+
                 let (next_size, next_full_size) = balance_chunk_size(buf.len(),
                                                                      full_size,
                                                                      read_len,
@@ -209,6 +209,11 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
             });
 
         if let Err(err) = result {
+            match err {
+                Error::Eof => println!("eof"),
+                Error::Timeout => println!("timeout"),
+                Error::Other => println!("other"),
+            }
             return match err {
                 Error::Eof => {
                     // Notify the receiver of EOF.
@@ -263,7 +268,7 @@ impl WriteBody for PullWriter {
 
                     res.write_all(&mut buf)
                         .and(Ok(()))
-                        .or(Err(Error::Other))
+                        .or_else(|err| {println!("{:?}", err); Err(Error::Other)})
                 })
                 .map(|_| {
                     // Ack the sender;
@@ -272,6 +277,12 @@ impl WriteBody for PullWriter {
                 });
 
             if let Err(err) = result {
+                match err {
+                    Error::Eof => println!("reof"),
+                    Error::Timeout => println!("rtimeout"),
+                    Error::Other => println!("rother"),
+                }
+
                 return match err {
                     Error::Eof => Ok(()),
                     Error::Timeout => Err(IoError::new(IoErrorKind::TimedOut, "timeout")),
@@ -313,34 +324,39 @@ fn pull_handler(req: &mut Request) -> IronResult<Response> {
 
     let channel_hash = String::from_redis_value(metadata.get("channel").unwrap()).unwrap();
     let total_size = u64::from_redis_value(metadata.get("size").unwrap()).unwrap();
+
     let writer: Box<WriteBody> = Box::new(PullWriter {
         redis: (&*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
         channel: channel_hash,
     });
     let mut resp = Response::with((status::Ok, mime!(Application/OctetStream), writer));
-
     if total_size > 0 {
         resp.headers.set(headers::ContentLength(total_size));
     }
-
     Ok(resp)
 }
 
 fn main() {
     dotenv().ok();
 
+    let host: &str = &env::var("SERVER").expect("SERVER must be set");
+
     let redis_pool = {
-        let redis_url = env::var("REDIS_URL").expect("Redis URL must be set");
-        let manager = RedisConnectionManager::new(&*redis_url).unwrap();
+        let redis_url: &str = &env::var("REDIS_URL").expect("REDIS_URL must be set");
+        let manager = RedisConnectionManager::new(redis_url).unwrap();
         r2d2::Pool::new(Default::default(), manager).expect("Redis connection error")
     };
 
     let router = router!(require: post "/require/:token" => require_handler,
                          push: post "/push/:channel" => push_handler,
-                         pull: get "/pull/:token/*" => pull_handler);
+                         pull: get "/pull/:token" => pull_handler);
 
     let mut chain = Chain::new(router);
     chain.link_before(persistent::Read::<RedisPool>::one(redis_pool));
 
-    Iron::new(chain).http(HOST).expect("Server failed to start");
+    Iron::new(chain).listen_with(host, 64, iron::Protocol::Http, Some(iron::Timeouts{
+        keep_alive: None,
+        read: Some(Duration::from_secs(CHUNK_TIMEOUT as u64)),
+        write: Some(Duration::from_secs(CHUNK_TIMEOUT as u64)),
+    })).expect("Server failed to start");
 }

@@ -24,7 +24,7 @@ function require() {
     let defer = $.Deferred();
     function try_require() {
         let token = gen_token();
-        $.post("/flux/d/require/" + token).done((res) => {
+        $.post("require/" + token).done((res) => {
             if(res == "duplicate") {
                 try_require();
             }
@@ -53,7 +53,7 @@ $(document).ready(() => {
             let file = event.target.files[0];
             let req = new XMLHttpRequest();
 
-            let link = location.href + "d/pull/" + token + "/" + file.name;
+            let link = location.href + "pull/" + token + "/" + file.name;
             $("#link").attr("href", link);
             $("#link").text(link);
             $("#link").show();
@@ -93,7 +93,7 @@ $(document).ready(() => {
                 j_transmit.find(".prog").hide();
                 $("#result").css("opacity", "1");
             }
-            req.open("POST", "/flux/d/push/" + channel, "true");
+            req.open("POST", "push/" + channel, "true");
             req.send(file);
         });
     });
