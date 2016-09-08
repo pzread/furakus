@@ -15,7 +15,7 @@ let crypto = window.crypto || window.msCrypto;
 let hasher = new Hashids();
 
 function gen_token() {
-    let rnd = new Uint8Array(4);
+    let rnd = new Uint8Array(3);
     crypto.getRandomValues(rnd);
     return hasher.encode(Array.from(rnd));
 }
@@ -36,79 +36,95 @@ function require() {
 }
 
 $(document).ready(() => {
-    let j_transmit = $("#transmit");
+    function add_item() {
+        let j_item = $('div.origin').clone(true);
+        let j_transmit = j_item.find('.transmit');
+        let j_file = j_item.find('.file');
+        let j_link = j_item.find('.link')
+        let j_result = j_item.find('.result');
 
-    j_transmit.click(() => {
-        if(!j_transmit.hasClass("box-plus")) {
-            return;
-        }
-        $("#file").trigger("click");
-    });
-    $("#file").change((event) => {
-        j_transmit.removeClass("box-plus");
-        j_transmit.addClass("box-spin");
-        j_transmit.find(".cont").hide();
-
-        require().done((token, channel) => {
-            let file = event.target.files[0];
-            let req = new XMLHttpRequest();
-
-            let link = location.href + "pull/" + token + "/" + file.name;
-            $("#link").attr("href", link);
-            $("#link").text(link);
-            $("#link").show();
-            $("#link").css("opacity", "1");
-
-            let counter = 0;
-            req.upload.onprogress = (evt) => {
-                if(evt.loaded / evt.total < 0.01) {
-                    return;
-                }
-                if(counter <= 20) {
-                    counter += 1;
-                    return;
-                }
-                if(j_transmit.hasClass("box-spin")) {
-                    $("#link").hide();
-                    j_transmit.find(".prog").show();
-                    j_transmit.removeClass("box-spin");
-                    j_transmit.css("width", "60%");
-                }
-                j_transmit.find(".prog").css("background-size",
-                        evt.loaded * 100 / evt.total + "% 100%");
-            };
-            req.onload = (evt) => {
-                $("#link").hide();
-                j_transmit.removeClass("box-spin");
-
-                let resp = req.responseText;
-                if(resp == "ok"){
-                    j_transmit.addClass("box-succ");
-                    $("#result").text(resp);
-                } else {
-                    j_transmit.addClass("box-fail");
-                    $("#result").text(resp);
-                }
-                j_transmit.css("width", "");
-                j_transmit.find(".prog").hide();
-                $("#result").css("opacity", "1");
+        j_transmit.click((evt) => {
+            if(!j_transmit.hasClass("box-plus")) {
+                return;
             }
-            req.open("POST", "push/" + channel, "true");
-            req.send(file);
+            j_file.trigger("click");
         });
-    });
+        j_file.change((evt) => {
+            add_item();
+
+            j_transmit.removeClass("box-plus");
+            j_transmit.addClass("box-spin");
+            j_transmit.find(".text").hide();
+
+            require().done((token, channel) => {
+                let file = evt.target.files[0];
+                let req = new XMLHttpRequest();
+
+                let link = location.href + "pull/" + token + "/" + file.name;
+                j_link.attr("href", link);
+                j_link.text(link);
+                j_link.show();
+                j_link.css("opacity", "1");
+
+                let counter = 0;
+                req.upload.onprogress = (evt) => {
+                    if(evt.loaded / evt.total < 0.01) {
+                        return;
+                    }
+                    if(counter <= 20) {
+                        counter += 1;
+                        return;
+                    }
+                    if(j_transmit.hasClass("box-spin")) {
+                        j_link.hide();
+                        j_transmit.find(".prog").show();
+                        j_transmit.removeClass("box-spin");
+                        j_transmit.css("width", "60%");
+                    }
+                    j_transmit.find(".prog").css("background-size",
+                            evt.loaded * 100 / evt.total + "% 100%");
+                };
+                req.onload = (evt) => {
+                    j_link.hide();
+                    j_transmit.removeClass("box-spin");
+
+                    let resp = req.responseText;
+                    if(resp == "ok"){
+                        j_transmit.addClass("box-succ");
+                        j_result.text(resp);
+                    } else {
+                        j_transmit.addClass("box-fail");
+                        j_result.text(resp);
+                    }
+
+                    j_transmit.css("width", "");
+                    j_transmit.find(".prog").hide();
+                    j_result.css("opacity", "1");
+                }
+                req.open("POST", "push/" + channel, "true");
+                req.send(file);
+            });
+        });
+
+        j_item.removeClass("origin hide");
+        $("#container").append(j_item);
+    }
+
+    add_item();
 });
 
 </script>
 </head>
-<input id="file" type="file" class="hide" />
-<div class="item">
-    <div id="transmit" class="button box box-plus">
-        <div class="cont">Transmit</div>
+<body>
+<div class="origin hide item">
+    <div class="transmit button box box-plus">
+        <div class="text">Transmit</div>
         <div class="prog hide"></div>
     </div>
-    <a id="link"></a>
-    <div id="result"></div>
+    <a class="link"></a>
+    <div class="result"></div>
+    <input type="file" class="file hide" />
 </div>
+<div id="container"></div>
 </body>
 </html>

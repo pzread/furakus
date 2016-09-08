@@ -50,7 +50,7 @@ type Result<T> = StdResult<T, Error>;
 
 const MIN_SIZE: usize = 4096;
 const MAX_SIZE: usize = 4 * 1024 * 1024;
-const CHUNK_TIMEOUT: usize = 30;
+const CHUNK_TIMEOUT: usize = 60;
 const LONG_TIMEOUT: usize = 86400;
 const STATE_CONTINUE: u64 = 0;
 const STATE_EOF: u64 = 1;
@@ -92,15 +92,15 @@ fn balance_chunk_size(cur_size: usize, full_size: usize, len: usize, rate: u64) 
     enum TransProfile { Balance, Under, Over }
 
     let profile =  match cur_size - len {
-        0 if rate > cur_size as u64  => TransProfile::Under,
+        0 if (rate / 2) > cur_size as u64  => TransProfile::Under,
         delta if delta > MIN_SIZE => TransProfile::Over,
-        _ if rate < cur_size as u64 * 2 => TransProfile::Over,
+        _ if rate < cur_size as u64 => TransProfile::Over,
         _ => TransProfile::Balance
     };
 
     match profile {
         TransProfile::Balance => (cur_size, full_size),
-        TransProfile::Under => (cmp::min(MAX_SIZE, cur_size * 2), cur_size),
+        TransProfile::Under => (cmp::min(MAX_SIZE, cur_size + full_size), cur_size),
         TransProfile::Over => {
             if cur_size == full_size {
                 (full_size, MIN_SIZE)
@@ -207,17 +207,11 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                                                                      full_size,
                                                                      read_len,
                                                                      rate);
-                println!("{} {} {} {}", read_len, buf.len(), next_size, next_full_size);
                 full_size = next_full_size;
                 buf.resize(next_size, 0);
             });
 
         if let Err(err) = result {
-            match err {
-                Error::Eof => println!("eof"),
-                Error::Timeout => println!("timeout"),
-                Error::Other => println!("other"),
-            }
             return match err {
                 Error::Eof => {
                     // Notify the receiver of EOF.
@@ -225,7 +219,7 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                     rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
                     Ok(Response::with((status::Ok, "ok")))
                 },
-                Error::Timeout => Ok(Response::with(status::InternalServerError)),
+                Error::Timeout => Ok(Response::with((status::Ok, "timeout"))),
                 Error::Other => {
                     // Notify the receiver of error.
                     rs.lpush::<_, u64, u64>(&recv_rskey, STATE_ERR).unwrap();
@@ -270,7 +264,7 @@ impl WriteBody for PullWriter {
 
                     res.write_all(&mut buf)
                         .and(Ok(()))
-                        .or_else(|err| {println!("{:?}", err); Err(Error::Other)})
+                        .or(Err(Error::Other))
                 })
                 .map(|_| {
                     // Ack the sender.
@@ -279,12 +273,6 @@ impl WriteBody for PullWriter {
                 });
 
             if let Err(err) = result {
-                match err {
-                    Error::Eof => println!("reof"),
-                    Error::Timeout => println!("rtimeout"),
-                    Error::Other => println!("rother"),
-                }
-
                 return match err {
                     Error::Eof => Ok(()),
                     Error::Timeout => Err(IoError::new(IoErrorKind::TimedOut, "timeout")),
