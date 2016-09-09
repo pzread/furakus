@@ -19,7 +19,7 @@ use iron::response::{ResponseBody, WriteBody};
 use iron::{headers, status};
 use r2d2_redis::RedisConnectionManager;
 use rand::{Rng, OsRng};
-use redis::{Commands, FromRedisValue};
+use redis::{Commands, FromRedisValue, PubSub};
 use router::*;
 use rustc_serialize::hex::*;
 use std::collections::{HashMap, VecDeque};
@@ -43,6 +43,7 @@ macro_rules! redis_conn {
 enum Error {
     Eof,
     Timeout,
+    Again,
     Other,
 }
 
@@ -178,9 +179,8 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
                         rs.set_ex::<_, _, String>(chunk_rskey,
                                                   &buf[0..read_len],
                                                   CHUNK_TIMEOUT).unwrap();
-                        // Ack the receiver.
-                        rs.lpush::<_, u64, u64>(&recv_rskey, STATE_CONTINUE).unwrap();
-                        rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
+                        // Ack receivers.
+                        redis::cmd("PUBLISH").arg(&recv_rskey).arg(STATE_CONTINUE).execute(&*rs);
 
                         read_len
                     })
@@ -214,18 +214,16 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
         if let Err(err) = result {
             return match err {
                 Error::Eof => {
-                    // Notify the receiver of EOF.
-                    rs.lpush::<_, u64, u64>(&recv_rskey, STATE_EOF).unwrap();
-                    rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
+                    // Notify receivers of EOF.
+                    redis::cmd("PUBLISH").arg(&recv_rskey).arg(STATE_EOF).execute(&*rs);
                     Ok(Response::with((status::Ok, "ok")))
                 },
                 Error::Timeout => Ok(Response::with((status::Ok, "timeout"))),
-                Error::Other => {
-                    // Notify the receiver of error.
-                    rs.lpush::<_, u64, u64>(&recv_rskey, STATE_ERR).unwrap();
-                    rs.expire::<_, u64>(&recv_rskey, LONG_TIMEOUT).unwrap();
+                _ => {
+                    // Notify receivers of error.
+                    redis::cmd("PUBLISH").arg(&recv_rskey).arg(STATE_ERR).execute(&*rs);
                     Ok(Response::with(status::InternalServerError))
-                },
+                }
             };
         }
     }
@@ -237,31 +235,54 @@ struct PullWriter {
     channel: String,
 }
 
+impl PullWriter {
+    fn get_chunk(&self, rs: &RedisConn, subscriber: &PubSub, index: u64) -> Result<Vec<u8>> {
+        let chunk_rskey = &format!("CHUNK@{}@{}", self.channel, index);
+        loop {
+            let result = rs.get::<_, Option<Vec<u8>>>(chunk_rskey)
+                .or(Err(Error::Other))
+                .and_then(|ret| {
+                    if let Some(data) = ret {
+                        Ok(data)
+                    } else {
+                        subscriber.get_message()
+                            .or(Err(Error::Timeout))
+                            .and_then(|msg| {
+                                match msg.get_payload::<u64>().unwrap() {
+                                    STATE_CONTINUE => Err(Error::Again),
+                                    STATE_EOF => Err(Error::Eof),
+                                    _ => Err(Error::Other)
+                                }
+                            })
+                    }
+                });
+            match result {
+                Err(Error::Again) => (),
+                _ => return result
+            }
+        }
+    }
+}
+
 impl WriteBody for PullWriter {
     fn write_body(&mut self, res: &mut ResponseBody) -> std::io::Result<()> {
         let rs = self.redis.get().unwrap();
         let send_rskey = &format!("SEND@{}", self.channel);
         let recv_rskey = &format!("RECV@{}", self.channel);
 
+        let redis_url: &str = &env::var("REDIS_URL").unwrap();
+        let subrs = redis::Client::open(redis_url).unwrap();
+        let mut subscriber = subrs.get_pubsub().unwrap();
+        subscriber.subscribe(recv_rskey).unwrap();
+        subscriber.set_read_timeout(Some(Duration::from_secs(CHUNK_TIMEOUT as u64))).unwrap();
+
         // Notify the sender.
         rs.lpush::<_, u64, u64>(send_rskey, STATE_CONTINUE).unwrap();
         rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
 
         for index in 0.. {
-            let result = rs.brpop::<_, Vec<u64>>(recv_rskey, CHUNK_TIMEOUT).unwrap().first()
-                .ok_or(Error::Timeout)
-                .and_then(|state| {
-                    match *state {
-                        STATE_CONTINUE => Ok(()),
-                        STATE_EOF => Err(Error::Eof),
-                        _ => Err(Error::Other)
-                    }
-                })
-                .and_then(|_| {
-                    let chunk_rskey = &format!("CHUNK@{}@{}", self.channel, index);
-                    let mut buf: Vec<u8> = rs.get(chunk_rskey).unwrap();
-                    rs.del::<_, u64>(chunk_rskey).unwrap();
-
+            let result = self.get_chunk(&rs, &subscriber, index)
+                .and_then(|mut buf| {
                     res.write_all(&mut buf)
                         .and(Ok(()))
                         .or(Err(Error::Other))
@@ -276,12 +297,12 @@ impl WriteBody for PullWriter {
                 return match err {
                     Error::Eof => Ok(()),
                     Error::Timeout => Err(IoError::new(IoErrorKind::TimedOut, "timeout")),
-                    Error::Other => {
+                    _ => {
                         // Notify the sender of error.
                         rs.lpush::<_, _, u64>(send_rskey, STATE_ERR).unwrap();
                         rs.expire::<_, u64>(send_rskey, LONG_TIMEOUT).unwrap();
                         Err(IoError::new(IoErrorKind::BrokenPipe, "error"))
-                    },
+                    }
                 };
             }
         }
