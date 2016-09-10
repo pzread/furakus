@@ -135,12 +135,13 @@ class ChunkProcessor {
     }
 
     absorber_callback(evt) {
+        if (evt.data == null) {
+            return;
+        }
         if (typeof evt.data == 'number') {
             this.absorber_index = evt.data;
         } else {
-            if (evt.data != null) {
-                this.test(evt.data);
-            }
+            this.test(evt.data);
             this.absorber_index += 1;
         }
         this.absorber.postMessage(this.absorber_index);
