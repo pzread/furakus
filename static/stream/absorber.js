@@ -1,5 +1,11 @@
 'use strict'
 
+importScripts('ende.js');
+
+_init();
+
+let ende_input = _get_input_buffer();
+let ende_output = _get_output_buffer();
 let token = null;
 
 onmessage = (evt) => {
@@ -25,9 +31,14 @@ onmessage = (evt) => {
             return;
         }
 
-        let pcm = new Int16Array(resp);
+        let data = new Int8Array(resp);
+        for (let idx = 0; idx < data.length; idx++) {
+            HEAP8[ende_input + idx] = data[idx];
+        }
+        let declen = _decode(data.length);
+
         let channels = 2;
-        let samples = pcm.length / channels;
+        let samples = declen / 4 / channels;
         let buffers = new Array(channels);
 
         for (let ch = 0; ch < channels; ch++) {
@@ -37,7 +48,7 @@ onmessage = (evt) => {
         let off = 0;
         for (let idx = 0; idx < samples; idx++) {
             for (let ch = 0; ch < channels; ch++) {
-                buffers[ch][idx] = pcm[off] / 32768;
+                buffers[ch][idx] = HEAP32[ende_output / 4 + off] / 32768;
                 off++;
             }
         }

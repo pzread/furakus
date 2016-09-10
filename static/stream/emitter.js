@@ -1,32 +1,39 @@
 'use strict'
 
-let key = null;
+importScripts('ende.js');
+
+_init();
+
+let ende_input = _get_input_buffer();
+let ende_output = _get_output_buffer();
+let broadcast_key = null;
 
 onmessage = (evt) => {
-    if (key == null) {
-        key = evt.data;
+    if (broadcast_key == null) {
+        broadcast_key = evt.data;
         return;
     }
 
     let buffers = evt.data;
     let channels = buffers.length;
     let samples = buffers[0].length;
-    let data = new ArrayBuffer(
-        Int16Array.BYTES_PER_ELEMENT * samples * channels);
-    let pcm = new Int16Array(data);
     let off = 0;
     for (let idx = 0; idx < samples; idx++) {
         for (let ch = 0; ch < channels; ch++) {
-            pcm[off] = Math.min(32767, Math.floor(buffers[ch][idx] * 32768));
+            HEAP32[ende_input / 4 + off] =
+                Math.min(32767, Math.floor(buffers[ch][idx] * 32768));
             off++;
         }
     }
+
+    let enclen = _encode(samples);
+    let data = HEAP8.slice(ende_output, ende_output + enclen);
 
     let req = new XMLHttpRequest();
     req.onload = (evt) => {
         let resp = req.responseText;
         postMessage(resp);
     };
-    req.open("POST", "/pushchunk/" + key, "true");
-    req.send(data);
+    req.open("POST", "/pushchunk/" + broadcast_key, "true");
+    req.send(data.buffer);
 };

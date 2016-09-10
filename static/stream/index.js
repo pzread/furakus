@@ -17,7 +17,6 @@ function main() {
         $.post('/require/' + token + '/0').done((key) => {
             console.log(key);
 
-            let e_source = $('#source')[0];
             navigator.mediaDevices.getUserMedia({
                 audio: {
                     mandatory: {
@@ -28,6 +27,7 @@ function main() {
                     }]
                 },
             }).then((stream) => {
+                //let e_source = $('#source')[0];
                 //let source_node = audio_ctx.createMediaElementSource(e_source);
                 let source_node = audio_ctx.createMediaStreamSource(stream);
                 let chunk_processor = new ChunkProcessor(audio_ctx, token, key);
