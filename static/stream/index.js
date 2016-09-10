@@ -26,7 +26,7 @@ function main() {
                     optional: [{
                         echoCancellation: false
                     }]
-                }
+                },
             }).then((stream) => {
                 //let source_node = audio_ctx.createMediaElementSource(e_source);
                 let source_node = audio_ctx.createMediaStreamSource(stream);
