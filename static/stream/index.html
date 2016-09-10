@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <title>Test</title>
 <script
-    src="http://code.jquery.com/jquery-3.1.0.min.js"
+    src="https://code.jquery.com/jquery-3.1.0.min.js"
     integrity="sha256-cCueBR6CsyA4/9szpPfrX3s49M9vUU5BgtiJj06wt/s="
     crossorigin="anonymous"></script>
 <script type="text/javascript" src="/hashids.min.js"></script>
@@ -15,10 +15,9 @@ $(document).ready(main);
 </script>
 </head>
 <body>
-<a id="link" style="display: none;">broadcast link</a><br>
-<span id="wait" style="display: none;">buffering...</span><br>
-<audio id="source" controls="">
-    <source src="a.mp3">
-</audio>
+<div><a id="link" style="display: none;">broadcast link</a></div>
+<div id="wait" style="display: none;">buffering...</div>
+<div id="run" style="display: none;">streaming...</div>
+<audio id="source"></audio>
 </body>
 </html>

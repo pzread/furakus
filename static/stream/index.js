@@ -16,13 +16,27 @@ function main() {
         let token = gen_token();
         $.post('/require/' + token + '/0').done((key) => {
             console.log(key);
-            let e_source = $('#source')[0];
-            let source_node = audio_ctx.createMediaElementSource(e_source);
-            let chunk_processor = new ChunkProcessor(audio_ctx, token, key);
-            input(chunk_processor, source_node);
 
-            $('#link').attr('href', token);
-            $('#link').show();
+            let e_source = $('#source')[0];
+            navigator.mediaDevices.getUserMedia({
+                audio: {
+                    mandatory: {
+                        echoCancellation: false
+                    },
+                    optional: [{
+                        echoCancellation: false
+                    }]
+                }
+            }).then((stream) => {
+                //let source_node = audio_ctx.createMediaElementSource(e_source);
+                let source_node = audio_ctx.createMediaStreamSource(stream);
+                let chunk_processor = new ChunkProcessor(audio_ctx, token, key);
+                input(chunk_processor, source_node);
+
+                $('#link').attr('href', token);
+                $('#link').show();
+                $('#run').show();
+            })
         });
     } else {
         let token = parts[parts.length - 1];
@@ -47,6 +61,7 @@ function input(chunk_processor, source_node) {
     compressor_node.connect(process_node);*/
 
     source_node.connect(process_node);
+    process_node.connect(audio_ctx.destination);
 }
 
 function output(chunk_processor) {
@@ -64,8 +79,7 @@ class ChunkProcessor {
         this.interval = this.context_rate * 5;
 
         this.input_offset = 0;
-        this.input_buffer = this.audio_ctx.createBuffer(2, this.interval,
-            this.context_rate);
+        this.input_buffer = this.create_input_buffer();
         this.output_offset = this.interval;
         this.output_buffer = null;
 
@@ -84,6 +98,10 @@ class ChunkProcessor {
             this.absorber.postMessage(token);
             this.absorber.postMessage(this.absorber_index);
         }
+    }
+
+    create_input_buffer() {
+        return this.audio_ctx.createBuffer(2, this.interval, this.context_rate);
     }
 
     enqueue_chunk(buffer) {
@@ -114,7 +132,6 @@ class ChunkProcessor {
     emitter_callback(evt) {
         this.emitter_busy = false;
         this.emit_chunk();
-        console.log(evt.data);
     }
 
     absorber_callback(evt) {
@@ -150,8 +167,10 @@ class ChunkProcessor {
     dequeue_chunk() {
         if (!this.output_queue.isEmpty()) {
             $('#wait').hide();
+            $('#run').show();
             return this.output_queue.dequeue();
         } else {
+            $('#run').hide();
             $('#wait').show();
             return this.audio_ctx.createBuffer(2, this.interval,
                 this.context_rate);
@@ -162,6 +181,7 @@ class ChunkProcessor {
         for (let off = 0; off < databuf.length; ) {
             if (this.input_offset == this.interval) {
                 this.enqueue_chunk(this.input_buffer);
+                this.input_buffer = this.create_input_buffer();
                 this.input_offset = 0;
             }
             let len = Math.min(databuf.length - off,

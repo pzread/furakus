@@ -15,7 +15,6 @@ onmessage = (evt) => {
         if (req.status == 404) {
             let text = decodeURIComponent(escape(
                 String.fromCharCode.apply(null, new Uint8Array(req.response))));
-            console.log(text);
             postMessage(parseInt(text));
             return;
         }
