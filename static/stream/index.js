@@ -1,38 +1,67 @@
 'use strict'
 
+let crypto = window.crypto || window.msCrypto;
+let hasher = new Hashids();
+let audio_ctx = new AudioContext();
+
+function gen_token() {
+    let rnd = new Uint8Array(3);
+    crypto.getRandomValues(rnd);
+    return hasher.encode(Array.from(rnd));
+}
+
 function main() {
-    let e_source = $('#source')[0];
-    let audio_ctx = new AudioContext();
-    let source_node = audio_ctx.createMediaElementSource(e_source);
+    let parts = location.href.split('/');
+    if (parts[parts.length - 1] == '') {
+        let token = gen_token();
+        $.post('/require/' + token + '/0').done((key) => {
+            console.log(key);
+            let e_source = $('#source')[0];
+            let source_node = audio_ctx.createMediaElementSource(e_source);
+            let chunk_processor = new ChunkProcessor(audio_ctx, token, key);
+            input(chunk_processor, source_node);
 
-    let chunk_processor = new ChunkProcessor(audio_ctx, audio_ctx.sampleRate);
+            $('#link').attr('href', token);
+            $('#link').show();
+        });
+    } else {
+        let token = parts[parts.length - 1];
+        let chunk_processor = new ChunkProcessor(audio_ctx, token, null);
+        output(chunk_processor);
+    }
+}
 
+function input(chunk_processor, source_node) {
     let process_node = audio_ctx.createScriptProcessor(16384, 2, 2);
     process_node.onaudioprocess = (evt) => {
         chunk_processor.write_buffer(evt.inputBuffer);
     };
 
-    source_node.connect(process_node);
-    e_source.play();
+    /*let compressor_node = audio_ctx.createDynamicsCompressor();
+    console.log(compressor_node);
+    compressor_node.threshold.value = -50;
+    compressor_node.knee.value = 40;
+    compressor_node.ratio.value = 12;
+    compressor_node.attack.value = 0;
+    compressor_node.release.value = 0.25;
+    compressor_node.connect(process_node);*/
 
-    output(chunk_processor);
+    source_node.connect(process_node);
 }
 
 function output(chunk_processor) {
-    let audio_ctx = new AudioContext();
     let process_node = audio_ctx.createScriptProcessor(16384, 2, 2);
     process_node.onaudioprocess = (evt) => {
-        console.log('read chunk');
         chunk_processor.read_buffer(evt.outputBuffer);
     };
     process_node.connect(audio_ctx.destination);
 }
 
 class ChunkProcessor {
-    constructor(audio_ctx, context_rate) {
+    constructor(audio_ctx, token, key) {
         this.audio_ctx = audio_ctx;
-        this.context_rate = context_rate;
-        this.interval = context_rate * 10;
+        this.context_rate = audio_ctx.sampleRate;
+        this.interval = this.context_rate * 5;
 
         this.input_offset = 0;
         this.input_buffer = this.audio_ctx.createBuffer(2, this.interval,
@@ -42,13 +71,23 @@ class ChunkProcessor {
 
         this.input_queue = new Queue();
         this.output_queue = new Queue();
-        this.emitter = new Worker('emitter.js');
-        this.emitter_busy = false;
-        this.emitter.onmessage = (evt) => {this.emitter_callback(evt)};
+
+        if (key != null) {
+            this.emitter = new Worker('emitter.js');
+            this.emitter_busy = false;
+            this.emitter.onmessage = (evt) => {this.emitter_callback(evt)};
+            this.emitter.postMessage(key);
+        } else {
+            this.absorber = new Worker('absorber.js');
+            this.absorber_index = 0;
+            this.absorber.onmessage = (evt) => {this.absorber_callback(evt)};
+            this.absorber.postMessage(token);
+            this.absorber.postMessage(this.absorber_index);
+        }
     }
 
     enqueue_chunk(buffer) {
-        let offaud_ctx = new OfflineAudioContext(2, 44100 * 10, 44100);
+        let offaud_ctx = new OfflineAudioContext(2, 44100 * 5, 44100);
         let source = offaud_ctx.createBufferSource();
         source.connect(offaud_ctx.destination);
         source.buffer = buffer;
@@ -75,13 +114,25 @@ class ChunkProcessor {
     emitter_callback(evt) {
         this.emitter_busy = false;
         this.emit_chunk();
-        this.test(evt.data);
+        console.log(evt.data);
+    }
+
+    absorber_callback(evt) {
+        if (typeof evt.data == 'number') {
+            this.absorber_index = evt.data;
+        } else {
+            if (evt.data != null) {
+                this.test(evt.data);
+            }
+            this.absorber_index += 1;
+        }
+        this.absorber.postMessage(this.absorber_index);
     }
 
     test(data) {
-        let offaud_ctx = new OfflineAudioContext(2, this.context_rate * 10,
+        let offaud_ctx = new OfflineAudioContext(2, this.context_rate * 5,
             this.context_rate);
-        let buffer = offaud_ctx.createBuffer(2, 44100 * 10, 44100);
+        let buffer = offaud_ctx.createBuffer(2, 44100 * 5, 44100);
         let source = offaud_ctx.createBufferSource();
 
         for (let ch = 0; ch < data.length; ch++) {
@@ -92,15 +143,16 @@ class ChunkProcessor {
         source.buffer = buffer;
         source.start();
         offaud_ctx.startRendering().then((outbuf) => {
-            console.log('test');
             this.output_queue.enqueue(outbuf);
         });
     }
 
     dequeue_chunk() {
         if (!this.output_queue.isEmpty()) {
+            $('#wait').hide();
             return this.output_queue.dequeue();
         } else {
+            $('#wait').show();
             return this.audio_ctx.createBuffer(2, this.interval,
                 this.context_rate);
         }

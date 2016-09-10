@@ -24,7 +24,7 @@ function require() {
     let defer = $.Deferred();
     function try_require() {
         let token = gen_token();
-        $.post("require/" + token).done((res) => {
+        $.post("require/" + token + '/1').done((res) => {
             if(res == "duplicate") {
                 try_require();
             }

@@ -49,7 +49,7 @@ type Result<T> = StdResult<T, Error>;
 
 const MIN_SIZE: usize = 4096;
 const MAX_SIZE: usize = 4 * 1024 * 1024;
-const CHUNK_TIMEOUT: usize = 60;
+const SHORT_TIMEOUT: usize = 60;
 const LONG_TIMEOUT: usize = 86400;
 const STATE_EOF: i64 = -1;
 const STATE_ERR: i64 = -2;
@@ -70,6 +70,8 @@ fn gen_channel() -> String {
 fn require_handler(req: &mut Request) -> IronResult<Response> {
     let rs = redis_conn!(req);
     let token_hash = hash(req.extensions.get::<Router>().unwrap().find("token").unwrap());
+    let consumer = req.extensions.get::<Router>().unwrap().find("consumer").unwrap()
+        .parse::<u64>().unwrap();
     let channel = gen_channel();
     let channel_hash = hash(&channel);
     let file_rskey = &format!("FILE@{}", token_hash);
@@ -80,11 +82,10 @@ fn require_handler(req: &mut Request) -> IronResult<Response> {
     }
 
     redis::pipe()
-        .hset(file_rskey, "consumer", 1)
+        .hset(file_rskey, "consumer", consumer)
         .hset(file_rskey, "offset", 0)
-        .set(require_rskey, &token_hash)
-        .expire(require_rskey, LONG_TIMEOUT)
-        .expire(file_rskey, LONG_TIMEOUT)
+        .set_ex(require_rskey, token_hash, SHORT_TIMEOUT)
+        .expire(file_rskey, SHORT_TIMEOUT)
         .execute(rs);
 
     Ok(Response::with((status::Ok, channel)))
@@ -115,7 +116,6 @@ fn balance_chunk_size(cur_size: usize, full_size: usize, len: usize, rate: u64) 
 
 fn retrieve_token_hash(rs: &RedisConn, channel_hash: &str) -> Option<String> {
     let require_rskey = &format!("REQUIRE@{}", channel_hash);
-
     redis::pipe()
         .get(require_rskey)
         .del(require_rskey)
@@ -141,31 +141,63 @@ fn read_from_request(req: &mut Request, buf: &mut [u8]) -> Result<usize> {
 fn wait_receiver_ack(rs: &RedisConn,
                      channel_hash: &str,
                      timeout: usize,
-                     offset: u64,
+                     index: u64,
                      consumer: u64) -> Result<()> {
-    let send_rskey = format!("SEND@{}", channel_hash);
-    let mut counter: u64 = consumer;
+    if index >= 1 {
+        let old_index = index - 1;
+        let send_rskey = format!("SEND@{}", channel_hash);
+        let mut counter: u64 = consumer;
 
-    while counter > 0 {
-        let result = rs.brpop::<_, Vec<i64>>(&send_rskey, timeout).unwrap().first()
-            .ok_or(Error::Timeout)
-            .and_then(|ret| {
-                let off: i64 = *ret;
-                if off >= 0 {
-                    if (off as u64) == offset {
-                        counter -= 1;
+        while counter > 0 {
+            let result = rs.brpop::<_, Vec<i64>>(&send_rskey, timeout).unwrap().first()
+                .ok_or(Error::Timeout)
+                .and_then(|ret| {
+                    let ack: i64 = *ret;
+                    if ack >= 0 {
+                        if (ack as u64) == old_index {
+                            counter -= 1;
+                        }
+                        Ok(())
+                    } else {
+                        Err(Error::Other)
                     }
-                    Ok(())
-                } else {
-                    Err(Error::Other)
-                }
-            });
+                });
 
-        if let Err(err) = result {
-            return Err(err);
+            if let Err(err) = result {
+                return Err(err);
+            }
         }
     }
     Ok(())
+}
+
+fn store_chunk(rs: &RedisConn,
+               token_hash: &str,
+               channel_hash: &str,
+               timeout: usize,
+               consumer: u64,
+               buf: &[u8]) -> Result<u64> {
+    let file_rskey = &format!("FILE@{}", token_hash);
+    let recv_rskey = &format!("RECV@{}", channel_hash);
+    let index = rs.hget::<_, _, u64>(file_rskey, "offset").unwrap();
+    wait_receiver_ack(rs, channel_hash, timeout, index, consumer)
+        .map(|_| {
+            let chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index);
+            redis::pipe()
+                // Store the chunk.
+                .set_ex(chunk_rskey, buf, SHORT_TIMEOUT)
+                // Update the offset.
+                .hincr(file_rskey, "offset", 1)
+                // Ack receivers.
+                .cmd("PUBLISH").arg(recv_rskey).arg(index)
+                .execute(rs);
+            if index >= 1 {
+                // Remove the out-of-date chunk.
+                let old_chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index - 1);
+                rs.del::<_, i64>(old_chunk_rskey).unwrap();
+            }
+            index
+        })
 }
 
 fn push_handler(req: &mut Request) -> IronResult<Response> {
@@ -183,20 +215,23 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
     };
 
     let file_rskey = &format!("FILE@{}", token_hash);
+    let consumer: u64 = rs.hget(file_rskey, "consumer").unwrap();
+    if consumer == 0 {
+        // Consumer must be greater than 0.
+        return Ok(Response::with(status::BadRequest))
+    }
     redis::pipe()
         // Extend file lifetime.
         .expire(file_rskey, LONG_TIMEOUT)
         // Set file size.
         .hset(file_rskey, "size", total_size)
         .execute(rs);
-    let consumer: u64 = rs.hget(file_rskey, "consumer").unwrap();
 
-    let recv_rskey = format!("RECV@{}", channel_hash);
     let mut rate_record = VecDeque::<(usize, Instant)>::new();
-    let mut rate_accumlator = 0u64;
+    let mut rate_accumlator = 0;
     let mut full_size = MIN_SIZE;
-    let mut buf = Vec::<u8>::new();
 
+    let mut buf = Vec::<u8>::new();
     buf.resize(MIN_SIZE, 0);
 
     for index in 0.. {
@@ -205,22 +240,9 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
 
         let result = read_from_request(req, &mut buf)
             .and_then(|read_len| {
-                let timeout = match index { 0 => LONG_TIMEOUT, _ => CHUNK_TIMEOUT };
-                wait_receiver_ack(rs, &channel_hash, timeout, index, consumer)
-                    .map(|_| {
-                        let chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index);
-                        redis::pipe()
-                            .set_ex(chunk_rskey, &buf[0..read_len], CHUNK_TIMEOUT)
-                            .hincr(file_rskey, "offset", 1)
-                            // Ack receivers.
-                            .cmd("PUBLISH").arg(&recv_rskey).arg(index)
-                            .execute(rs);
-                        if index >= 1 {
-                            let old_chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index - 1);
-                            rs.del::<_, i64>(old_chunk_rskey).unwrap();
-                        }
-                        read_len
-                    })
+                let timeout = match index { 0 => LONG_TIMEOUT, _ => SHORT_TIMEOUT };
+                store_chunk(rs, &token_hash, &channel_hash, timeout, consumer, &buf[0..read_len])
+                    .and(Ok(read_len))
             })
             .map(|read_len| {
                 // Rate measurement.
@@ -249,17 +271,18 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
             });
 
         if let Err(err) = result {
+            let recv_rskey = &format!("RECV@{}", channel_hash);
             return match err {
                 Error::Eof => {
                     // Notify receivers of EOF.
-                    redis::cmd("PUBLISH").arg(&recv_rskey).arg(STATE_EOF).execute(rs);
+                    redis::cmd("PUBLISH").arg(recv_rskey).arg(STATE_EOF).execute(rs);
                     Ok(Response::with((status::Ok, "ok")))
                 },
                 Error::Timeout => Ok(Response::with((status::Ok, "timeout"))),
                 _ => {
                     // Notify receivers of error.
-                    redis::cmd("PUBLISH").arg(&recv_rskey).arg(STATE_ERR).execute(rs);
-                    Ok(Response::with(status::InternalServerError))
+                    redis::cmd("PUBLISH").arg(recv_rskey).arg(STATE_ERR).execute(rs);
+                    Ok(Response::with((status::Ok, "error")))
                 }
             };
         }
@@ -267,9 +290,70 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
     unreachable!();
 }
 
+fn push_chunk_handler(req: &mut Request) -> IronResult<Response> {
+    let rs = redis_conn!(req);
+    let channel_hash = hash(req.extensions.get::<Router>().unwrap().find("channel").unwrap());
+
+    let token_hash = match retrieve_token_hash(&rs, &channel_hash) {
+        Some(hash) => hash,
+        None => return Ok(Response::with(status::NotFound)),
+    };
+
+    let chunk_size: usize = match req.headers.get::<headers::ContentLength>() {
+        Some(content_length) if content_length.0 <= MAX_SIZE as u64 => content_length.0,
+        None => return Ok(Response::with(status::LengthRequired)),
+        _ => return Ok(Response::with(status::BadRequest))
+    } as usize;
+
+    let file_rskey = &format!("FILE@{}", token_hash);
+    let consumer: u64 = rs.hget(file_rskey, "consumer").unwrap();
+    if consumer > 0 {
+        // Consumer must be equal to 0, for now.
+        return Ok(Response::with(status::BadRequest))
+    }
+    // Extend file lifetime.
+    rs.expire::<_, i64>(file_rskey, LONG_TIMEOUT).unwrap();
+
+    let mut buf = Vec::<u8>::new();
+    buf.resize(chunk_size, 0);
+
+    let mut read_off = 0;
+    while read_off < chunk_size {
+        match read_from_request(req, &mut buf[read_off..]) {
+            Ok(read_len) => {
+                read_off += read_len;
+            },
+            _ => break
+        }
+    }
+
+    let result = if read_off != chunk_size {
+        Err(Error::Other)
+    } else {
+        store_chunk(rs, &token_hash, &channel_hash, SHORT_TIMEOUT, consumer, &buf[0..read_off])
+    };
+
+    match result {
+        Ok(_) => {
+            // Add back the require key.
+            let require_rskey = &format!("REQUIRE@{}", channel_hash);
+            rs.set_ex::<_, _, String>(require_rskey, &token_hash, SHORT_TIMEOUT).unwrap();
+            Ok(Response::with((status::Ok, "ok")))
+        }
+        Err(Error::Timeout) => Ok(Response::with((status::Ok, "timeout"))),
+        _ => {
+            // Notify receivers of error.
+            let recv_rskey = &format!("RECV@{}", channel_hash);
+            redis::cmd("PUBLISH").arg(recv_rskey).arg(STATE_ERR).execute(rs);
+            Ok(Response::with((status::Ok, "error")))
+        }
+    }
+}
+
 struct PullWriter {
     redis_pool: r2d2::Pool<RedisConnectionManager>,
     channel: String,
+    range: Option<(u64, u64)>,
 }
 
 impl PullWriter {
@@ -286,13 +370,21 @@ impl PullWriter {
                             .or(Err(Error::Timeout))
                             .and_then(|msg| {
                                 match msg.get_payload::<i64>().unwrap() {
-                                    off if off >= 0 => Err(Error::Again),
+                                    off if off >= 0 => {
+                                        if (off as u64) > index + 1 {
+                                            Err(Error::Eof)
+                                        } else {
+                                            Err(Error::Again)
+                                        }
+                                    }
+                                    off if off == 0 => Err(Error::Other),
                                     STATE_EOF => Err(Error::Eof),
                                     _ => Err(Error::Other)
                                 }
                             })
                     }
                 });
+
             match result {
                 Err(Error::Again) => (),
                 _ => return result
@@ -311,21 +403,21 @@ impl WriteBody for PullWriter {
         let subrs = redis::Client::open(redis_url).unwrap();
         let mut subscriber = subrs.get_pubsub().unwrap();
         subscriber.subscribe(recv_rskey).unwrap();
-        subscriber.set_read_timeout(Some(Duration::from_secs(CHUNK_TIMEOUT as u64))).unwrap();
+        subscriber.set_read_timeout(Some(Duration::from_secs(SHORT_TIMEOUT as u64))).unwrap();
 
-        // Notify the sender.
-        redis::pipe()
-            .lpush(send_rskey, 0)
-            .expire(send_rskey, LONG_TIMEOUT)
-            .execute(rs);
+        let (start_index, end_index) = if let Some(range) = self.range {
+            range
+        } else {
+            (0, u64::MAX)
+        };
 
-        for index in 0.. {
+        for index in start_index..end_index {
             let result = self.get_chunk(&rs, &subscriber, index)
                 .and_then(|mut buf| {
                     // Ack the sender.
                     redis::pipe()
-                        .lpush(send_rskey, index + 1)
-                        .expire(send_rskey, LONG_TIMEOUT)
+                        .lpush(send_rskey, index)
+                        .expire(send_rskey, SHORT_TIMEOUT)
                         .execute(rs);
 
                     res.write_all(&mut buf)
@@ -341,14 +433,14 @@ impl WriteBody for PullWriter {
                         // Notify the sender of error.
                         redis::pipe()
                             .lpush(send_rskey, STATE_ERR)
-                            .expire(send_rskey, LONG_TIMEOUT)
+                            .expire(send_rskey, SHORT_TIMEOUT)
                             .execute(rs);
                         Err(IoError::new(IoErrorKind::BrokenPipe, "error"))
                     }
                 };
             }
         }
-        unreachable!();
+        Ok(())
     }
 }
 
@@ -370,8 +462,8 @@ fn pull_handler(req: &mut Request) -> IronResult<Response> {
         Some(metadata) => metadata,
         None => return Ok(Response::with(status::NotFound)),
     };
-    if u64::from_redis_value(metadata.get("consumer").unwrap()).unwrap() == 0 ||
-        u64::from_redis_value(metadata.get("offset").unwrap()).unwrap() > 0 {
+    if u64::from_redis_value(metadata.get("consumer").unwrap()).unwrap() == 0 {
+        // Consumer must be greater than 0.
         return Ok(Response::with(status::NotFound))
     }
 
@@ -381,12 +473,46 @@ fn pull_handler(req: &mut Request) -> IronResult<Response> {
     let writer: Box<WriteBody> = Box::new(PullWriter {
         redis_pool: (&*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
         channel: channel_hash,
+        range: None,
     });
     let mut resp = Response::with((status::Ok, mime!(Application/OctetStream), writer));
     if total_size > 0 {
         resp.headers.set(headers::ContentLength(total_size));
     }
     Ok(resp)
+}
+
+fn pull_chunk_handler(req: &mut Request) -> IronResult<Response> {
+    let rs = redis_conn!(req);
+    let token_hash = hash(req.extensions.get::<Router>().unwrap().find("token").unwrap());
+    let index = req.extensions.get::<Router>().unwrap().find("index").unwrap()
+        .parse::<u64>().unwrap();
+
+    let metadata = match retrieve_metadata(&rs, &token_hash) {
+        Some(metadata) => metadata,
+        None => return Ok(Response::with(status::NotFound)),
+    };
+    if u64::from_redis_value(metadata.get("consumer").unwrap()).unwrap() > 0 {
+        // Consumer must be equal to 0, for now.
+        return Ok(Response::with(status::NotFound))
+    }
+    let file_rskey = &format!("FILE@{}", token_hash);
+    let next_index: u64 = rs.hget(file_rskey, "offset").unwrap();
+    if next_index > index {
+        // Missed.
+        return Ok(Response::with((status::NotFound, next_index.to_string())))
+    }
+
+    let channel_hash = String::from_redis_value(metadata.get("channel").unwrap()).unwrap();
+
+    let writer: Box<WriteBody> = Box::new(PullWriter {
+        redis_pool: (&*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
+        channel: channel_hash,
+        range: Some((index, index + 1)),
+    });
+    Ok(Response::with((status::Ok,
+                       mime!(Application/OctetStream),
+                       writer)))
 }
 
 fn main() {
@@ -400,16 +526,18 @@ fn main() {
         r2d2::Pool::new(Default::default(), manager).expect("Redis connection error")
     };
 
-    let router = router!(require: post "/require/:token" => require_handler,
+    let router = router!(require: post "/require/:token/:consumer" => require_handler,
                          push: post "/push/:channel" => push_handler,
-                         pull: get "/pull/:token" => pull_handler);
+                         push_chunk: post "/pushchunk/:channel" => push_chunk_handler,
+                         pull: get "/pull/:token" => pull_handler,
+                         pull_chunk: get "/pullchunk/:token/:index" => pull_chunk_handler);
 
     let mut chain = Chain::new(router);
     chain.link_before(persistent::Read::<RedisPool>::one(redis_pool));
 
     Iron::new(chain).listen_with(host, 64, iron::Protocol::Http, Some(iron::Timeouts{
         keep_alive: None,
-        read: Some(Duration::from_secs(CHUNK_TIMEOUT as u64)),
-        write: Some(Duration::from_secs(CHUNK_TIMEOUT as u64)),
+        read: Some(Duration::from_secs(SHORT_TIMEOUT as u64)),
+        write: Some(Duration::from_secs(SHORT_TIMEOUT as u64)),
     })).expect("Server failed to start");
 }

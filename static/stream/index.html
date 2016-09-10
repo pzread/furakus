@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Test</title>
+<script
+    src="http://code.jquery.com/jquery-3.1.0.min.js"
+    integrity="sha256-cCueBR6CsyA4/9szpPfrX3s49M9vUU5BgtiJj06wt/s="
+    crossorigin="anonymous"></script>
+<script type="text/javascript" src="/hashids.min.js"></script>
+<script type="text/javascript" src="/Queue.js"></script>
+<script type="text/javascript" src="index.js"></script>
+<script>
+$(document).ready(main);
+</script>
+</head>
+<body>
+<a id="link" style="display: none;">broadcast link</a><br>
+<span id="wait" style="display: none;">buffering...</span><br>
+<audio id="source" controls="">
+    <source src="a.mp3">
+</audio>
+</body>
+</html>
