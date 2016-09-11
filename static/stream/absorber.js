@@ -13,7 +13,6 @@ onmessage = (evt) => {
     let token = evt.data[0];
     let index = evt.data[1];
     let req = new XMLHttpRequest();
-    req.responseType = "arraybuffer";
     req.onload = (evt) => {
         let resp = req.response;
         if (req.status == 404) {
@@ -53,5 +52,6 @@ onmessage = (evt) => {
         postMessage(buffers);
     };
     req.open("GET", "/pullchunk/" + token + "/" + index, "true");
+    req.responseType = "arraybuffer";
     req.send();
 }
