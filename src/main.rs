@@ -143,29 +143,26 @@ fn wait_receiver_ack(rs: &RedisConn,
                      timeout: usize,
                      index: u64,
                      consumer: u64) -> Result<()> {
-    if index >= 1 {
-        let old_index = index - 1;
-        let send_rskey = format!("SEND@{}", channel_hash);
-        let mut counter: u64 = consumer;
+    let send_rskey = format!("SEND@{}", channel_hash);
+    let mut counter: u64 = consumer;
 
-        while counter > 0 {
-            let result = rs.brpop::<_, Vec<i64>>(&send_rskey, timeout).unwrap().first()
-                .ok_or(Error::Timeout)
-                .and_then(|ret| {
-                    let ack: i64 = *ret;
-                    if ack >= 0 {
-                        if (ack as u64) == old_index {
-                            counter -= 1;
-                        }
-                        Ok(())
-                    } else {
-                        Err(Error::Other)
+    while counter > 0 {
+        let result = rs.brpop::<_, Vec<i64>>(&send_rskey, timeout).unwrap().first()
+            .ok_or(Error::Timeout)
+            .and_then(|ret| {
+                let ack: i64 = *ret;
+                if ack >= 0 {
+                    if (ack as u64) == index {
+                        counter -= 1;
                     }
-                });
+                    Ok(())
+                } else {
+                    Err(Error::Other)
+                }
+            });
 
-            if let Err(err) = result {
-                return Err(err);
-            }
+        if let Err(err) = result {
+            return Err(err);
         }
     }
     Ok(())
@@ -180,8 +177,15 @@ fn store_chunk(rs: &RedisConn,
     let file_rskey = &format!("FILE@{}", token_hash);
     let recv_rskey = &format!("RECV@{}", channel_hash);
     let index = rs.hget::<_, _, u64>(file_rskey, "offset").unwrap();
+
     wait_receiver_ack(rs, channel_hash, timeout, index, consumer)
         .map(|_| {
+            if index >= 1 {
+                // Remove the out-of-date chunk.
+                let old_chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index - 1);
+                rs.del::<_, i64>(old_chunk_rskey).unwrap();
+            }
+
             let chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index);
             redis::pipe()
                 // Store the chunk.
@@ -191,11 +195,7 @@ fn store_chunk(rs: &RedisConn,
                 // Ack receivers.
                 .cmd("PUBLISH").arg(recv_rskey).arg(index)
                 .execute(rs);
-            if index >= 1 {
-                // Remove the out-of-date chunk.
-                let old_chunk_rskey = &format!("CHUNK@{}@{}", channel_hash, index - 1);
-                rs.del::<_, i64>(old_chunk_rskey).unwrap();
-            }
+
             index
         })
 }
@@ -412,14 +412,14 @@ impl WriteBody for PullWriter {
         };
 
         for index in start_index..end_index {
+            // Ack the sender.
+            redis::pipe()
+                .lpush(send_rskey, index)
+                .expire(send_rskey, SHORT_TIMEOUT)
+                .execute(rs);
+
             let result = self.get_chunk(&rs, &subscriber, index)
                 .and_then(|mut buf| {
-                    // Ack the sender.
-                    redis::pipe()
-                        .lpush(send_rskey, index)
-                        .expire(send_rskey, SHORT_TIMEOUT)
-                        .execute(rs);
-
                     res.write_all(&mut buf)
                         .and(Ok(()))
                         .or(Err(Error::Other))
