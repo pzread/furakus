@@ -2,19 +2,16 @@
 
 importScripts('ende.js');
 
-_init();
-
-let ende_input = _get_input_buffer();
-let ende_output = _get_output_buffer();
-let broadcast_key = null;
+Module['_main'] = () => {
+    _init();
+    postMessage(null);
+};
 
 onmessage = (evt) => {
-    if (broadcast_key == null) {
-        broadcast_key = evt.data;
-        return;
-    }
-
-    let buffers = evt.data;
+    let ende_input = _get_input_buffer();
+    let ende_output = _get_output_buffer();
+    let castkey = evt.data[0];
+    let buffers = evt.data[1];
     let channels = buffers.length;
     let samples = buffers[0].length;
     let off = 0;
@@ -34,6 +31,6 @@ onmessage = (evt) => {
         let resp = req.responseText;
         postMessage(resp);
     };
-    req.open("POST", "/pushchunk/" + broadcast_key, "true");
+    req.open("POST", "/pushchunk/" + castkey, "true");
     req.send(data.buffer);
 };

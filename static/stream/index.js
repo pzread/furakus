@@ -31,17 +31,20 @@ function main() {
                 //let source_node = audio_ctx.createMediaElementSource(e_source);
                 let source_node = audio_ctx.createMediaStreamSource(stream);
                 let chunk_processor = new ChunkProcessor(audio_ctx, token, key);
-                input(chunk_processor, source_node);
-
-                $('#link').attr('href', token);
-                $('#link').show();
-                $('#run').show();
+                chunk_processor.init().done(() => {
+                    input(chunk_processor, source_node);
+                    $('#link').attr('href', token);
+                    $('#link').show();
+                    $('#run').show();
+                });
             })
         });
     } else {
         let token = parts[parts.length - 1];
         let chunk_processor = new ChunkProcessor(audio_ctx, token, null);
-        output(chunk_processor);
+        chunk_processor.init().done(() => {
+            output(chunk_processor);
+        });
     }
 }
 
@@ -77,27 +80,39 @@ class ChunkProcessor {
         this.audio_ctx = audio_ctx;
         this.context_rate = audio_ctx.sampleRate;
         this.interval = this.context_rate * 5;
-
         this.input_offset = 0;
         this.input_buffer = this.create_input_buffer();
         this.output_offset = this.interval;
         this.output_buffer = null;
-
         this.input_queue = new Queue();
         this.output_queue = new Queue();
+        this.token = token;
+        this.key = key;
+    }
 
-        if (key != null) {
+    init() {
+        let defer = $.Deferred();
+        if (this.key != null) {
             this.emitter = new Worker('emitter.js');
             this.emitter_busy = false;
-            this.emitter.onmessage = (evt) => {this.emitter_callback(evt)};
-            this.emitter.postMessage(key);
+            this.emitter.onmessage = () => {
+                this.emitter.onmessage = (evt) => {
+                    this.emitter_callback(evt);
+                };
+                defer.resolve();
+            };
         } else {
             this.absorber = new Worker('absorber.js');
             this.absorber_index = 0;
-            this.absorber.onmessage = (evt) => {this.absorber_callback(evt)};
-            this.absorber.postMessage(token);
-            this.absorber.postMessage(this.absorber_index);
+            this.absorber.onmessage = () => {
+                this.absorber.onmessage = (evt) => {
+                    this.absorber_callback(evt);
+                };
+                this.absorber.postMessage([this.token, this.absorber_index]);
+                defer.resolve();
+            };
         }
+        return defer.promise();
     }
 
     create_input_buffer() {
@@ -126,7 +141,7 @@ class ChunkProcessor {
             data[ch] = buffer.getChannelData(ch);
         }
         this.emitter_busy = true;
-        this.emitter.postMessage(data);
+        this.emitter.postMessage([this.key, data]);
     }
 
     emitter_callback(evt) {
@@ -144,7 +159,7 @@ class ChunkProcessor {
             this.test(evt.data);
             this.absorber_index += 1;
         }
-        this.absorber.postMessage(this.absorber_index);
+        this.absorber.postMessage([this.token, this.absorber_index]);
     }
 
     test(data) {
