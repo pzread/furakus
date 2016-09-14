@@ -1,6 +1,7 @@
 'use strict'
 
 importScripts('ende.js');
+importScripts('config.js');
 
 Module['_main'] = () => {
     _init();
@@ -31,6 +32,6 @@ onmessage = (evt) => {
         let resp = req.responseText;
         postMessage(resp);
     };
-    req.open("POST", "/pushchunk/" + castkey, "true");
+    req.open("POST", FLUX_SERVER + "/pushchunk/" + castkey, "true");
     req.send(data.buffer);
 };

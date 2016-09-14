@@ -193,7 +193,7 @@ div.item > .link, div.item > .result {
     opacity: 0;
     transition: opacity 0.1s;
     transition-delay: 0.1s;
-    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 #container {

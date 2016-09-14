@@ -10,11 +10,17 @@ function gen_token() {
     return hasher.encode(Array.from(rnd));
 }
 
+function gen_rand() {
+    let rnd = new Uint32Array(1);
+    crypto.getRandomValues(rnd);
+    return rnd[0];
+}
+
 function main() {
     let parts = location.href.split('/');
     if (parts[parts.length - 1] == '') {
         let token = gen_token();
-        $.post('/require/' + token + '/0').done((key) => {
+        $.post(FLUX_SERVER + '/require/' + token + '/0').done((key) => {
             console.log(key);
 
             navigator.mediaDevices.getUserMedia({
@@ -27,8 +33,6 @@ function main() {
                     }]
                 },
             }).then((stream) => {
-                //let e_source = $('#source')[0];
-                //let source_node = audio_ctx.createMediaElementSource(e_source);
                 let source_node = audio_ctx.createMediaStreamSource(stream);
                 let chunk_processor = new ChunkProcessor(audio_ctx, token, key);
                 chunk_processor.init().done(() => {
@@ -84,8 +88,8 @@ class ChunkProcessor {
         this.input_buffer = this.create_input_buffer();
         this.output_offset = this.interval;
         this.output_buffer = null;
-        this.input_queue = new Queue();
-        this.output_queue = new Queue();
+        this.input_queue = new queue();
+        this.output_queue = new queue();
         this.token = token;
         this.key = key;
     }
@@ -103,7 +107,7 @@ class ChunkProcessor {
             };
         } else {
             this.absorber = new Worker('absorber.js');
-            this.absorber_index = 0;
+            this.absorber_index = 4294967295 - (gen_rand() % 1000000);
             this.absorber.onmessage = () => {
                 this.absorber.onmessage = (evt) => {
                     this.absorber_callback(evt);
@@ -126,16 +130,16 @@ class ChunkProcessor {
         source.buffer = buffer;
         source.start();
         offaud_ctx.startRendering().then((outbuf) => {
-            this.input_queue.enqueue(outbuf);
+            this.input_queue.push(outbuf);
             this.emit_chunk();
         });
     }
 
     emit_chunk() {
-        if (this.emitter_busy || this.input_queue.isEmpty()) {
+        if (this.emitter_busy || this.input_queue.empty()) {
             return;
         }
-        let buffer = this.input_queue.dequeue();
+        let buffer = this.input_queue.pop();
         let data = new Array(buffer.numberOfChannels);
         for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
             data[ch] = buffer.getChannelData(ch);
@@ -156,13 +160,13 @@ class ChunkProcessor {
         if (typeof evt.data == 'number') {
             this.absorber_index = evt.data;
         } else {
-            this.test(evt.data);
+            this.absorb_chunk(evt.data);
             this.absorber_index += 1;
         }
         this.absorber.postMessage([this.token, this.absorber_index]);
     }
 
-    test(data) {
+    absorb_chunk(data) {
         let offaud_ctx = new OfflineAudioContext(2, this.context_rate * 5,
             this.context_rate);
         let buffer = offaud_ctx.createBuffer(2, 44100 * 5, 44100);
@@ -176,15 +180,15 @@ class ChunkProcessor {
         source.buffer = buffer;
         source.start();
         offaud_ctx.startRendering().then((outbuf) => {
-            this.output_queue.enqueue(outbuf);
+            this.output_queue.push(outbuf);
         });
     }
 
     dequeue_chunk() {
-        if (!this.output_queue.isEmpty()) {
+        if (!this.output_queue.empty()) {
             $('#wait').hide();
             $('#run').show();
-            return this.output_queue.dequeue();
+            return this.output_queue.pop();
         } else {
             $('#run').hide();
             $('#wait').show();

@@ -49,7 +49,8 @@ type Result<T> = StdResult<T, Error>;
 
 const MIN_SIZE: usize = 4096;
 const MAX_SIZE: usize = 4 * 1024 * 1024;
-const SHORT_TIMEOUT: usize = 60;
+const FIXED_SIZE: usize = 2 * 1024 * 1024;
+const SHORT_TIMEOUT: usize = 30;
 const LONG_TIMEOUT: usize = 86400;
 const STATE_EOF: i64 = -1;
 const STATE_ERR: i64 = -2;
@@ -274,14 +275,21 @@ fn push_handler(req: &mut Request) -> IronResult<Response> {
             let recv_rskey = &format!("RECV@{}", channel_hash);
             return match err {
                 Error::Eof => {
-                    // Notify receivers of EOF.
-                    redis::cmd("PUBLISH").arg(recv_rskey).arg(STATE_EOF).execute(rs);
+                    redis::pipe()
+                        // Notify receivers of EOF.
+                        .cmd("PUBLISH").arg(recv_rskey).arg(STATE_EOF)
+                        // Clean.
+                        .expire(file_rskey, SHORT_TIMEOUT)
+                        .execute(rs);
                     Ok(Response::with((status::Ok, "ok")))
                 },
-                Error::Timeout => Ok(Response::with((status::Ok, "timeout"))),
                 _ => {
-                    // Notify receivers of error.
-                    redis::cmd("PUBLISH").arg(recv_rskey).arg(STATE_ERR).execute(rs);
+                    redis::pipe()
+                        // Notify receivers of error.
+                        .cmd("PUBLISH").arg(recv_rskey).arg(STATE_ERR)
+                        // Clean.
+                        .del(file_rskey)
+                        .execute(rs);
                     Ok(Response::with((status::Ok, "error")))
                 }
             };
@@ -300,7 +308,7 @@ fn push_chunk_handler(req: &mut Request) -> IronResult<Response> {
     };
 
     let chunk_size: usize = match req.headers.get::<headers::ContentLength>() {
-        Some(content_length) if content_length.0 <= MAX_SIZE as u64 => content_length.0,
+        Some(content_length) if content_length.0 <= FIXED_SIZE as u64 => content_length.0,
         None => return Ok(Response::with(status::LengthRequired)),
         _ => return Ok(Response::with(status::BadRequest))
     } as usize;
@@ -371,13 +379,12 @@ impl PullWriter {
                             .and_then(|msg| {
                                 match msg.get_payload::<i64>().unwrap() {
                                     off if off >= 0 => {
-                                        if (off as u64) > index + 1 {
+                                        if (off as u64) > index {
                                             Err(Error::Eof)
                                         } else {
                                             Err(Error::Again)
                                         }
                                     }
-                                    off if off == 0 => Err(Error::Other),
                                     STATE_EOF => Err(Error::Eof),
                                     _ => Err(Error::Other)
                                 }
@@ -395,7 +402,7 @@ impl PullWriter {
 
 impl WriteBody for PullWriter {
     fn write_body(&mut self, res: &mut ResponseBody) -> std::io::Result<()> {
-        let rs = &*self.redis_pool.get().unwrap();
+        let rs: &RedisConn = &self.redis_pool.get().unwrap();
         let send_rskey = &format!("SEND@{}", self.channel);
         let recv_rskey = &format!("RECV@{}", self.channel);
 
@@ -471,7 +478,7 @@ fn pull_handler(req: &mut Request) -> IronResult<Response> {
     let total_size = u64::from_redis_value(metadata.get("size").unwrap()).unwrap();
 
     let writer: Box<WriteBody> = Box::new(PullWriter {
-        redis_pool: (&*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
+        redis_pool: (*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
         channel: channel_hash,
         range: None,
     });
@@ -498,7 +505,7 @@ fn pull_chunk_handler(req: &mut Request) -> IronResult<Response> {
     }
     let file_rskey = &format!("FILE@{}", token_hash);
     let next_index: u64 = rs.hget(file_rskey, "offset").unwrap();
-    if next_index > index {
+    if next_index != index {
         // Missed.
         return Ok(Response::with((status::NotFound, next_index.to_string())))
     }
@@ -506,7 +513,7 @@ fn pull_chunk_handler(req: &mut Request) -> IronResult<Response> {
     let channel_hash = String::from_redis_value(metadata.get("channel").unwrap()).unwrap();
 
     let writer: Box<WriteBody> = Box::new(PullWriter {
-        redis_pool: (&*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
+        redis_pool: (*req.get::<persistent::Read<RedisPool>>().unwrap()).clone(),
         channel: channel_hash,
         range: Some((index, index + 1)),
     });

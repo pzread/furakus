@@ -3,11 +3,9 @@
 <head>
 <title>Flux</title>
 <link rel="stylesheet" type="text/css" href="index.css">
-<script
-    src="http://code.jquery.com/jquery-3.1.0.min.js"
-    integrity="sha256-cCueBR6CsyA4/9szpPfrX3s49M9vUU5BgtiJj06wt/s="
-    crossorigin="anonymous"></script>
-<script type="text/javascript" src="hashids.min.js"></script>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.1.0/jquery.min.js"></script>
+<script type="text/javascript" src="/lib/hashids.min.js"></script>
+<script type="text/javascript" src="config.js"></script>
 <script type="text/javascript">
 'use strict'
 
@@ -24,7 +22,7 @@ function require() {
     let defer = $.Deferred();
     function try_require() {
         let token = gen_token();
-        $.post("require/" + token + '/1').done((res) => {
+        $.post(FLUX_SERVER + "/require/" + token + '/1').done((res) => {
             if(res == "duplicate") {
                 try_require();
             }
@@ -60,7 +58,7 @@ $(document).ready(() => {
                 let file = evt.target.files[0];
                 let req = new XMLHttpRequest();
 
-                let link = location.href + "pull/" + token + "/" + file.name;
+                let link = FLUXCDN_SERVER + "/pull/" + token + "/" + file.name;
                 j_link.attr("href", link);
                 j_link.text(link);
                 j_link.show();
@@ -101,7 +99,7 @@ $(document).ready(() => {
                     j_transmit.find(".prog").hide();
                     j_result.css("opacity", "1");
                 }
-                req.open("POST", "push/" + channel, "true");
+                req.open("POST", FLUX_SERVER + "/push/" + channel, "true");
                 req.send(file);
             });
         });

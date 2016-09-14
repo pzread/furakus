@@ -1,6 +1,7 @@
 'use strict'
 
 importScripts('ende.js');
+importScripts('config.js');
 
 Module['_main'] = () => {
     _init();
@@ -51,7 +52,7 @@ onmessage = (evt) => {
         }
         postMessage(buffers);
     };
-    req.open("GET", "/pullchunk/" + token + "/" + index, "true");
-    req.responseType = "arraybuffer";
+    req.open('GET', FLUX_SERVER + '/pullchunk/' + token + '/' + index, true);
+    req.responseType = 'arraybuffer';
     req.send();
 }
