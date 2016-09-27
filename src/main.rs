@@ -1,3 +1,4 @@
+mod common;
 extern crate crypto;
 extern crate dotenv;
 extern crate iron;
