@@ -25,7 +25,9 @@ fn get_redis_connection(client: &RedisClient) -> RedisConn {
 fn test_create_and_get() {
     let rs = &get_redis_connection(&get_redis_client());
     flushdb!(rs);
-    let flow = Flow::new(rs);
-    Flow::get(rs, &flow.id).expect("Can't get the flow from its id.");
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024).unwrap();
+    assert_eq!(flow_a.get_max_chunksize(), 2 * 1024 * 1024);
+    let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
+    assert_eq!(flow_b.get_max_chunksize(), 2 * 1024 * 1024);
     flushdb!(rs);
 }

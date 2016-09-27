@@ -4,8 +4,10 @@ use rand::{Rng, OsRng};
 use rustc_serialize::hex::*;
 use std::{cmp, fmt, ops};
 
-// pub const SHORT_TIMEOUT: usize = 30;
-// pub const LONG_TIMEOUT: usize = 86400;
+/// Some default constants.
+pub const SHORT_TIMEOUT: usize = 30;
+pub const LONG_TIMEOUT: usize = 86400;
+pub const MAX_CHUNKSIZE: usize = 4 * 1024 * 1024;
 
 /// The `Hash` struct is the 256 bits SHA-3 hash of the string.
 ///
