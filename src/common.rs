@@ -22,7 +22,7 @@ impl Hash {
     pub fn get(data: &str) -> Hash {
         let mut hasher = crypto::sha3::Sha3::sha3_256();
         hasher.input_str(data);
-        Hash(hasher.result_str().to_owned())
+        Hash(hasher.result_str()[..32].to_owned())
     }
 }
 
@@ -43,10 +43,8 @@ impl fmt::LowerHex for Hash {
 #[test]
 fn test_hash() {
     let hash = Hash::get("hello world!");
-    assert_eq!(&*hash,
-               "9c24b06143c07224c897bac972e6e92b46cf18063f1a469ebe2f7a0966306105");
-    assert_eq!(format!("{:x}", &hash),
-               "9c24b06143c07224c897bac972e6e92b46cf18063f1a469ebe2f7a0966306105");
+    assert_eq!(&*hash, "9c24b06143c07224c897bac972e6e92b");
+    assert_eq!(format!("{:x}", &hash), "9c24b06143c07224c897bac972e6e92b");
 }
 
 /// Return a unique 256 bits identifier in hex and its `Hash`.

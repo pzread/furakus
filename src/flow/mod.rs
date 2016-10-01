@@ -17,14 +17,61 @@ use std::result::Result as StdResult;
 
 /// Always use these macros to build a redis key.
 macro_rules! rskey_flow { ($hash:expr) => { &format!("FLOW@{:x}", $hash) } }
+macro_rules! rskey_flow_chunk {
+    ($hash:expr, $index:expr) => { &format!("FLOW@{:x}@CHUNK@{}", $hash, $index) }
+}
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Error {
     /// Some arguments are illegal.
     BadArgument,
+    /// Other errors.
+    Other,
 }
 
 pub type Result<T> = StdResult<T, Error>;
+
+lazy_static! {
+    /// The redis script for acquiring and inserting a chunk, and set its provider.
+    ///
+    /// Arguments:
+    /// +. KEYS[1] is the redis key of the flow.
+    /// +. ARGV[1] is the provider id.
+    /// +. ARGV[2] is the specified index. If there is no specified index, set this to -1.
+    ///
+    /// Return:
+    /// If the insertion succeeded, the index of the chunk. If the insertion failed, -1.
+    static ref ACQUIRE_CHUNK_SCRIPT: redis::Script = redis::Script::new(r"
+        local flow_rskey = KEYS[1]
+        local provider_id = ARGV[1]
+        local specific_index = tonumber(ARGV[2])
+        if specific_index == -1 then
+            local head_index = redis.call('hincrby', flow_rskey, 'head_index', 1)
+            if redis.call('hsetnx', flow_rskey .. '@CHUNK@' .. head_index,
+                          'provider_id', provider_id) ~= 1 then
+                error('collision')
+            end
+            return head_index
+        else
+            local head_index = tonumber(redis.call('hget', flow_rskey, 'head_index'))
+            if specific_index <= head_index then
+                return -1
+            end
+            if redis.call('hsetnx', flow_rskey .. '@CHUNK@' .. specific_index,
+                          'provider_id', provider_id) == 0 then
+                return -1
+            end
+            if specific_index == head_index + 1 then
+                local next_index = head_index + 2
+                while redis.call('exists', flow_rskey .. '@CHUNK@' .. next_index) == 1 do
+                    next_index = next_index + 1
+                end
+                redis.call('hset', flow_rskey, 'head_index', next_index - 1)
+            end
+            return specific_index
+        end
+    ");
+}
 
 /// The struct represents the flow.
 pub struct Flow<'a> {
@@ -44,7 +91,7 @@ impl<'a> Flow<'a> {
         let (id, id_hash) = generate_identifier();
         let flow_rskey = rskey_flow!(id_hash);
         redis::pipe()
-            .hset(flow_rskey, "next_index", 0)
+            .hset(flow_rskey, "head_index", -1)
             .hset(flow_rskey, "tail_index", 0)
             .hset(flow_rskey, "max_chunksize", max_chunksize)
             .expire(flow_rskey, LONG_TIMEOUT)
@@ -88,7 +135,30 @@ impl<'a> Flow<'a> {
         if data.len() > self.max_chunksize || index.unwrap_or(0) < 0 {
             return Err(Error::BadArgument);
         }
-        Ok(0)
+        let flow_rskey = rskey_flow!(self.id_hash);
+        let acquire_res = ACQUIRE_CHUNK_SCRIPT
+            .key(&*flow_rskey)
+            .arg(provider_id)
+            .arg(index.unwrap_or(-1))
+            .invoke::<i64>(self.rs)
+            .or(Err(Error::Other))
+            .and_then(|index| {
+                if index < 0 {
+                    Err(Error::BadArgument)
+                } else {
+                    Ok(index)
+                }
+            });
+        let head_index = match acquire_res {
+            Ok(index) => index,
+            Err(err) => return Err(err),
+        };
+        let flow_chunk_rskey = rskey_flow_chunk!(self.id_hash, head_index);
+        redis::pipe()
+            .hset(flow_chunk_rskey, "data", data)
+            .expire(flow_chunk_rskey, SHORT_TIMEOUT)
+            .execute(self.rs);
+        Ok(head_index)
     }
 
     /// Pull a chunk from the flow. Return the size of the chunk.
@@ -103,11 +173,7 @@ impl<'a> Flow<'a> {
     ///
     /// It doesn't guarantee that the chunk is always available even if this method reports the
     /// chunk is ready.
-    ///
-    /// Note this method needs to subscribe the redis channel. So it requires a `redis::Client`
-    /// for creating the new pubsub redis connection.
-    /// TODO We may extend the `r2d2_redis` to maintain a pubsub redis connection pool.
-    pub fn poll(&self, client: &RedisClient, index: i64, timeout: usize) -> Result<()> {
+    pub fn poll(&self, index: i64, timeout: usize) -> Result<()> {
         if index < 0 {
             return Err(Error::BadArgument);
         }
