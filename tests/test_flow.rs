@@ -1,7 +1,10 @@
 //! The tests for the `flow` module.
 //!
 //! The tests need to connect to the redis server. The environment variable `TEST_REDIS_URL` must
-//! be configured for redis server connection before running these tests.
+//! be set for redis server connection before running these tests. For example,
+//! ```
+//! TEST_REDIS_URL='redis://localhost:6379/15' cargo test
+//! ```
 
 extern crate dotenv;
 extern crate flux;

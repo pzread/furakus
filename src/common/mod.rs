@@ -2,7 +2,7 @@ use crypto::digest::Digest;
 use crypto;
 use rand::{Rng, OsRng};
 use rustc_serialize::hex::*;
-use std::{cmp, fmt, ops};
+use std::{fmt, ops};
 
 /// Some default constants.
 pub const SHORT_TIMEOUT: usize = 30;
@@ -11,10 +11,11 @@ pub const MAX_CHUNKSIZE: usize = 4 * 1024 * 1024;
 
 /// The `Hash` struct is the 256 bits SHA-3 hash of the string.
 ///
-/// It implemented the `fmt::LowerHex` trait. This is useful for formatting a redis key since the
-/// lowercase hexstring is safe for concatting with the redis key.
+/// It implemented the `fmt::LowerHex` trait. This is useful for building a redis key since the
+/// lowercase hexstring is safe for concatting with any redis key.
 ///
 /// It coerces to `&str`. It implemented equivalence relation.
+#[derive(Debug, PartialEq)]
 pub struct Hash (String);
 
 impl Hash {
@@ -39,14 +40,6 @@ impl fmt::LowerHex for Hash {
     }
 }
 
-impl cmp::PartialEq for Hash {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl cmp::Eq for Hash {}
-
 #[test]
 fn test_hash() {
     let hash = Hash::get("hello world!");
@@ -69,5 +62,5 @@ pub fn generate_identifier() -> (String, Hash) {
 #[test]
 fn test_generate_identifier() {
     let (id, id_hash) = generate_identifier();
-    assert!(Hash::get(&id) == id_hash, "hash(id) doesn't match to id_hash");
+    assert_eq!(Hash::get(&id), id_hash);
 }
