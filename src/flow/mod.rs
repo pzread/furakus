@@ -33,7 +33,9 @@ pub enum Error {
 pub type Result<T> = StdResult<T, Error>;
 
 lazy_static! {
-    /// The redis script for acquiring and inserting a chunk, and set its provider.
+    /// The redis script for acquiring and inserting a chunk, then set its provider and chunk id.
+    ///
+    /// Once the transcation finished, the chunk is ready.
     ///
     /// Arguments:
     /// +. KEYS[1]: The redis key of the flow.
@@ -53,7 +55,7 @@ lazy_static! {
         if specific_index == -1 then
             local head_index = redis.call('hincrby', flow_rskey, 'head_index', 1)
             flow_chunk_key = flow_rskey .. '@CHUNK@' .. head_index
-            if redis.call('hsetnx', flow_chunk_key, 'provider_id', provider_id) ~= 1 then
+            if redis.call('hsetnx', flow_chunk_key, 'chunk_id', chunk_id) ~= 1 then
                 error('collision')
             end
             chunk_index = head_index
@@ -63,7 +65,7 @@ lazy_static! {
             if specific_index <= head_index then
                 return -1
             end
-            if redis.call('hsetnx', flow_chunk_key, 'provider_id', provider_id) == 0 then
+            if redis.call('hsetnx', flow_chunk_key, 'chunk_id', chunk_id) == 0 then
                 return -1
             end
             if specific_index == head_index + 1 then
@@ -75,7 +77,7 @@ lazy_static! {
             end
             chunk_index = specific_index
         end
-        redis.call('hset', flow_chunk_key, 'chunk_id', chunk_id)
+        redis.call('hset', flow_chunk_key, 'provider_id', provider_id)
         return chunk_index
     ");
 }
@@ -161,7 +163,6 @@ impl<'a> Flow<'a> {
                 if index < 0 {
                     Err(Error::BadArgument)
                 } else {
-                    // Set chunk expiration.
                     self.rs.expire::<_, i64>(
                         rskey_flow_chunk!(self.id_hash, index), SHORT_TIMEOUT).unwrap();
                     Ok(index)
