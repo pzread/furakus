@@ -50,7 +50,8 @@ fn test_push_and_pop() {
     assert_eq!(flow.push("alex", None, &data), Ok(0));
     assert_eq!(flow.push("bob", None, &data), Ok(1));
     assert_eq!(flow.push("alex", Some(10), &data), Ok(10));
+    assert_eq!(flow.push("alex", Some(3), &data), Ok(3));
     assert_eq!(flow.push("alex", Some(2), &data), Ok(2));
-    assert_eq!(flow.push("bob", None, &data), Ok(3));
+    assert_eq!(flow.push("bob", None, &data), Ok(4));
     assert_eq!(flow.push("bob", Some(1), &data), Err(Error::BadArgument));
 }
