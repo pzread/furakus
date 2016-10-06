@@ -5,7 +5,7 @@ use rustc_serialize::hex::*;
 use std::{fmt, ops};
 
 /// Some default constants.
-pub const SHORT_TIMEOUT: usize = 30;
+pub const SHORT_TIMEOUT: usize = 300;
 pub const LONG_TIMEOUT: usize = 86400;
 pub const MAX_CHUNKSIZE: usize = 4 * 1024 * 1024;
 

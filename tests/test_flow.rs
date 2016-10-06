@@ -34,7 +34,7 @@ fn test_create_and_get() {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow_a = Flow::new(rs, 2 * 1024 * 1024).unwrap();
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, None).unwrap();
     assert_eq!(flow_a.get_max_chunksize(), 2 * 1024 * 1024);
     let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
     assert_eq!(flow_b.get_max_chunksize(), 2 * 1024 * 1024);
@@ -45,13 +45,36 @@ fn test_push_and_pop() {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow = Flow::new(rs, 2 * 1024 * 1024).unwrap();
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, None).unwrap();
     let data = vec![1u8; 1000];
-    assert_eq!(flow.push("alex", None, &data), Ok(0));
-    assert_eq!(flow.push("bob", None, &data), Ok(1));
-    assert_eq!(flow.push("alex", Some(10), &data), Ok(10));
-    assert_eq!(flow.push("alex", Some(3), &data), Ok(3));
-    assert_eq!(flow.push("alex", Some(2), &data), Ok(2));
-    assert_eq!(flow.push("bob", None, &data), Ok(4));
-    assert_eq!(flow.push("bob", Some(1), &data), Err(Error::BadArgument));
+    assert_eq!(flow_a.push("alex", None, &data), Ok(0));
+    assert_eq!(flow_a.push("bob", None, &data), Ok(1));
+    assert_eq!(flow_a.push("alex", Some(10), &data), Ok(10));
+    assert_eq!(flow_a.push("alex", Some(3), &data), Ok(3));
+    assert_eq!(flow_a.push("alex", Some(2), &data), Ok(2));
+    assert_eq!(flow_a.push("bob", None, &data), Ok(4));
+    assert_eq!(flow_a.push("bob", Some(1), &data), Err(Error::BadArgument));
+    assert_eq!(flow_a.push("bob", Some(-1), &data), Err(Error::BadArgument));
+
+    let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
+    let mut data = vec![0u8; 2 * 1024 * 1024];
+    assert_eq!(flow_b.pull("bob", None, &mut data), Ok((0, 1000, "alex".to_owned())));
+    assert_eq!(flow_b.pull("bob", Some(1), &mut data), Ok((1, 1000, "bob".to_owned())));
+    assert_eq!(flow_b.pull("bob", Some(-1), &mut data), Err(Error::BadArgument));
+    assert_eq!(flow_b.pull("bob", Some(1000), &mut data), Err(Error::OutOfRange));
+}
+
+#[test]
+fn test_acl() {
+    let rs = &get_redis_connection();
+    flushdb!(rs);
+
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, Some(&["alex", "ross"])).unwrap();
+    let data = vec![1u8; 1000];
+    assert_eq!(flow_a.push("alex", None, &data), Ok(0));
+
+    let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
+    let mut data = vec![0u8; 2 * 1024 * 1024];
+    assert_eq!(flow_b.pull("ross", None, &mut data), Ok((0, 1000, "alex".to_owned())));
+    assert_eq!(flow_b.pull("bob", None, &mut data), Err(Error::BadArgument));
 }
