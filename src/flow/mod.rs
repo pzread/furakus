@@ -160,6 +160,8 @@ pub struct Flow<'a> {
 
 impl<'a> Flow<'a> {
     /// Create a new `Flow`.
+    ///
+    /// If `pull_limit` is 0, the flow will be asynchronous.
     pub fn new(rs: &RedisConn, max_chunksize: usize, pull_limit: i64) -> Result<Flow> {
         if max_chunksize == 0 ||  max_chunksize > MAX_CHUNKSIZE || pull_limit < 0 {
             return Err(Error::BadArgument);
