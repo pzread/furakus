@@ -38,13 +38,36 @@ fn test_benchmark_sync(bench: &mut Bencher) {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow_a = Flow::new(rs, 4 * 1024 * 1024, Some(&["ross", "alex"])).unwrap();
+    let flow_a = Flow::new(rs, 1 * 1024 * 1024, 1).unwrap();
     let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
-    let push_data = vec![1u8; 2 * 1024 * 1024];
-    let mut pull_data = vec![0u8; 4 * 1024 * 1024];
+    let push_data = vec![1u8; 64 * 1024];
+    let mut pull_data = vec![0u8; 1 * 1024 * 1024];
 
-    assert_eq!(flow_a.push("alex", None, &push_data), Ok(0));
+    flow_a.push(None, &push_data).unwrap();
+    flow_a.push(None, &push_data).unwrap();
+    flow_a.push(None, &push_data).unwrap();
+    flow_a.push(None, &push_data).unwrap();
     bench.iter(|| {
-        assert_eq!(flow_b.pull("ross", None, &mut pull_data), Ok((0, 2 * 1024 * 1024, "alex".to_owned())));
+        let idx = flow_a.push(None, &push_data).unwrap();
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx - 4, push_data.len())));
+    });
+}
+
+#[bench]
+fn test_benchmark_async(bench: &mut Bencher) {
+    let rs = &get_redis_connection();
+    flushdb!(rs);
+
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, 0).unwrap();
+    let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
+    let push_data = vec![1u8; 64 * 1024];
+    let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+
+    flow_a.push(None, &push_data).unwrap();
+    flow_a.push(None, &push_data).unwrap();
+    flow_a.push(None, &push_data).unwrap();
+    bench.iter(|| {
+        let idx = flow_a.push(None, &push_data).unwrap();
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx - 3, push_data.len())));
     });
 }

@@ -17,9 +17,10 @@ use std::sync::{Once, ONCE_INIT};
 static FLUSHDB: Once = ONCE_INIT;
 
 /// Since the tests will be run concurrently, we only clean the test database for the first time.
+/// TODO Still be called multiple times.
 macro_rules! flushdb { ($rs:expr) => {
     FLUSHDB.call_once(|| {
-        redis::Cmd::new().arg("FLUSHDB").execute($rs)
+        // redis::Cmd::new().arg("FLUSHDB").execute($rs)
     })
 } }
 
@@ -34,47 +35,75 @@ fn test_create_and_get() {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow_a = Flow::new(rs, 2 * 1024 * 1024, None).unwrap();
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, 1).unwrap();
     assert_eq!(flow_a.get_max_chunksize(), 2 * 1024 * 1024);
     let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
     assert_eq!(flow_b.get_max_chunksize(), 2 * 1024 * 1024);
 }
 
 #[test]
-fn test_push_and_pop() {
+fn test_sync_push_and_pop() {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow_a = Flow::new(rs, 2 * 1024 * 1024, None).unwrap();
-    let data = vec![1u8; 1000];
-    assert_eq!(flow_a.push("alex", None, &data), Ok(0));
-    assert_eq!(flow_a.push("bob", None, &data), Ok(1));
-    assert_eq!(flow_a.push("alex", Some(10), &data), Ok(10));
-    assert_eq!(flow_a.push("alex", Some(3), &data), Ok(3));
-    assert_eq!(flow_a.push("alex", Some(2), &data), Ok(2));
-    assert_eq!(flow_a.push("bob", None, &data), Ok(4));
-    assert_eq!(flow_a.push("bob", Some(1), &data), Err(Error::BadArgument));
-    assert_eq!(flow_a.push("bob", Some(-1), &data), Err(Error::BadArgument));
-
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, 1).unwrap();
     let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
-    let mut data = vec![0u8; 2 * 1024 * 1024];
-    assert_eq!(flow_b.pull("bob", None, &mut data), Ok((0, 1000, "alex".to_owned())));
-    assert_eq!(flow_b.pull("bob", Some(1), &mut data), Ok((1, 1000, "bob".to_owned())));
-    assert_eq!(flow_b.pull("bob", Some(-1), &mut data), Err(Error::BadArgument));
-    assert_eq!(flow_b.pull("bob", Some(1000), &mut data), Err(Error::OutOfRange));
+    let push_data = vec![1u8; 1000];
+    let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+
+    assert_eq!(flow_a.push(None, &push_data), Ok(0));
+    assert_eq!(flow_a.push(None, &push_data), Ok(1));
+    assert_eq!(flow_a.push(Some(10), &push_data), Ok(10));
+    assert_eq!(flow_a.push(Some(3), &push_data), Ok(3));
+    assert_eq!(flow_a.push(Some(2), &push_data), Err(Error::Again));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
+    assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
+    assert_eq!(flow_a.push(Some(-1), &push_data), Err(Error::BadArgument));
+    assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
+    assert_eq!(flow_a.push(None, &push_data), Ok(4));
+    assert_eq!(flow_b.pull(Some(3), &mut pull_data), Ok((3, 1000)));
+    assert_eq!(flow_a.push(None, &push_data), Err(Error::Again));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((2, 1000)));
+    assert_eq!(flow_a.push(None, &push_data), Ok(5));
+    assert_eq!(flow_a.push(None, &push_data), Ok(6));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((4, 1000)));
+    assert_eq!(flow_b.pull(Some(-1), &mut pull_data), Err(Error::BadArgument));
+    assert_eq!(flow_b.pull(Some(1000), &mut pull_data), Err(Error::OutOfRange));
+    assert_eq!(flow_b.pull(Some(1), &mut pull_data), Err(Error::OutOfRange));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((5, 1000)));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((6, 1000)));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Again));
 }
 
 #[test]
-fn test_acl() {
+fn test_async_push_and_pop() {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow_a = Flow::new(rs, 2 * 1024 * 1024, Some(&["alex", "ross"])).unwrap();
-    let data = vec![1u8; 1000];
-    assert_eq!(flow_a.push("alex", None, &data), Ok(0));
-
+    let flow_a = Flow::new(rs, 2 * 1024 * 1024, 0).unwrap();
     let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
-    let mut data = vec![0u8; 2 * 1024 * 1024];
-    assert_eq!(flow_b.pull("ross", None, &mut data), Ok((0, 1000, "alex".to_owned())));
-    assert_eq!(flow_b.pull("bob", None, &mut data), Err(Error::BadArgument));
+    let push_data = vec![1u8; 1000];
+    let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+
+    assert_eq!(flow_a.push(None, &push_data), Ok(0));
+    assert_eq!(flow_a.push(None, &push_data), Ok(1));
+    assert_eq!(flow_a.push(Some(10), &push_data), Ok(10));
+    assert_eq!(flow_a.push(Some(3), &push_data), Ok(3));
+    assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
+    assert_eq!(flow_b.pull(Some(3), &mut pull_data), Ok((3, 1000)));
+    assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
+    assert_eq!(flow_a.push(Some(-1), &push_data), Err(Error::BadArgument));
+    assert_eq!(flow_a.push(None, &push_data), Ok(4));
+    assert_eq!(flow_b.pull(Some(2), &mut pull_data), Ok((2, 1000)));
+    assert_eq!(flow_a.push(None, &push_data), Ok(5));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((3, 1000)));
+    assert_eq!(flow_a.push(None, &push_data), Ok(6));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((4, 1000)));
+    assert_eq!(flow_b.pull(Some(-1), &mut pull_data), Err(Error::BadArgument));
+    assert_eq!(flow_b.pull(Some(1000), &mut pull_data), Err(Error::OutOfRange));
+    assert_eq!(flow_b.pull(Some(1), &mut pull_data), Err(Error::OutOfRange));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Ok((4, 1000)));
+    assert_eq!(flow_b.pull(Some(6), &mut pull_data), Ok((6, 1000)));
 }
