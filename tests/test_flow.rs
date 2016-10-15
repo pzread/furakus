@@ -17,10 +17,9 @@ use std::sync::{Once, ONCE_INIT};
 static FLUSHDB: Once = ONCE_INIT;
 
 /// Since the tests will be run concurrently, we only clean the test database for the first time.
-/// TODO Still be called multiple times.
 macro_rules! flushdb { ($rs:expr) => {
     FLUSHDB.call_once(|| {
-        // redis::Cmd::new().arg("FLUSHDB").execute($rs)
+        redis::Cmd::new().arg("FLUSHDB").execute($rs)
     })
 } }
 
@@ -60,6 +59,7 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
     assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
     assert_eq!(flow_a.push(Some(-1), &push_data), Err(Error::BadArgument));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Again));
     assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
     assert_eq!(flow_a.push(None, &push_data), Ok(4));
     assert_eq!(flow_b.pull(Some(3), &mut pull_data), Ok((3, 1000)));
@@ -74,6 +74,9 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((5, 1000)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((6, 1000)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Again));
+    assert_eq!(flow_a.push(None, &push_data), Ok(7));
+    assert_eq!(flow_a.push(None, &push_data), Ok(8));
+    assert_eq!(flow_a.push(None, &push_data), Ok(9));
 }
 
 #[test]

@@ -19,7 +19,7 @@ macro_rules! rskey_flow { ($hash:expr) => { &format!("FLOW@{:x}", $hash) } }
 macro_rules! rskey_flow_chunk {
     ($hash:expr, $index:expr) => { &format!("FLOW@{:x}@CHUNK@{}", $hash, $index) }
 }
-macro_rules! rskey_chunk_data { ($id:expr) => { &format!("CHUNK@{:x}", $id) } }
+macro_rules! rskey_chunk_data { ($id:expr) => { &format!("CHUNK@{}", $id) } }
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -56,11 +56,19 @@ lazy_static! {
         local pull_limit = tonumber(ARGV[3])
         local flow_chunk_key = nil
         local chunk_index = nil
+        local ret
+
+        ret = redis.call('hmget', flow_key, 'tail_index', 'head_index')
+        local tail_index = tonumber(ret[1])
+        local head_index = tonumber(ret[2])
 
         if tonumber(redis.call('hget', flow_key, 'avail_chunk')) <= 0 then
-            local tail_index = redis.call('hget', flow_key, 'tail_index')
+            -- Try slow recycling.
+            if tail_index > head_index then
+                return -2
+            end
             local tail_flow_chunk_key = flow_key .. '@CHUNK@' .. tail_index
-            local ret = redis.call('hmget', tail_flow_chunk_key, 'pull_count', 'chunk_id')
+            ret = redis.call('hmget', tail_flow_chunk_key, 'pull_count', 'chunk_id')
             if tonumber(ret[1]) < pull_limit then
                 return -2
             end
@@ -70,14 +78,13 @@ lazy_static! {
         end
 
         if specific_index == -1 then
-            local head_index = redis.call('hincrby', flow_key, 'head_index', 1)
-            flow_chunk_key = flow_key .. '@CHUNK@' .. head_index
+            local next_index = redis.call('hincrby', flow_key, 'head_index', 1)
+            flow_chunk_key = flow_key .. '@CHUNK@' .. next_index
             if redis.call('hsetnx', flow_chunk_key, 'chunk_id', chunk_id) ~= 1 then
                 error('collision')
             end
-            chunk_index = head_index
+            chunk_index = next_index
         else
-            local head_index = tonumber(redis.call('hget', flow_key, 'head_index'))
             flow_chunk_key = flow_key .. '@CHUNK@' .. specific_index
             if specific_index <= head_index then
                 return -1
@@ -137,8 +144,9 @@ lazy_static! {
         local flow_chunk_key = flow_key .. '@CHUNK@' .. index
         local chunk_id = redis.call('hget', flow_chunk_key, 'chunk_id')
         local removable = false
-        if redis.call('hincrby', flow_chunk_key, 'pull_count', 1) >= pull_limit then
+        if redis.call('hincrby', flow_chunk_key, 'pull_count', 1) == pull_limit then
             if index == tail_index and pull_limit > 0 then
+                -- Do continuous fast recycling.
                 redis.call('del', flow_chunk_key)
                 redis.call('hincrby', flow_key, 'avail_chunk', 1)
                 redis.call('hincrby', flow_key, 'tail_index', 1)
@@ -221,11 +229,15 @@ impl<'a> Flow<'a> {
         }
 
         let flow_rskey = rskey_flow!(self.id_hash);
+        // Get the unique chunk id.
         let chunk_id: i64 = self.rs.incr("CHUNK_LAST_ID", 1).unwrap();
         let chunk_data_rskey = rskey_chunk_data!(chunk_id);
+
         // Store the chunk data first, then remove it if the insertion failed.
         // Therefore, once the insertion succeeded, the chunk will be ready.
-        self.rs.set_ex::<_, _, bool>(chunk_data_rskey, data, SHORT_TIMEOUT).unwrap();
+        if self.rs.set_nx::<_, _, i64>(chunk_data_rskey, data).unwrap() != 1 {
+            return Err(Error::Other);
+        }
 
         // Try to acquire the chunk.
         ACQUIRE_CHUNK_SCRIPT
@@ -241,7 +253,7 @@ impl<'a> Flow<'a> {
                 _ => Ok(index)
             })
             .map_err(|err| {
-                // The insertion failed, remove the chunk data.
+                // Insertion failed, remove the chunk data.
                 self.rs.del::<_, i64>(chunk_data_rskey).unwrap();
                 err
             })
@@ -252,6 +264,7 @@ impl<'a> Flow<'a> {
         if data.len() < self.max_chunksize || index.unwrap_or(0) < 0 {
             return Err(Error::BadArgument);
         }
+
         // Try to get the chunk.
         let flow_rskey = rskey_flow!(self.id_hash);
         PULL_SCRIPT
@@ -263,8 +276,8 @@ impl<'a> Flow<'a> {
             .and_then(|result| {
                 redis::from_redis_value::<(i64, i64, bool)>(&result)
                     .map_err(|_| match i64::from_redis_value(&result).unwrap() {
-                        -1 => Error::Again,
                         -2 => Error::OutOfRange,
+                        -1 => Error::Again,
                         _ => Error::Other
                     })
             })
