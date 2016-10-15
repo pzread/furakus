@@ -235,9 +235,7 @@ impl<'a> Flow<'a> {
 
         // Store the chunk data first, then remove it if the insertion failed.
         // Therefore, once the insertion succeeded, the chunk will be ready.
-        if self.rs.set_nx::<_, _, i64>(chunk_data_rskey, data).unwrap() != 1 {
-            return Err(Error::Other);
-        }
+        self.rs.set_ex::<_, _, bool>(chunk_data_rskey, data, SHORT_TIMEOUT).unwrap();
 
         // Try to acquire the chunk.
         ACQUIRE_CHUNK_SCRIPT
