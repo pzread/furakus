@@ -19,6 +19,7 @@ macro_rules! rskey_flow { ($hash:expr) => { &format!("FLOW@{:x}", $hash) } }
 macro_rules! rskey_flow_chunk {
     ($hash:expr, $index:expr) => { &format!("FLOW@{:x}@CHUNK@{}", $hash, $index) }
 }
+macro_rules! rskey_flow_avail { ($hash:expr) => { &format!("FLOW@{:x}@AVAIL", $hash) } }
 macro_rules! rskey_chunk_data { ($id:expr) => { &format!("CHUNK@{}", $id) } }
 
 #[derive(Debug, PartialEq)]
@@ -29,6 +30,8 @@ pub enum Error {
     OutOfRange,
     /// Again,
     Again,
+    /// Timeout.
+    Timeout,
     /// Other errors.
     Other,
 }
@@ -45,15 +48,19 @@ lazy_static! {
     /// +. ARGV[1]: The specified index. If there is no specified index, set this to -1.
     /// +. ARGV[2]: The chunk id.
     /// +. ARGV[3]: The pull limit.
+    /// +. ARGV[4]: Skip available process.
     ///
     /// Return:
     /// If the insertion succeeded, the index of the chunk. If the insertion failed, -1. If there
     /// is no available chunk, -2.
+    ///
+    /// TODO Eliminate reducible LPUSH and RPOP.
     static ref ACQUIRE_CHUNK_SCRIPT: redis::Script = redis::Script::new(&format!(r"
         local flow_key = KEYS[1]
         local specific_index = tonumber(ARGV[1])
         local chunk_id = tonumber(ARGV[2])
         local pull_limit = tonumber(ARGV[3])
+        local skip_avail = tonumber(ARGV[4])
         local flow_chunk_key = nil
         local chunk_index = nil
         local ret
@@ -62,19 +69,24 @@ lazy_static! {
         local tail_index = tonumber(ret[1])
         local head_index = tonumber(ret[2])
 
-        if tonumber(redis.call('hget', flow_key, 'avail_chunk')) <= 0 then
-            -- Try slow recycling.
-            if tail_index > head_index then
-                return -2
+        local flow_avail_key = flow_key .. '@AVAIL'
+        if skip_avail == 1 then
+            redis.call('rpush', flow_avail_key, 0)
+        else
+            if redis.call('llen', flow_avail_key) == 0 then
+                -- Try slow recycling.
+                if tail_index > head_index then
+                    return -2
+                end
+                local tail_flow_chunk_key = flow_key .. '@CHUNK@' .. tail_index
+                ret = redis.call('hmget', tail_flow_chunk_key, 'pull_count', 'chunk_id')
+                if tonumber(ret[1]) < pull_limit then
+                    return -2
+                end
+                redis.call('del', 'CHUNK@' .. ret[2], tail_flow_chunk_key)
+                redis.call('hincrby', flow_key, 'tail_index', 1)
+                redis.call('rpush', flow_avail_key, 0)
             end
-            local tail_flow_chunk_key = flow_key .. '@CHUNK@' .. tail_index
-            ret = redis.call('hmget', tail_flow_chunk_key, 'pull_count', 'chunk_id')
-            if tonumber(ret[1]) < pull_limit then
-                return -2
-            end
-            redis.call('del', 'CHUNK@' .. ret[2], tail_flow_chunk_key)
-            redis.call('hincrby', flow_key, 'avail_chunk', 1)
-            redis.call('hincrby', flow_key, 'tail_index', 1)
         end
 
         if specific_index == -1 then
@@ -102,9 +114,9 @@ lazy_static! {
             chunk_index = specific_index
         end
 
-        redis.call('hincrby', flow_key, 'avail_chunk', -1)
         redis.call('hset', flow_chunk_key, 'pull_count', 0)
         redis.call('expire', flow_chunk_key, {})
+        redis.call('lpop', flow_avail_key)
         return chunk_index
     ", SHORT_TIMEOUT));
 
@@ -148,8 +160,8 @@ lazy_static! {
             if index == tail_index and pull_limit > 0 then
                 -- Do continuous fast recycling.
                 redis.call('del', flow_chunk_key)
-                redis.call('hincrby', flow_key, 'avail_chunk', 1)
                 redis.call('hincrby', flow_key, 'tail_index', 1)
+                redis.call('rpush', flow_key .. '@AVAIL', 0)
                 removable = true
             end
         end
@@ -176,13 +188,15 @@ impl<'a> Flow<'a> {
         }
         let (id, id_hash) = generate_identifier();
         let flow_rskey = rskey_flow!(id_hash);
+        let flow_avail_rskey = rskey_flow_avail!(id_hash);
         redis::pipe()
             .hset(flow_rskey, "head_index", -1)
             .hset(flow_rskey, "tail_index", 0)
             .hset(flow_rskey, "max_chunksize", max_chunksize)
             .hset(flow_rskey, "pull_limit", pull_limit)
-            .hset(flow_rskey, "avail_chunk", MAX_CHUNKSIZE * 2 / max_chunksize)
             .expire(flow_rskey, LONG_TIMEOUT)
+            .lpush(flow_avail_rskey, vec![0; MAX_CHUNKSIZE * 2 / max_chunksize])
+            .expire(flow_avail_rskey, LONG_TIMEOUT)
             .execute(rs);
         Ok(Flow {
             rs: rs,
@@ -190,7 +204,7 @@ impl<'a> Flow<'a> {
             id_hash: id_hash,
             max_chunksize: max_chunksize,
             pull_limit: pull_limit,
-        })
+        } )
     }
 
     /// Get the created `Flow` from its id.
@@ -214,12 +228,28 @@ impl<'a> Flow<'a> {
                 id_hash: id_hash,
                 max_chunksize: max_chunksize,
                 pull_limit: pull_limit,
-            })
+            } )
         }
     }
 
     pub fn get_max_chunksize(&self) -> usize {
         self.max_chunksize
+    }
+
+    fn acquire_chunk(&self, index: Option<i64>, chunk_id: i64, skip_avail: bool) -> Result<i64> {
+        ACQUIRE_CHUNK_SCRIPT
+            .key(rskey_flow!(self.id_hash))
+            .arg(index.unwrap_or(-1))
+            .arg(chunk_id)
+            .arg(self.pull_limit)
+            .arg(match skip_avail { true => 1, false => 0 } )
+            .invoke::<i64>(self.rs)
+            .or(Err(Error::Other))
+            .and_then(|index| match index {
+                -2 => Err(Error::Again),
+                -1 => Err(Error::BadArgument),
+                _ => Ok(index)
+            } )
     }
 
     /// Push a chunk into the flow. Return the chunk index.
@@ -228,7 +258,6 @@ impl<'a> Flow<'a> {
             return Err(Error::BadArgument);
         }
 
-        let flow_rskey = rskey_flow!(self.id_hash);
         // Get the unique chunk id.
         let chunk_id: i64 = self.rs.incr("CHUNK_LAST_ID", 1).unwrap();
         let chunk_data_rskey = rskey_chunk_data!(chunk_id);
@@ -238,23 +267,25 @@ impl<'a> Flow<'a> {
         self.rs.set_ex::<_, _, bool>(chunk_data_rskey, data, SHORT_TIMEOUT).unwrap();
 
         // Try to acquire the chunk.
-        ACQUIRE_CHUNK_SCRIPT
-            .key(&*flow_rskey)
-            .arg(index.unwrap_or(-1))
-            .arg(chunk_id)
-            .arg(self.pull_limit)
-            .invoke::<i64>(self.rs)
-            .or(Err(Error::Other))
-            .and_then(|index| match index {
-                -2 => Err(Error::Again),
-                -1 => Err(Error::BadArgument),
-                _ => Ok(index)
-            })
-            .map_err(|err| {
+        self.acquire_chunk(index, chunk_id, false)
+            .or_else(|err| {
+                if err == Error::Again {
+                    if self.rs.blpop::<_, (String, i64)>(rskey_flow_avail!(self.id_hash),
+                                                         SHORT_TIMEOUT / 2).is_ok() {
+                        // Get an available chunk, try again.
+                        self.acquire_chunk(index, chunk_id, true)
+                    } else {
+                        Err(Error::Timeout)
+                    }
+                } else {
+                    Err(err)
+                }
+            } )
+            .or_else(|err| {
                 // Insertion failed, remove the chunk data.
                 self.rs.del::<_, i64>(chunk_data_rskey).unwrap();
-                err
-            })
+                Err(err)
+            } )
     }
 
     /// Pull a chunk from the flow. Return the chunk index and chunk size.
@@ -277,11 +308,12 @@ impl<'a> Flow<'a> {
                         -2 => Error::OutOfRange,
                         -1 => Error::Again,
                         _ => Error::Other
-                    })
-            })
+                    } )
+            } )
             .and_then(|(chunk_index, chunk_id, removable)| {
                 let chunk_data_rskey = rskey_chunk_data!(chunk_id);
                 let chunk_data: Vec<u8> = if removable {
+                    // Get the chunk data then remove it.
                     redis::pipe()
                         .get(chunk_data_rskey)
                         .del(chunk_data_rskey)
@@ -291,12 +323,12 @@ impl<'a> Flow<'a> {
                 };
                 if chunk_data.is_empty() {
                     // The chunk has been dropped.
-                    Err(Error::Other)
+                    Err(Error::Timeout)
                 } else {
                     data[..chunk_data.len()].copy_from_slice(&chunk_data);
                     Ok((chunk_index, chunk_data.len()))
                 }
-            })
+            } )
     }
 
     // /// Poll and wait for the specific indexed chunk being ready.

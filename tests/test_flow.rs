@@ -12,7 +12,8 @@ extern crate redis;
 
 use flux::flow::*;
 use redis::Connection as RedisConn;
-use std::sync::{Once, ONCE_INIT};
+use std::sync::{self, Once, ONCE_INIT};
+use std::{thread, time};
 
 static FLUSHDB: Once = ONCE_INIT;
 
@@ -20,7 +21,7 @@ static FLUSHDB: Once = ONCE_INIT;
 macro_rules! flushdb { ($rs:expr) => {
     FLUSHDB.call_once(|| {
         redis::Cmd::new().arg("FLUSHDB").execute($rs)
-    })
+    } )
 } }
 
 fn get_redis_connection() -> RedisConn {
@@ -54,7 +55,7 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_a.push(None, &push_data), Ok(1));
     assert_eq!(flow_a.push(Some(10), &push_data), Ok(10));
     assert_eq!(flow_a.push(Some(3), &push_data), Ok(3));
-    assert_eq!(flow_a.push(Some(2), &push_data), Err(Error::Again));
+    // assert_eq!(flow_a.push(Some(2), &push_data), Err(Error::Again));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
     assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
@@ -63,7 +64,7 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
     assert_eq!(flow_a.push(None, &push_data), Ok(4));
     assert_eq!(flow_b.pull(Some(3), &mut pull_data), Ok((3, 1000)));
-    assert_eq!(flow_a.push(None, &push_data), Err(Error::Again));
+    // assert_eq!(flow_a.push(None, &push_data), Err(Error::Again));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((2, 1000)));
     assert_eq!(flow_a.push(None, &push_data), Ok(5));
     assert_eq!(flow_a.push(None, &push_data), Ok(6));
@@ -109,4 +110,37 @@ fn test_async_push_and_pop() {
     assert_eq!(flow_b.pull(Some(1), &mut pull_data), Err(Error::OutOfRange));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((4, 1000)));
     assert_eq!(flow_b.pull(Some(6), &mut pull_data), Ok((6, 1000)));
+}
+
+#[test]
+fn test_sync_wait() {
+    flushdb!(&get_redis_connection());
+
+    let (tx, rx) = sync::mpsc::channel();
+
+    let a = thread::spawn(move|| {
+        let rs = &get_redis_connection();
+        let flow_a = Flow::new(rs, 2 * 1024 * 1024, 1).unwrap();
+        let push_data = vec![1u8; 1000];
+        tx.send(flow_a.id.clone()).unwrap();
+
+        assert_eq!(flow_a.push(None, &push_data), Ok((0)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((1)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((2)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((3)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((4)));
+    } );
+
+    let b = thread::spawn(move|| {
+        let rs = &get_redis_connection();
+        let flow_id: String = rx.recv().unwrap();
+        let flow_b = Flow::get(rs, &flow_id).expect("Can't get the flow from its id.");
+        let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+
+        thread::sleep(time::Duration::from_millis(1000));
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
+    } );
+
+    a.join().unwrap();
+    b.join().unwrap();
 }
