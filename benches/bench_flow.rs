@@ -16,7 +16,7 @@ extern crate redis;
 extern crate test;
 
 use flux::flow::*;
-use redis::Connection as RedisConn;
+use redis::{Connection as RedisConn, PubSub};
 use std::{sync, thread};
 use test::Bencher;
 
@@ -26,10 +26,17 @@ macro_rules! flushdb { ($rs:expr) => {
     redis::Cmd::new().arg("FLUSHDB").execute($rs)
 } }
 
-fn get_redis_connection() -> RedisConn {
+fn get_client() -> redis::Client {
     let redis_url: &str = env!("TEST_REDIS_URL");
-    let client = redis::Client::open(redis_url).unwrap();
-    client.get_connection().expect("Failed to connect to the redis server")
+    redis::Client::open(redis_url).unwrap()
+}
+
+fn get_redis_connection() -> RedisConn {
+    get_client().get_connection().expect("Failed to connect to the redis server")
+}
+
+fn get_redis_pubsub() -> PubSub {
+    get_client().get_pubsub().expect("Failed to connect to the redis server")
 }
 
 fn sync_bench(bench: &mut Bencher, chunk_size: usize) {
@@ -85,36 +92,54 @@ fn test_benchmark_async_64k(bench: &mut Bencher) {
     } );
 }
 
-// #[bench]
+#[bench]
 fn test_benchmark_sync_pipe(bench: &mut Bencher) {
     flushdb!(&get_redis_connection());
 
-    bench.iter(|| {
-        let (tx, rx) = sync::mpsc::channel();
+    let (tx, rx) = sync::mpsc::channel();
+    let (rtx, rrx) = sync::mpsc::channel();
+    let step: i64 = 128;
 
-        let a = thread::spawn(move|| {
-            let rs = &get_redis_connection();
-            let flow_a = Flow::new(rs, 2 * 1024 * 1024, 1).unwrap();
-            let push_data = vec![1u8; 64 * 1024];
-            tx.send(flow_a.id.clone()).unwrap();
+    let a = thread::spawn(move|| {
+        let rs = &get_redis_connection();
+        let flow_a = Flow::new(rs, 2 * 1024 * 1024, 1).unwrap();
+        let push_data = vec![1u8; 2 * 1024 * 1024];
+        tx.send(flow_a.id.clone()).unwrap();
 
-            for idx in 0..10000 {
+        let mut offset = 0;
+        while rrx.recv().unwrap() {
+            for idx in offset..(offset + step) {
                 assert_eq!(flow_a.push(None, &push_data), Ok((idx)));
             }
-        } );
+            offset += step;
+        }
+    } );
 
-        let b = thread::spawn(move|| {
-            let rs = &get_redis_connection();
-            let flow_id: String = rx.recv().unwrap();
-            let flow_b = Flow::get(rs, &flow_id).expect("Can't get the flow from its id.");
-            let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+    let rs = &get_redis_connection();
+    let flow_id: String = rx.recv().unwrap();
+    let flow_b = Flow::get(rs, &flow_id).expect("Can't get the flow from its id.");
+    let mut pull_data = vec![0u8; 2 * 1024 * 1024];
 
-            for idx in 0..10000 {
-                assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx, 64 * 1024)));
+    let mut offset = 0;
+    bench.iter(|| {
+        rtx.send(true).unwrap();
+        for idx in offset..(offset + step) {
+            loop {
+                match flow_b.pull(None, &mut pull_data) {
+                    Ok(ret) => {
+                        assert_eq!(ret, (idx, 2 * 1024 * 1024));
+                        break;
+                    }
+                    Err(err) => {
+                        assert_eq!(err, Error::Empty);
+                        assert_eq!(flow_b.poll(get_redis_pubsub(), None, Some(2)), Ok(()));
+                    }
+                }
             }
-        } );
+        }
+        offset += step;
+    } );
 
-        a.join().unwrap();
-        b.join().unwrap();
-    } )
+    rtx.send(false).unwrap();
+    a.join().unwrap();
 }

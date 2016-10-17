@@ -369,8 +369,7 @@ impl<'a> Flow<'a> {
     /// It doesn't guarantee that the chunk is always available even if this method reports the
     /// chunk is ready.
     pub fn poll(&self, mut subrs: PubSub, index: Option<i64>, timeout: Option<u64>) -> Result<()> {
-        let index = index.unwrap_or(0);
-        if index < 0 {
+        if index.unwrap_or(0) < 0 {
             return Err(Error::BadArgument);
         }
 
@@ -379,9 +378,13 @@ impl<'a> Flow<'a> {
 
         match self.get_range() {
             Ok((tail_index, head_index)) => {
-                if index < tail_index {
-                    return Err(Error::OutOfRange);
-                } else if index >= tail_index && index <= head_index {
+                if let Some(index) = index {
+                    if index < tail_index {
+                        return Err(Error::OutOfRange);
+                    } else if index >= tail_index && index <= head_index {
+                        return Ok(());
+                    }
+                } else {
                     return Ok(());
                 }
             }
@@ -389,6 +392,7 @@ impl<'a> Flow<'a> {
             Err(err) => return Err(err),
         };
 
+        let index = index.unwrap_or(0);
         let start_time = Instant::now();
         loop {
             let ret = subrs.get_message()

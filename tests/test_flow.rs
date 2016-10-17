@@ -159,7 +159,7 @@ fn test_sync_wait_and_poll() {
         assert_eq!(flow_b.pull(None, &mut pull_data), Ok((2, 1000)));
         assert_eq!(flow_b.pull(None, &mut pull_data), Ok((3, 1000)));
         assert_eq!(flow_b.pull(Some(5), &mut pull_data), Err(Error::OutOfRange));
-        assert_eq!(flow_b.poll(get_redis_pubsub(), Some(5), Some(2)), Ok(()));
+        assert_eq!(flow_b.poll(get_redis_pubsub(), None, Some(2)), Ok(()));
         assert_eq!(flow_b.pull(Some(5), &mut pull_data), Ok((5, 1000)));
         assert_eq!(flow_b.pull(Some(7), &mut pull_data), Err(Error::OutOfRange));
         assert_eq!(flow_b.poll(get_redis_pubsub(), Some(7), Some(2)), Ok(()));
