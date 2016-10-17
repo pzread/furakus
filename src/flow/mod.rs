@@ -51,8 +51,9 @@ lazy_static! {
     /// +. ARGV[4]: Skip available process.
     ///
     /// Return:
-    /// If the insertion succeeded, the index of the chunk. If the insertion failed, -1. If there
-    /// is no available chunk, -2.
+    /// If the insertion succeeded, the index of the chunk.
+    /// If there is no available chunk, -1.
+    /// If the insertion failed, -2.
     ///
     /// TODO Eliminate reducible LPUSH and RPOP.
     static ref ACQUIRE_CHUNK_SCRIPT: redis::Script = redis::Script::new(&format!(r"
@@ -76,12 +77,12 @@ lazy_static! {
             if redis.call('llen', flow_avail_key) == 0 then
                 -- Try slow recycling.
                 if tail_index > head_index then
-                    return -2
+                    return -1
                 end
                 local tail_flow_chunk_key = flow_key .. '@CHUNK@' .. tail_index
                 ret = redis.call('hmget', tail_flow_chunk_key, 'pull_count', 'chunk_id')
                 if tonumber(ret[1]) < pull_limit then
-                    return -2
+                    return -1
                 end
                 redis.call('del', 'CHUNK@' .. ret[2], tail_flow_chunk_key)
                 redis.call('hincrby', flow_key, 'tail_index', 1)
@@ -99,10 +100,10 @@ lazy_static! {
         else
             flow_chunk_key = flow_key .. '@CHUNK@' .. specific_index
             if specific_index <= head_index then
-                return -1
+                return -2
             end
             if redis.call('hsetnx', flow_chunk_key, 'chunk_id', chunk_id) == 0 then
-                return -1
+                return -2
             end
             if specific_index == head_index + 1 then
                 local next_index = head_index + 2
@@ -132,8 +133,9 @@ lazy_static! {
     /// +. ARGV[2]: The pull limit.
     ///
     /// Return:
-    /// If the pulling succeeded, (chunk index, chunk id, removable). If there is no available
-    /// chunk, -1. If the specific index is out of range, -2.
+    /// If the pulling succeeded, (chunk index, chunk id, removable, tail_index, head_index).
+    /// If there is no available chunk, (-1, _, _).
+    /// If the specific index is out of range, (-2, tail_index, head_index).
     static ref PULL_SCRIPT: redis::Script = redis::Script::new(r"
         local flow_key = KEYS[1]
         local index = tonumber(ARGV[1])
@@ -142,10 +144,10 @@ lazy_static! {
         local ret = redis.call('hmget', flow_key, 'tail_index', 'head_index')
         local tail_index = tonumber(ret[1])
         local head_index = tonumber(ret[2])
+        if tail_index > head_index then
+            return -1
+        end
         if index == -1 then
-            if tail_index > head_index then
-                return -1
-            end
             index = tail_index
         else
             if index < tail_index or index > head_index then
@@ -236,6 +238,19 @@ impl<'a> Flow<'a> {
         self.max_chunksize
     }
 
+    /// Get available pulling range.
+    pub fn get_range(&self) -> Result<(i64, i64)> {
+        self.rs.hget(rskey_flow!(self.id_hash), ("tail_index", "head_index"))
+            .or(Err(Error::Other))
+            .and_then(|(tail_index, head_index)| {
+                if tail_index > head_index {
+                    Err(Error::Again)
+                } else {
+                    Ok((tail_index, head_index))
+                }
+            })
+    }
+
     fn acquire_chunk(&self, index: Option<i64>, chunk_id: i64, skip_avail: bool) -> Result<i64> {
         ACQUIRE_CHUNK_SCRIPT
             .key(rskey_flow!(self.id_hash))
@@ -246,8 +261,8 @@ impl<'a> Flow<'a> {
             .invoke::<i64>(self.rs)
             .or(Err(Error::Other))
             .and_then(|index| match index {
-                -2 => Err(Error::Again),
-                -1 => Err(Error::BadArgument),
+                -1 => Err(Error::Again),
+                -2 => Err(Error::BadArgument),
                 _ => Ok(index)
             } )
     }
@@ -288,7 +303,7 @@ impl<'a> Flow<'a> {
             } )
     }
 
-    /// Pull a chunk from the flow. Return the chunk index and chunk size.
+    /// Pull a chunk from the flow. Return chunk index, chunk size, and current available range.
     pub fn pull(&self, index: Option<i64>, data: &mut [u8]) -> Result<(i64, usize)> {
         if data.len() < self.max_chunksize || index.unwrap_or(0) < 0 {
             return Err(Error::BadArgument);
@@ -304,10 +319,12 @@ impl<'a> Flow<'a> {
             .or(Err(Error::Other))
             .and_then(|result| {
                 redis::from_redis_value::<(i64, i64, bool)>(&result)
-                    .map_err(|_| match i64::from_redis_value(&result).unwrap() {
-                        -2 => Error::OutOfRange,
-                        -1 => Error::Again,
-                        _ => Error::Other
+                    .map_err(|_| {
+                        match redis::from_redis_value::<i64>(&result).unwrap() {
+                            -1 => Error::Again,
+                            -2 => Error::OutOfRange,
+                            _ => Error::Other
+                        }
                     } )
             } )
             .and_then(|(chunk_index, chunk_id, removable)| {

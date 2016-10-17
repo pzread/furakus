@@ -1,6 +1,8 @@
 //! The benchmarks for the `flow` module.
 //!
-//! The benchmarks need to connect to the redis server. The environment variable `TEST_REDIS_URL`
+//! This is only supported by nightly rust now.
+//!
+//! These benchmarks need to connect to the redis server. The environment variable `TEST_REDIS_URL`
 //! must be set for redis server connection before running these benchmarks. For example,
 //! ```
 //! TEST_REDIS_URL='redis://localhost:6379/15' cargo bench
@@ -15,16 +17,13 @@ extern crate test;
 
 use flux::flow::*;
 use redis::Connection as RedisConn;
-use std::sync::{Once, ONCE_INIT};
+use std::{sync, thread};
 use test::Bencher;
 
-static FLUSHDB: Once = ONCE_INIT;
-
-/// Since the tests will be run concurrently, we only clean the test database for the first time.
+/// Since the benchs won't be run concurrently, we clean the test database every time to reduce the
+/// noise.
 macro_rules! flushdb { ($rs:expr) => {
-    FLUSHDB.call_once(|| {
-        redis::Cmd::new().arg("FLUSHDB").execute($rs)
-    })
+    redis::Cmd::new().arg("FLUSHDB").execute($rs)
 } }
 
 fn get_redis_connection() -> RedisConn {
@@ -33,28 +32,40 @@ fn get_redis_connection() -> RedisConn {
     client.get_connection().expect("Failed to connect to the redis server")
 }
 
-#[bench]
-fn test_benchmark_sync(bench: &mut Bencher) {
+fn sync_bench(bench: &mut Bencher, chunk_size: usize) {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
-    let flow_a = Flow::new(rs, 1 * 1024 * 1024, 1).unwrap();
+    let flow_a = Flow::new(rs, chunk_size, 1).unwrap();
     let flow_b = Flow::get(rs, &flow_a.id).expect("Can't get the flow from its id.");
-    let push_data = vec![1u8; 64 * 1024];
-    let mut pull_data = vec![0u8; 1 * 1024 * 1024];
+    let push_data = vec![1u8; chunk_size];
+    let mut pull_data = vec![0u8; chunk_size];
 
-    flow_a.push(None, &push_data).unwrap();
-    flow_a.push(None, &push_data).unwrap();
-    flow_a.push(None, &push_data).unwrap();
-    flow_a.push(None, &push_data).unwrap();
     bench.iter(|| {
-        let idx = flow_a.push(None, &push_data).unwrap();
-        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx - 4, push_data.len())));
-    });
+        for _ in 0..10 {
+            let idx = flow_a.push(None, &push_data).unwrap();
+            assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx, push_data.len())));
+        }
+    } );
 }
 
 #[bench]
-fn test_benchmark_async(bench: &mut Bencher) {
+fn test_benchmark_sync_64k(bench: &mut Bencher) {
+    sync_bench(bench, 64 * 1024);
+}
+
+#[bench]
+fn test_benchmark_sync_2m(bench: &mut Bencher) {
+    sync_bench(bench, 2 * 1024 * 1024);
+}
+
+#[bench]
+fn test_benchmark_sync_4m(bench: &mut Bencher) {
+    sync_bench(bench, 4 * 1024 * 1024);
+}
+
+#[bench]
+fn test_benchmark_async_64k(bench: &mut Bencher) {
     let rs = &get_redis_connection();
     flushdb!(rs);
 
@@ -67,7 +78,43 @@ fn test_benchmark_async(bench: &mut Bencher) {
     flow_a.push(None, &push_data).unwrap();
     flow_a.push(None, &push_data).unwrap();
     bench.iter(|| {
-        let idx = flow_a.push(None, &push_data).unwrap();
-        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx - 3, push_data.len())));
-    });
+        for _ in 0..10 {
+            let idx = flow_a.push(None, &push_data).unwrap();
+            assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx - 3, push_data.len())));
+        }
+    } );
+}
+
+// #[bench]
+fn test_benchmark_sync_pipe(bench: &mut Bencher) {
+    flushdb!(&get_redis_connection());
+
+    bench.iter(|| {
+        let (tx, rx) = sync::mpsc::channel();
+
+        let a = thread::spawn(move|| {
+            let rs = &get_redis_connection();
+            let flow_a = Flow::new(rs, 2 * 1024 * 1024, 1).unwrap();
+            let push_data = vec![1u8; 64 * 1024];
+            tx.send(flow_a.id.clone()).unwrap();
+
+            for idx in 0..10000 {
+                assert_eq!(flow_a.push(None, &push_data), Ok((idx)));
+            }
+        } );
+
+        let b = thread::spawn(move|| {
+            let rs = &get_redis_connection();
+            let flow_id: String = rx.recv().unwrap();
+            let flow_b = Flow::get(rs, &flow_id).expect("Can't get the flow from its id.");
+            let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+
+            for idx in 0..10000 {
+                assert_eq!(flow_b.pull(None, &mut pull_data), Ok((idx, 64 * 1024)));
+            }
+        } );
+
+        a.join().unwrap();
+        b.join().unwrap();
+    } )
 }

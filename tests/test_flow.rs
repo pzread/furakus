@@ -55,16 +55,17 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_a.push(None, &push_data), Ok(1));
     assert_eq!(flow_a.push(Some(10), &push_data), Ok(10));
     assert_eq!(flow_a.push(Some(3), &push_data), Ok(3));
-    // assert_eq!(flow_a.push(Some(2), &push_data), Err(Error::Again));
+    assert_eq!(flow_b.get_range(), Ok((0, 1)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
+    assert_eq!(flow_b.get_range(), Err(Error::Again));
     assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
     assert_eq!(flow_a.push(Some(-1), &push_data), Err(Error::BadArgument));
     assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Again));
     assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
+    assert_eq!(flow_b.get_range(), Ok((2, 3)));
     assert_eq!(flow_a.push(None, &push_data), Ok(4));
     assert_eq!(flow_b.pull(Some(3), &mut pull_data), Ok((3, 1000)));
-    // assert_eq!(flow_a.push(None, &push_data), Err(Error::Again));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((2, 1000)));
     assert_eq!(flow_a.push(None, &push_data), Ok(5));
     assert_eq!(flow_a.push(None, &push_data), Ok(6));
@@ -95,6 +96,7 @@ fn test_async_push_and_pop() {
     assert_eq!(flow_a.push(Some(10), &push_data), Ok(10));
     assert_eq!(flow_a.push(Some(3), &push_data), Ok(3));
     assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
+    assert_eq!(flow_b.get_range(), Ok((1, 3)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
     assert_eq!(flow_b.pull(Some(3), &mut pull_data), Ok((3, 1000)));
     assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
