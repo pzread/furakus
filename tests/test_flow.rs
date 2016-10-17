@@ -11,7 +11,7 @@ extern crate flux;
 extern crate redis;
 
 use flux::flow::*;
-use redis::Connection as RedisConn;
+use redis::{Connection as RedisConn, PubSub};
 use std::sync::{self, Once, ONCE_INIT};
 use std::{thread, time};
 
@@ -24,10 +24,17 @@ macro_rules! flushdb { ($rs:expr) => {
     } )
 } }
 
-fn get_redis_connection() -> RedisConn {
+fn get_client() -> redis::Client {
     let redis_url: &str = env!("TEST_REDIS_URL");
-    let client = redis::Client::open(redis_url).unwrap();
-    client.get_connection().expect("Failed to connect to the redis server")
+    redis::Client::open(redis_url).unwrap()
+}
+
+fn get_redis_connection() -> RedisConn {
+    get_client().get_connection().expect("Failed to connect to the redis server")
+}
+
+fn get_redis_pubsub() -> PubSub {
+    get_client().get_pubsub().expect("Failed to connect to the redis server")
 }
 
 #[test]
@@ -58,10 +65,10 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_b.get_range(), Ok((0, 1)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
-    assert_eq!(flow_b.get_range(), Err(Error::Again));
+    assert_eq!(flow_b.get_range(), Err(Error::Empty));
     assert_eq!(flow_a.push(Some(1), &push_data), Err(Error::BadArgument));
     assert_eq!(flow_a.push(Some(-1), &push_data), Err(Error::BadArgument));
-    assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Again));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Empty));
     assert_eq!(flow_a.push(Some(2), &push_data), Ok(2));
     assert_eq!(flow_b.get_range(), Ok((2, 3)));
     assert_eq!(flow_a.push(None, &push_data), Ok(4));
@@ -75,10 +82,11 @@ fn test_sync_push_and_pop() {
     assert_eq!(flow_b.pull(Some(1), &mut pull_data), Err(Error::OutOfRange));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((5, 1000)));
     assert_eq!(flow_b.pull(None, &mut pull_data), Ok((6, 1000)));
-    assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Again));
+    assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Empty));
     assert_eq!(flow_a.push(None, &push_data), Ok(7));
     assert_eq!(flow_a.push(None, &push_data), Ok(8));
     assert_eq!(flow_a.push(None, &push_data), Ok(9));
+    assert_eq!(flow_b.get_range(), Ok((7, 10)));
 }
 
 #[test]
@@ -115,7 +123,7 @@ fn test_async_push_and_pop() {
 }
 
 #[test]
-fn test_sync_wait() {
+fn test_sync_wait_and_poll() {
     flushdb!(&get_redis_connection());
 
     let (tx, rx) = sync::mpsc::channel();
@@ -131,6 +139,12 @@ fn test_sync_wait() {
         assert_eq!(flow_a.push(None, &push_data), Ok((2)));
         assert_eq!(flow_a.push(None, &push_data), Ok((3)));
         assert_eq!(flow_a.push(None, &push_data), Ok((4)));
+        assert_eq!(flow_a.push(Some(7), &push_data), Ok((7)));
+        thread::sleep(time::Duration::from_millis(500));
+        assert_eq!(flow_a.push(None, &push_data), Ok((5)));
+        thread::sleep(time::Duration::from_millis(500));
+        assert_eq!(flow_a.push(None, &push_data), Ok((6)));
+        // TODO Lack of timeout tests.
     } );
 
     let b = thread::spawn(move|| {
@@ -139,8 +153,56 @@ fn test_sync_wait() {
         let flow_b = Flow::get(rs, &flow_id).expect("Can't get the flow from its id.");
         let mut pull_data = vec![0u8; 2 * 1024 * 1024];
 
-        thread::sleep(time::Duration::from_millis(1000));
+        thread::sleep(time::Duration::from_millis(500));
         assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((1, 1000)));
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((2, 1000)));
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((3, 1000)));
+        assert_eq!(flow_b.pull(Some(5), &mut pull_data), Err(Error::OutOfRange));
+        assert_eq!(flow_b.poll(get_redis_pubsub(), Some(5), Some(2)), Ok(()));
+        assert_eq!(flow_b.pull(Some(5), &mut pull_data), Ok((5, 1000)));
+        assert_eq!(flow_b.pull(Some(7), &mut pull_data), Err(Error::OutOfRange));
+        assert_eq!(flow_b.poll(get_redis_pubsub(), Some(7), Some(2)), Ok(()));
+        assert_eq!(flow_b.pull(Some(7), &mut pull_data), Ok((7, 1000)));
+    } );
+
+    a.join().unwrap();
+    b.join().unwrap();
+}
+
+#[test]
+fn test_async_poll() {
+    flushdb!(&get_redis_connection());
+
+    let (tx, rx) = sync::mpsc::channel();
+
+    let a = thread::spawn(move|| {
+        let rs = &get_redis_connection();
+        let flow_a = Flow::new(rs, 2 * 1024 * 1024, 0).unwrap();
+        let push_data = vec![1u8; 1000];
+        tx.send(flow_a.id.clone()).unwrap();
+
+        thread::sleep(time::Duration::from_millis(500));
+        assert_eq!(flow_a.push(None, &push_data), Ok((0)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((1)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((2)));
+        assert_eq!(flow_a.push(None, &push_data), Ok((3)));
+        thread::sleep(time::Duration::from_millis(500));
+        assert_eq!(flow_a.push(None, &push_data), Ok((4)));
+        // TODO Lack of timeout tests.
+    } );
+
+    let b = thread::spawn(move|| {
+        let rs = &get_redis_connection();
+        let flow_id: String = rx.recv().unwrap();
+        let flow_b = Flow::get(rs, &flow_id).expect("Can't get the flow from its id.");
+        let mut pull_data = vec![0u8; 2 * 1024 * 1024];
+
+        assert_eq!(flow_b.pull(None, &mut pull_data), Err(Error::Empty));
+        assert_eq!(flow_b.poll(get_redis_pubsub(), None, Some(2)), Ok(()));
+        assert_eq!(flow_b.pull(None, &mut pull_data), Ok((0, 1000)));
+        assert_eq!(flow_b.poll(get_redis_pubsub(), Some(4), Some(2)), Ok(()));
+        assert_eq!(flow_b.pull(Some(4), &mut pull_data), Ok((4, 1000)));
     } );
 
     a.join().unwrap();

@@ -10,9 +10,10 @@
 //! flow unexpectedly.
 
 use common::*;
-use redis::{self, Commands, Connection as RedisConn, FromRedisValue, PipelineCommands};
+use redis::{self, Commands, Connection as RedisConn, FromRedisValue, PipelineCommands, PubSub};
 use std::collections::HashMap;
 use std::result::Result as StdResult;
+use std::time::{Duration, Instant};
 
 /// Always use these macros to build a redis key.
 macro_rules! rskey_flow { ($hash:expr) => { &format!("FLOW@{:x}", $hash) } }
@@ -20,6 +21,7 @@ macro_rules! rskey_flow_chunk {
     ($hash:expr, $index:expr) => { &format!("FLOW@{:x}@CHUNK@{}", $hash, $index) }
 }
 macro_rules! rskey_flow_avail { ($hash:expr) => { &format!("FLOW@{:x}@AVAIL", $hash) } }
+macro_rules! rskey_flow_channel { ($hash:expr) => { &format!("FLOW@{:x}@CHANNEL", $hash) } }
 macro_rules! rskey_chunk_data { ($id:expr) => { &format!("CHUNK@{}", $id) } }
 
 #[derive(Debug, PartialEq)]
@@ -28,6 +30,8 @@ pub enum Error {
     BadArgument,
     /// OutOfRange,
     OutOfRange,
+    /// Empty,
+    Empty,
     /// Again,
     Again,
     /// Timeout.
@@ -91,7 +95,7 @@ lazy_static! {
         end
 
         if specific_index == -1 then
-            local next_index = redis.call('hincrby', flow_key, 'head_index', 1)
+            local next_index = tonumber(redis.call('hincrby', flow_key, 'head_index', 1))
             flow_chunk_key = flow_key .. '@CHUNK@' .. next_index
             if redis.call('hsetnx', flow_chunk_key, 'chunk_id', chunk_id) ~= 1 then
                 error('collision')
@@ -105,14 +109,19 @@ lazy_static! {
             if redis.call('hsetnx', flow_chunk_key, 'chunk_id', chunk_id) == 0 then
                 return -2
             end
-            if specific_index == head_index + 1 then
-                local next_index = head_index + 2
-                while redis.call('exists', flow_key .. '@CHUNK@' .. next_index) == 1 do
-                    next_index = next_index + 1
-                end
-                redis.call('hset', flow_key, 'head_index', next_index - 1)
-            end
             chunk_index = specific_index
+        end
+        if chunk_index == head_index + 1 then
+            -- Update the head index.
+            local next_index = chunk_index + 1
+            while redis.call('exists', flow_key .. '@CHUNK@' .. next_index) == 1 do
+                next_index = next_index + 1
+            end
+            next_index = next_index - 1
+            if next_index ~= chunk_index or specific_index ~= -1 then
+                redis.call('hset', flow_key, 'head_index', next_index)
+            end
+            redis.call('publish', flow_key .. '@CHANNEL', next_index)
         end
 
         redis.call('hset', flow_chunk_key, 'pull_count', 0)
@@ -244,11 +253,11 @@ impl<'a> Flow<'a> {
             .or(Err(Error::Other))
             .and_then(|(tail_index, head_index)| {
                 if tail_index > head_index {
-                    Err(Error::Again)
+                    Err(Error::Empty)
                 } else {
                     Ok((tail_index, head_index))
                 }
-            })
+            } )
     }
 
     fn acquire_chunk(&self, index: Option<i64>, chunk_id: i64, skip_avail: bool) -> Result<i64> {
@@ -285,13 +294,17 @@ impl<'a> Flow<'a> {
         self.acquire_chunk(index, chunk_id, false)
             .or_else(|err| {
                 if err == Error::Again {
-                    if self.rs.blpop::<_, (String, i64)>(rskey_flow_avail!(self.id_hash),
-                                                         SHORT_TIMEOUT / 2).is_ok() {
+                    self.rs.blpop::<_, (String, i64)>(rskey_flow_avail!(self.id_hash),
+                                                      SHORT_TIMEOUT / 2)
+                        .or_else(|err| {
+                            if err.is_timeout() {
+                                Err(Error::Timeout)
+                            } else {
+                                Err(Error::Other)
+                            }
+                        } )
                         // Get an available chunk, try again.
-                        self.acquire_chunk(index, chunk_id, true)
-                    } else {
-                        Err(Error::Timeout)
-                    }
+                        .and(self.acquire_chunk(index, chunk_id, true))
                 } else {
                     Err(err)
                 }
@@ -321,7 +334,7 @@ impl<'a> Flow<'a> {
                 redis::from_redis_value::<(i64, i64, bool)>(&result)
                     .map_err(|_| {
                         match redis::from_redis_value::<i64>(&result).unwrap() {
-                            -1 => Error::Again,
+                            -1 => Error::Empty,
                             -2 => Error::OutOfRange,
                             _ => Error::Other
                         }
@@ -348,14 +361,64 @@ impl<'a> Flow<'a> {
             } )
     }
 
-    // /// Poll and wait for the specific indexed chunk being ready.
-    // ///
-    // /// It doesn't guarantee that the chunk is always available even if this method reports the
-    // /// chunk is ready.
-    // pub fn poll(&self, index: i64, timeout: usize) -> Result<()> {
-    //     if index < 0 {
-    //         return Err(Error::BadArgument);
-    //     }
-    //     Ok(())
-    // }
+    /// Poll and wait for the specific indexed chunk being ready.
+    ///
+    /// It requires a disposable redis connection to subscribe the channel.
+    /// Therefore, the ownership of `subrs` is moved to this method.
+    ///
+    /// It doesn't guarantee that the chunk is always available even if this method reports the
+    /// chunk is ready.
+    pub fn poll(&self, mut subrs: PubSub, index: Option<i64>, timeout: Option<u64>) -> Result<()> {
+        let index = index.unwrap_or(0);
+        if index < 0 {
+            return Err(Error::BadArgument);
+        }
+
+        subrs.set_read_timeout(timeout.map(|secs| Duration::from_secs(secs))).unwrap();
+        subrs.subscribe(rskey_flow_channel!(self.id_hash)).unwrap();
+
+        match self.get_range() {
+            Ok((tail_index, head_index)) => {
+                if index < tail_index {
+                    return Err(Error::OutOfRange);
+                } else if index >= tail_index && index <= head_index {
+                    return Ok(());
+                }
+            }
+            Err(Error::Empty) => (),
+            Err(err) => return Err(err),
+        };
+
+        let start_time = Instant::now();
+        loop {
+            let ret = subrs.get_message()
+                .or_else(|err| {
+                    if err.is_timeout() {
+                        Err(Error::Timeout)
+                    } else {
+                        Err(Error::Other)
+                    }
+                } )
+                .and_then(|msg| {
+                    let head_index: i64 = msg.get_payload().unwrap();
+                    if head_index < index {
+                        Err(Error::Again)
+                    } else {
+                        Ok(())
+                    }
+                });
+            match ret {
+                Err(Error::Again) => {
+                    if let Some(secs) = timeout {
+                        if start_time.elapsed().as_secs() >= secs {
+                            return Err(Error::Timeout);
+                        }
+                    }
+                    continue;
+                }
+                _ => return ret
+            }
+        }
+        // Unreachable.
+    }
 }
