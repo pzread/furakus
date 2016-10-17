@@ -1,2 +1,2 @@
-# flux
-Pipe over HTTP
+# Flux >|<
+Flows over HTTPs
