@@ -1,0 +1,10 @@
+[package]
+name = "flux"
+version = "0.1.0"
+authors = ["PZ Read"]
+
+[dependencies]
+futures = "0.1"
+hyper = { git = "https://github.com/hyperium/hyper" }
+tokio-core = "0.1"
+uuid = { version = "0.4", features = ["v4"] }
