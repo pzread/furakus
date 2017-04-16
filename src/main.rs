@@ -1,5 +1,7 @@
-extern crate hyper;
+#![feature(plugin)]
+#![plugin(dotenv_macros)]
 extern crate futures;
+extern crate hyper;
 extern crate tokio_core as tokio;
 
 use futures::Stream;
@@ -28,7 +30,7 @@ impl Service for FluxService {
 }
 
 fn main() {
-    let addr: std::net::SocketAddr = "127.0.0.1:3000".parse().unwrap();
+    let addr: std::net::SocketAddr = dotenv!("SERVER_ADDRESS").parse().unwrap();
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
 
     let mut threads = Vec::new();
