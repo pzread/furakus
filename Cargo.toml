@@ -4,8 +4,8 @@ version = "0.1.0"
 authors = ["PZ Read"]
 
 [dependencies]
-dotenv_macros = "0.10"
+dotenv = "0.10"
 futures = "0.1"
-hyper = { git = "https://github.com/hyperium/hyper" }
+hyper = { git = "https://github.com/pzread/hyper" }
 tokio-core = "0.1"
 uuid = { version = "0.4", features = ["v4"] }
