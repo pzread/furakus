@@ -3,6 +3,7 @@ extern crate dotenv;
 extern crate futures;
 extern crate hyper;
 extern crate regex;
+extern crate rustc_serialize;
 extern crate tokio_core as tokio;
 extern crate uuid;
 mod flow;
@@ -35,8 +36,8 @@ impl FluxService {
         }
     }
 
-    fn handle_new(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
-        let flow = Flow::new();
+    fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
+        let flow = Flow::new(None);
         let flow_id = flow.id.clone();
         {
             let mut bucket = self.flow_bucket.write().unwrap();
@@ -102,6 +103,11 @@ impl FluxService {
             Ok(Response::new().with_status(StatusCode::InternalServerError))
         }).boxed()
     }
+
+    fn handle_pull(&self, req: Request, route: regex::Captures) -> ResponseFuture {
+        let flow_id = route.get(1).unwrap().as_str();
+        future::ok(Response::new().with_status(StatusCode::InternalServerError)).boxed()
+    }
 }
 
 impl Service for FluxService {
@@ -114,6 +120,7 @@ impl Service for FluxService {
         lazy_static! {
             static ref PATTERN_NEW: Regex = Regex::new(r"/new").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"/([a-f0-9]{32})/push").unwrap();
+            static ref PATTERN_PULL: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
         }
 
         match req.method() {
@@ -124,6 +131,8 @@ impl Service for FluxService {
                     self.handle_new(req, route)
                 } else if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
+                } else if let Some(route) = PATTERN_PULL.captures(path) {
+                    self.handle_pull(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
@@ -233,9 +242,8 @@ mod tests {
             })
         })).unwrap();
 
-        let payload = Vec::from("The quick brown fox jumps over the lazy dog");
         let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(payload);
+        req.set_body(b"The quick brown fox jumps over the lazy dog" as &[u8]);
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat().and_then(|body| {

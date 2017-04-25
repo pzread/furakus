@@ -9,5 +9,6 @@ futures = "0.1"
 hyper = { git = "https://github.com/pzread/hyper" }
 lazy_static = "0.2"
 regex = "0.2"
+rustc-serialize = "0.3"
 tokio-core = "0.1"
 uuid = { version = "0.4", features = ["v4"] }
