@@ -55,7 +55,7 @@ impl Flow {
         self.next_index += 1;
         self.chunk_bucket.insert(chunk_index, Chunk { data: data.to_vec() });
 
-        self.stat_size += (data.len() as u64);
+        self.stat_size += data.len() as u64;
         Ok(chunk_index)
     }
 

@@ -1,9 +1,11 @@
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate serde_derive;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
 extern crate regex;
-extern crate rustc_serialize;
+extern crate serde;
+extern crate serde_json;
 extern crate tokio_core as tokio;
 extern crate uuid;
 mod flow;
@@ -20,11 +22,22 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::{env, thread};
 use tokio::reactor::Core;
 
+#[derive(Debug)]
+pub enum Error {
+    Invalid,
+    Internal(hyper::Error),
+}
+
 type SharedFlow = Arc<RwLock<Flow>>;
 
 #[derive(Clone)]
 struct FluxService {
     flow_bucket: Arc<RwLock<HashMap<String, SharedFlow>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FlowReqParam {
+    pub size: Option<u64>,
 }
 
 type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error>>;
@@ -37,17 +50,29 @@ impl FluxService {
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
-        let flow = Flow::new(None);
-        let flow_id = flow.id.clone();
-        {
-            let mut bucket = self.flow_bucket.write().unwrap();
-            bucket.insert(flow_id.clone(), Arc::new(RwLock::new(flow)));
-        }
-        let body = flow_id.into_bytes();
-        future::ok(Response::new()
-                   .with_header(ContentType::plaintext())
-                   .with_header(ContentLength(body.len() as u64))
-                   .with_body(body)).boxed()
+        let flow_bucket = self.flow_bucket.clone();
+        req.body().concat().map_err(|err| Error::Internal(err)).and_then(|body| {
+            serde_json::from_slice::<FlowReqParam>(&body).map_err(|_| Error::Invalid)
+        }).and_then(move |param| {
+            let flow = Flow::new(param.size);
+            let flow_id = flow.id.clone();
+            {
+                let mut bucket = flow_bucket.write().unwrap();
+                bucket.insert(flow_id.clone(), Arc::new(RwLock::new(flow)));
+            }
+            let body = flow_id.into_bytes();
+            future::ok(Response::new()
+                       .with_header(ContentType::plaintext())
+                       .with_header(ContentLength(body.len() as u64))
+                       .with_body(body))
+        }).or_else(|err| {
+            match err {
+                Error::Invalid => {
+                    Ok(Response::new().with_status(StatusCode::BadRequest))
+                }
+                Error::Internal(err) => Err(err),
+            }
+        }).boxed()
     }
 
     fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
@@ -104,9 +129,12 @@ impl FluxService {
         }).boxed()
     }
 
-    fn handle_pull(&self, req: Request, route: regex::Captures) -> ResponseFuture {
-        let flow_id = route.get(1).unwrap().as_str();
-        future::ok(Response::new().with_status(StatusCode::InternalServerError)).boxed()
+    fn handle_fetch(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
+        unreachable!();
+    }
+
+    fn handle_pull(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
+        unreachable!();
     }
 }
 
@@ -120,6 +148,7 @@ impl Service for FluxService {
         lazy_static! {
             static ref PATTERN_NEW: Regex = Regex::new(r"/new").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"/([a-f0-9]{32})/push").unwrap();
+            static ref PATTERN_FETCH: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
         }
 
@@ -131,6 +160,8 @@ impl Service for FluxService {
                     self.handle_new(req, route)
                 } else if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
+                } else if let Some(route) = PATTERN_FETCH.captures(path) {
+                    self.handle_fetch(req, route)
                 } else if let Some(route) = PATTERN_PULL.captures(path) {
                     self.handle_pull(req, route)
                 } else {
@@ -214,7 +245,8 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{}"#);
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat().and_then(|body| {
@@ -222,6 +254,24 @@ mod tests {
                 assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
                 Ok(())
             })
+        })).unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{"size": 4096}"#);
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                let flow_id = str::from_utf8(&body).unwrap();
+                assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
+                Ok(())
+            })
+        })).unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{"size": 4O96}"#);
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::BadRequest);
+            Ok(())
         })).unwrap();
     }
 
@@ -233,7 +283,8 @@ mod tests {
 
         let mut flow_id = String::new();
 
-        let req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body("{}");
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat().and_then(|body| {
