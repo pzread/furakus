@@ -1,25 +1,29 @@
+#[macro_use] extern crate lazy_static;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
+extern crate regex;
 extern crate tokio_core as tokio;
 extern crate uuid;
 mod flow;
 
 use dotenv::dotenv;
 use flow::Flow;
-use futures::{Future, Stream};
-use futures::future;
+use futures::{future, stream, Future, Stream};
 use hyper::header::{ContentLength, ContentType};
 use hyper::server::{Http, Service, Request, Response};
 use hyper::{Method, StatusCode};
+use regex::Regex;
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, RwLock};
 use std::{env, thread};
 use tokio::reactor::Core;
 
+type SharedFlow = Arc<RwLock<Flow>>;
+
 #[derive(Clone)]
 struct FluxService {
-    flow_bucket: Arc<RwLock<HashMap<u64, u64>>>,
+    flow_bucket: Arc<RwLock<HashMap<String, SharedFlow>>>,
 }
 
 type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error>>;
@@ -31,13 +35,72 @@ impl FluxService {
         }
     }
 
-    fn handle_new(&self) -> ResponseFuture {
+    fn handle_new(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
         let flow = Flow::new();
-        let body = flow.id.into_bytes();
+        let flow_id = flow.id.clone();
+        {
+            let mut bucket = self.flow_bucket.write().unwrap();
+            bucket.insert(flow_id.clone(), Arc::new(RwLock::new(flow)));
+        }
+        let body = flow_id.into_bytes();
         future::ok(Response::new()
                    .with_header(ContentType::plaintext())
                    .with_header(ContentLength(body.len() as u64))
                    .with_body(body)).boxed()
+    }
+
+    fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
+        let flow_id = route.get(1).unwrap().as_str();
+        let flow = {
+            let bucket = self.flow_bucket.read().unwrap();
+            if let Some(flow) = bucket.get(flow_id) {
+                flow.clone()
+            } else {
+                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            }
+        };
+
+        // Chain a EOF on the stream to flush the remaining chunk.
+        let body_stream = req.body()
+            .map(|chunk| Some(chunk))
+            .chain(stream::once(Ok(None)));
+        // Read the body and push chunks.
+        let init_chunk = Vec::<u8>::with_capacity(flow::MAX_SIZE);
+        body_stream.fold(init_chunk, move |mut rem_chunk, chunk| {
+            let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
+                if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
+                    let caplen = flow::MAX_SIZE - rem_chunk.len();
+                    rem_chunk.extend_from_slice(&chunk[..caplen]);
+                    (Some(rem_chunk), chunk[caplen..].to_vec())
+                } else {
+                    rem_chunk.extend_from_slice(&chunk);
+                    (None, rem_chunk)
+                }
+            } else {
+                // EOF, flush the remaining chunk.
+                if rem_chunk.len() > 0 {
+                    (Some(rem_chunk), Vec::new())
+                } else {
+                    (None, Vec::new())
+                }
+            };
+            if let Some(flush_chunk) = flush_chunk {
+                let mut flow = flow.write().unwrap();
+                flow.push(&flush_chunk)
+                    .map(|_| ret_chunk)
+                    .map_err(|_| hyper::error::Error::Incomplete)
+            } else {
+                Ok(ret_chunk)
+            }
+        }).and_then(|_| {
+            let body = "Ok";
+            Ok(Response::new()
+                .with_header(ContentType::plaintext())
+                .with_header(ContentLength(body.len() as u64))
+                .with_body(body))
+        }).or_else(|_| {
+            Ok(Response::new().with_status(StatusCode::InternalServerError))
+        }).boxed()
     }
 }
 
@@ -48,29 +111,22 @@ impl Service for FluxService {
     type Future = ResponseFuture;
 
     fn call(&self, req: Request) -> Self::Future {
+        lazy_static! {
+            static ref PATTERN_NEW: Regex = Regex::new(r"/new").unwrap();
+            static ref PATTERN_PUSH: Regex = Regex::new(r"/([a-f0-9]{32})/push").unwrap();
+        }
+
         match req.method() {
             &Method::Post => {
-                if req.path() == "/new" {
-                    self.handle_new()
+                let path = &req.path().to_owned();
+
+                if let Some(route) = PATTERN_NEW.captures(path) {
+                    self.handle_new(req, route)
+                } else if let Some(route) = PATTERN_PUSH.captures(path) {
+                    self.handle_push(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
-                /*
-                let datalen = if let Some(datalen) = req.headers().get::<ContentLength>() {
-                    std::cmp::min(datalen.0, 4194304) as usize
-                } else {
-                    4096
-                };
-                req.body().fold(Vec::<u8>::with_capacity(datalen), |mut data, chunk| {
-                    data.extend_from_slice(&chunk);
-                    Ok::<_, Self::Error>(data)
-                }).and_then(|body| {
-                    Ok(Response::new()
-                       .with_header(ContentType::plaintext())
-                       .with_header(ContentLength(body.len() as u64))
-                       .with_body(body))
-                }).boxed()
-                */
             }
             _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed()
         }
@@ -133,6 +189,7 @@ mod tests {
     use hyper::Method::Post;
     use hyper::client::{Client, Request};
     use hyper::status::StatusCode;
+    use regex::Regex;
     use std::str;
     use super::start_service;
     use tokio::reactor::Core;
@@ -153,6 +210,37 @@ mod tests {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat().and_then(|body| {
                 let flow_id = str::from_utf8(&body).unwrap();
+                assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
+                Ok(())
+            })
+        })).unwrap();
+    }
+
+    #[test]
+    fn handle_push_fetch() {
+        let prefix = &spawn_server();
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let mut flow_id = String::new();
+
+        let req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                flow_id = str::from_utf8(&body).unwrap().to_owned();
+                Ok(())
+            })
+        })).unwrap();
+
+        let payload = Vec::from("The quick brown fox jumps over the lazy dog");
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(payload);
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                let status = str::from_utf8(&body).unwrap().to_owned();
+                assert_eq!(status, "Ok");
                 Ok(())
             })
         })).unwrap();

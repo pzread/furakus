@@ -12,7 +12,7 @@ pub enum Error {
 
 pub type Result<T> = StdResult<T, Error>;
 
-const MAX_SIZE: usize = 65536;
+pub const MAX_SIZE: usize = 65536;
 
 struct Chunk {
     data: Vec<u8>,
@@ -44,10 +44,7 @@ impl Flow {
 
         let chunk_index = self.next_index;
         self.next_index += 1;
-
-        self.chunk_bucket
-            .insert(chunk_index, Chunk { data: data.to_vec() });
-
+        self.chunk_bucket.insert(chunk_index, Chunk { data: data.to_vec() });
         Ok(chunk_index)
     }
 
