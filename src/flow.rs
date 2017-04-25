@@ -59,7 +59,7 @@ impl Flow {
         Ok(chunk_index)
     }
 
-    pub fn fetch(&mut self, chunk_index: u64) -> Result<&[u8]> {
+    pub fn fetch(&self, chunk_index: u64) -> Result<&[u8]> {
         if let Some(chunk) = self.chunk_bucket.get(&chunk_index) {
             Ok(&chunk.data)
         } else {

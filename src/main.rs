@@ -1,4 +1,5 @@
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate mime;
 #[macro_use] extern crate serde_derive;
 extern crate dotenv;
 extern crate futures;
@@ -129,8 +130,33 @@ impl FluxService {
         }).boxed()
     }
 
-    fn handle_fetch(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
-        unreachable!();
+    fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
+        let flow_id = route.get(1).unwrap().as_str();
+        let chunk_index: u64 = if let Ok(index) = route.get(2).unwrap().as_str().parse() {
+            index
+        } else {
+            return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed()
+        };
+        let flow = {
+            let bucket = self.flow_bucket.read().unwrap();
+            if let Some(flow) = bucket.get(flow_id) {
+                flow.clone()
+            } else {
+                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            }
+        };
+        let chunk = {
+            let flow = flow.read().unwrap();
+            if let Ok(chunk) = flow.fetch(chunk_index) {
+                chunk.to_vec()
+            } else {
+                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            }
+        };
+        future::ok(Response::new()
+           .with_header(ContentType(mime!(Application/OctetStream)))
+           .with_header(ContentLength(chunk.len() as u64))
+           .with_body(chunk)).boxed()
     }
 
     fn handle_pull(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
@@ -148,7 +174,7 @@ impl Service for FluxService {
         lazy_static! {
             static ref PATTERN_NEW: Regex = Regex::new(r"/new").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"/([a-f0-9]{32})/push").unwrap();
-            static ref PATTERN_FETCH: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
+            static ref PATTERN_FETCH: Regex = Regex::new(r"/([a-f0-9]{32})/fetch/(\d+)").unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
         }
 
@@ -282,6 +308,9 @@ mod tests {
         let client = Client::new(&core.handle());
 
         let mut flow_id = String::new();
+        let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
+        let payload1: &[u8] = b"The quick brown fox jumps over the lazy dog";
+        let payload2: &[u8] = b"The quick brown fox jumps over the lazy dog";
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body("{}");
@@ -293,13 +322,76 @@ mod tests {
             })
         })).unwrap();
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(b"The quick brown fox jumps over the lazy dog" as &[u8]);
+        // The empty chunk should be ignored.
+        let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat().and_then(|body| {
-                let status = str::from_utf8(&body).unwrap().to_owned();
-                assert_eq!(status, "Ok");
+                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                Ok(())
+            })
+        })).unwrap();
+
+        // There should be no chunk.
+        let req = Request::new(Post, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, fake_id).parse().unwrap());
+        req.set_body(payload1);
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(payload1);
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                Ok(())
+            })
+        })).unwrap();
+
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(payload2);
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                Ok(())
+            })
+        })).unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/fetch/0", prefix, fake_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/fetch/10", prefix, flow_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                assert_eq!(&body as &[u8], payload1);
+                Ok(())
+            })
+        })).unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/fetch/1", prefix, flow_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat().and_then(|body| {
+                assert_eq!(&body as &[u8], payload2);
                 Ok(())
             })
         })).unwrap();
