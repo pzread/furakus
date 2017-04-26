@@ -53,8 +53,7 @@ impl Flow {
 
         let chunk_index = self.next_index;
         self.next_index += 1;
-        self.chunk_bucket
-            .insert(chunk_index, Chunk { data: data.to_vec() });
+        self.chunk_bucket.insert(chunk_index, Chunk { data: data.to_vec() });
 
         self.stat_size += data.len() as u64;
         Ok(chunk_index)
