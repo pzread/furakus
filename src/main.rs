@@ -1,6 +1,9 @@
-#[macro_use] extern crate lazy_static;
-#[macro_use] extern crate mime;
-#[macro_use] extern crate serde_derive;
+#[macro_use]
+extern crate lazy_static;
+#[macro_use]
+extern crate mime;
+#[macro_use]
+extern crate serde_derive;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
@@ -45,35 +48,35 @@ type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error>>;
 
 impl FluxService {
     fn new() -> Self {
-        FluxService {
-            flow_bucket: Arc::new(RwLock::new(HashMap::new())),
-        }
+        FluxService { flow_bucket: Arc::new(RwLock::new(HashMap::new())) }
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
         let flow_bucket = self.flow_bucket.clone();
-        req.body().concat().map_err(|err| Error::Internal(err)).and_then(|body| {
-            serde_json::from_slice::<FlowReqParam>(&body).map_err(|_| Error::Invalid)
-        }).and_then(move |param| {
-            let flow = Flow::new(param.size);
-            let flow_id = flow.id.clone();
-            {
-                let mut bucket = flow_bucket.write().unwrap();
-                bucket.insert(flow_id.clone(), Arc::new(RwLock::new(flow)));
-            }
-            let body = flow_id.into_bytes();
-            future::ok(Response::new()
-                       .with_header(ContentType::plaintext())
-                       .with_header(ContentLength(body.len() as u64))
-                       .with_body(body))
-        }).or_else(|err| {
-            match err {
-                Error::Invalid => {
-                    Ok(Response::new().with_status(StatusCode::BadRequest))
+        req.body()
+            .concat()
+            .map_err(|err| Error::Internal(err))
+            .and_then(|body| {
+                          serde_json::from_slice::<FlowReqParam>(&body).map_err(|_| Error::Invalid)
+                      })
+            .and_then(move |param| {
+                let flow = Flow::new(param.size);
+                let flow_id = flow.id.clone();
+                {
+                    let mut bucket = flow_bucket.write().unwrap();
+                    bucket.insert(flow_id.clone(), Arc::new(RwLock::new(flow)));
                 }
-                Error::Internal(err) => Err(err),
-            }
-        }).boxed()
+                let body = flow_id.into_bytes();
+                future::ok(Response::new()
+                               .with_header(ContentType::plaintext())
+                               .with_header(ContentLength(body.len() as u64))
+                               .with_body(body))
+            })
+            .or_else(|err| match err {
+                         Error::Invalid => Ok(Response::new().with_status(StatusCode::BadRequest)),
+                         Error::Internal(err) => Err(err),
+                     })
+            .boxed()
     }
 
     fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
@@ -93,41 +96,43 @@ impl FluxService {
             .chain(stream::once(Ok(None)));
         // Read the body and push chunks.
         let init_chunk = Vec::<u8>::with_capacity(flow::MAX_SIZE);
-        body_stream.fold(init_chunk, move |mut rem_chunk, chunk| {
-            let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
-                if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
-                    let caplen = flow::MAX_SIZE - rem_chunk.len();
-                    rem_chunk.extend_from_slice(&chunk[..caplen]);
-                    (Some(rem_chunk), chunk[caplen..].to_vec())
+        body_stream
+            .fold(init_chunk, move |mut rem_chunk, chunk| {
+                let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
+                    if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
+                        let caplen = flow::MAX_SIZE - rem_chunk.len();
+                        rem_chunk.extend_from_slice(&chunk[..caplen]);
+                        (Some(rem_chunk), chunk[caplen..].to_vec())
+                    } else {
+                        rem_chunk.extend_from_slice(&chunk);
+                        (None, rem_chunk)
+                    }
                 } else {
-                    rem_chunk.extend_from_slice(&chunk);
-                    (None, rem_chunk)
-                }
-            } else {
-                // EOF, flush the remaining chunk.
-                if rem_chunk.len() > 0 {
-                    (Some(rem_chunk), Vec::new())
+                    // EOF, flush the remaining chunk.
+                    if rem_chunk.len() > 0 {
+                        (Some(rem_chunk), Vec::new())
+                    } else {
+                        (None, Vec::new())
+                    }
+                };
+                if let Some(flush_chunk) = flush_chunk {
+                    let mut flow = flow.write().unwrap();
+                    flow.push(&flush_chunk)
+                        .map(|_| ret_chunk)
+                        .map_err(|_| hyper::error::Error::Incomplete)
                 } else {
-                    (None, Vec::new())
+                    Ok(ret_chunk)
                 }
-            };
-            if let Some(flush_chunk) = flush_chunk {
-                let mut flow = flow.write().unwrap();
-                flow.push(&flush_chunk)
-                    .map(|_| ret_chunk)
-                    .map_err(|_| hyper::error::Error::Incomplete)
-            } else {
-                Ok(ret_chunk)
-            }
-        }).and_then(|_| {
-            let body = "Ok";
-            Ok(Response::new()
-                .with_header(ContentType::plaintext())
-                .with_header(ContentLength(body.len() as u64))
-                .with_body(body))
-        }).or_else(|_| {
-            Ok(Response::new().with_status(StatusCode::InternalServerError))
-        }).boxed()
+            })
+            .and_then(|_| {
+                          let body = "Ok";
+                          Ok(Response::new()
+                                 .with_header(ContentType::plaintext())
+                                 .with_header(ContentLength(body.len() as u64))
+                                 .with_body(body))
+                      })
+            .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
+            .boxed()
     }
 
     fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
@@ -135,7 +140,7 @@ impl FluxService {
         let chunk_index: u64 = if let Ok(index) = route.get(2).unwrap().as_str().parse() {
             index
         } else {
-            return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed()
+            return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed();
         };
         let flow = {
             let bucket = self.flow_bucket.read().unwrap();
@@ -154,9 +159,10 @@ impl FluxService {
             }
         };
         future::ok(Response::new()
-           .with_header(ContentType(mime!(Application/OctetStream)))
-           .with_header(ContentLength(chunk.len() as u64))
-           .with_body(chunk)).boxed()
+                       .with_header(ContentType(mime!(Application / OctetStream)))
+                       .with_header(ContentLength(chunk.len() as u64))
+                       .with_body(chunk))
+                .boxed()
     }
 
     fn handle_pull(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
@@ -178,28 +184,34 @@ impl Service for FluxService {
             static ref PATTERN_PULL: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
         }
 
+        let path = &req.path().to_owned();
         match req.method() {
             &Method::Post => {
-                let path = &req.path().to_owned();
-
                 if let Some(route) = PATTERN_NEW.captures(path) {
                     self.handle_new(req, route)
                 } else if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
-                } else if let Some(route) = PATTERN_FETCH.captures(path) {
-                    self.handle_fetch(req, route)
                 } else if let Some(route) = PATTERN_PULL.captures(path) {
                     self.handle_pull(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
             }
-            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed()
+            &Method::Get => {
+                if let Some(route) = PATTERN_FETCH.captures(path) {
+                    self.handle_fetch(req, route)
+                } else {
+                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                }
+            }
+            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed(),
         }
     }
 }
 
-fn start_service(addr: std::net::SocketAddr, num_worker: usize, block: bool)
+fn start_service(addr: std::net::SocketAddr,
+                 num_worker: usize,
+                 block: bool)
                  -> Option<std::net::SocketAddr> {
     let service = FluxService::new();
 
@@ -215,14 +227,16 @@ fn start_service(addr: std::net::SocketAddr, num_worker: usize, block: bool)
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
-            let listener = tokio::net::TcpListener::from_listener(moved_listener,
-                                                                  &moved_addr,
-                                                                  &handle).unwrap();
+            let listener =
+                tokio::net::TcpListener::from_listener(moved_listener, &moved_addr, &handle)
+                    .unwrap();
             let http = Http::new();
-            let acceptor = listener.incoming().for_each(|(io, addr)| {
-                http.bind_connection(&handle, io, addr, moved_service.clone());
-                Ok(())
-            });
+            let acceptor = listener
+                .incoming()
+                .for_each(|(io, addr)| {
+                              http.bind_connection(&handle, io, addr, moved_service.clone());
+                              Ok(())
+                          });
             println!("Worker #{} is started.", idx);
             moved_barrier.wait();
             core.run(acceptor).unwrap();
@@ -252,7 +266,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use futures::{Future, Stream};
-    use hyper::Method::Post;
+    use hyper::Method::{Get, Post};
     use hyper::client::{Client, Request};
     use hyper::status::StatusCode;
     use regex::Regex;
@@ -261,7 +275,9 @@ mod tests {
     use tokio::reactor::Core;
 
     fn spawn_server() -> String {
-        let port = start_service("127.0.0.1:0".parse().unwrap(), 1, false).unwrap().port();
+        let port = start_service("127.0.0.1:0".parse().unwrap(), 1, false)
+            .unwrap()
+            .port();
         format!("http://127.0.0.1:{}", port)
     }
 
@@ -273,32 +289,51 @@ mod tests {
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                let flow_id = str::from_utf8(&body).unwrap();
-                assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
-                Ok(())
-            })
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  let flow_id = str::from_utf8(&body).unwrap();
+                                  assert!(Regex::new("[a-f0-9]{32}")
+                                              .unwrap()
+                                              .find(flow_id)
+                                              .is_some());
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4096}"#);
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                let flow_id = str::from_utf8(&body).unwrap();
-                assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
-                Ok(())
-            })
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  let flow_id = str::from_utf8(&body).unwrap();
+                                  assert!(Regex::new("[a-f0-9]{32}")
+                                              .unwrap()
+                                              .find(flow_id)
+                                              .is_some());
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4O96}"#);
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::BadRequest);
-            Ok(())
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                                   assert_eq!(res.status(), StatusCode::BadRequest);
+                                   Ok(())
+                               }))
+            .unwrap();
     }
 
     #[test]
@@ -314,86 +349,147 @@ mod tests {
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body("{}");
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                flow_id = str::from_utf8(&body).unwrap().to_owned();
-                Ok(())
-            })
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  flow_id = str::from_utf8(&body).unwrap().to_owned();
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
         // The empty chunk should be ignored.
-        let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                Ok(())
-            })
-        })).unwrap();
+        let req = Request::new(Post,
+                               format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
         // There should be no chunk.
-        let req = Request::new(Post, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::NotFound);
-            Ok(())
-        })).unwrap();
+        let req = Request::new(Get,
+                               format!("{}/{}/fetch/0", prefix, flow_id)
+                                   .parse()
+                                   .unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                                   assert_eq!(res.status(), StatusCode::NotFound);
+                                   Ok(())
+                               }))
+            .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, fake_id).parse().unwrap());
+        let mut req = Request::new(Post,
+                                   format!("{}/{}/push", prefix, fake_id).parse().unwrap());
         req.set_body(payload1);
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::NotFound);
-            Ok(())
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                                   assert_eq!(res.status(), StatusCode::NotFound);
+                                   Ok(())
+                               }))
+            .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        let mut req = Request::new(Post,
+                                   format!("{}/{}/push", prefix, flow_id).parse().unwrap());
         req.set_body(payload1);
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                Ok(())
-            })
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        let mut req = Request::new(Post,
+                                   format!("{}/{}/push", prefix, flow_id).parse().unwrap());
         req.set_body(payload2);
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                Ok(())
-            })
-        })).unwrap();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
-        let req = Request::new(Post, format!("{}/{}/fetch/0", prefix, fake_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::NotFound);
-            Ok(())
-        })).unwrap();
+        let req = Request::new(Get,
+                               format!("{}/{}/fetch/0", prefix, fake_id)
+                                   .parse()
+                                   .unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                                   assert_eq!(res.status(), StatusCode::NotFound);
+                                   Ok(())
+                               }))
+            .unwrap();
 
-        let req = Request::new(Post, format!("{}/{}/fetch/10", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::NotFound);
-            Ok(())
-        })).unwrap();
+        let req = Request::new(Get,
+                               format!("{}/{}/fetch/10", prefix, flow_id)
+                                   .parse()
+                                   .unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                                   assert_eq!(res.status(), StatusCode::NotFound);
+                                   Ok(())
+                               }))
+            .unwrap();
 
-        let req = Request::new(Post, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                assert_eq!(&body as &[u8], payload1);
-                Ok(())
-            })
-        })).unwrap();
+        let req = Request::new(Get,
+                               format!("{}/{}/fetch/0", prefix, flow_id)
+                                   .parse()
+                                   .unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  assert_eq!(&body as &[u8], payload1);
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
 
-        let req = Request::new(Post, format!("{}/{}/fetch/1", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat().and_then(|body| {
-                assert_eq!(&body as &[u8], payload2);
-                Ok(())
-            })
-        })).unwrap();
+        let req = Request::new(Get,
+                               format!("{}/{}/fetch/1", prefix, flow_id)
+                                   .parse()
+                                   .unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                                  assert_eq!(&body as &[u8], payload2);
+                                  Ok(())
+                              })
+            }))
+            .unwrap();
     }
 }
