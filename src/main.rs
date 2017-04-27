@@ -16,7 +16,7 @@ mod flow;
 
 use dotenv::dotenv;
 use flow::Flow;
-use futures::{Future, Stream, future, stream};
+use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
 use hyper::header::{ContentLength, ContentType};
 use hyper::server::{Http, Request, Response, Service};
@@ -24,7 +24,7 @@ use regex::Regex;
 use std::{env, thread};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, RwLock};
-use tokio::reactor::Core;
+use tokio::reactor::{self, Core};
 
 #[derive(Debug)]
 pub enum Error {
@@ -36,6 +36,7 @@ type SharedFlow = Arc<RwLock<Flow>>;
 
 #[derive(Clone)]
 struct FluxService {
+    remote: reactor::Remote,
     flow_bucket: Arc<RwLock<HashMap<String, SharedFlow>>>,
 }
 
@@ -47,8 +48,11 @@ struct FlowReqParam {
 type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
 impl FluxService {
-    fn new() -> Self {
-        FluxService { flow_bucket: Arc::new(RwLock::new(HashMap::new())) }
+    fn new(remote: reactor::Remote) -> Self {
+        FluxService {
+            remote: remote,
+            flow_bucket: Arc::new(RwLock::new(HashMap::new())),
+        }
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
@@ -115,9 +119,10 @@ impl FluxService {
                 };
                 if let Some(flush_chunk) = flush_chunk {
                     let mut flow = flow.write().unwrap();
-                    flow.push(&flush_chunk).map(|_| ret_chunk).map_err(|_| {
-                        hyper::error::Error::Incomplete
-                    }).boxed()
+                    flow.push(&flush_chunk)
+                        .map(|_| ret_chunk)
+                        .map_err(|_| hyper::error::Error::Incomplete)
+                        .boxed()
                 } else {
                     future::ok(ret_chunk).boxed()
                 }
@@ -163,8 +168,37 @@ impl FluxService {
                 .boxed()
     }
 
-    fn handle_pull(&self, _req: Request, _route: regex::Captures) -> ResponseFuture {
-        unreachable!();
+    fn handle_pull(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
+        let flow_id = route.get(1).unwrap().as_str();
+        let flow = {
+            let bucket = self.flow_bucket.read().unwrap();
+            if let Some(flow) = bucket.get(flow_id) {
+                flow.clone()
+            } else {
+                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            }
+        };
+
+        // Occupy the first chunk to make sure it's always valid.
+        let begin = {
+            let mut flow = flow.write().unwrap();
+            let start_index = flow.tail_index;
+            flow.pull(start_index, None)
+        };
+        // Get the remote reactor.
+        let remote = self.remote.clone();
+        begin
+            .map(move |first_chunk| {
+                let body_stream = stream::once(Ok(Ok(hyper::Chunk::from(first_chunk))));
+                let (tx, body) = hyper::Body::pair();
+                // Schedule the sender to the reactor.
+                remote.spawn(move |_| {
+                    tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
+                });
+                Response::new().with_body(body)
+            })
+            .or_else(|_| future::ok(Response::new().with_status(StatusCode::InternalServerError)))
+            .boxed()
     }
 }
 
@@ -198,6 +232,8 @@ impl Service for FluxService {
             &Method::Get => {
                 if let Some(route) = PATTERN_FETCH.captures(path) {
                     self.handle_fetch(req, route)
+                } else if let Some(route) = PATTERN_PULL.captures(path) {
+                    self.handle_pull(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
@@ -211,8 +247,6 @@ fn start_service(addr: std::net::SocketAddr,
                  num_worker: usize,
                  block: bool)
                  -> Option<std::net::SocketAddr> {
-    let service = FluxService::new();
-
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
@@ -220,11 +254,11 @@ fn start_service(addr: std::net::SocketAddr,
     for idx in 0..num_worker {
         let moved_addr = addr.clone();
         let moved_listener = upstream_listener.try_clone().unwrap();
-        let moved_service = service.clone();
         let moved_barrier = barrier.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
+            let remote = core.remote();
             let listener =
                 tokio::net::TcpListener::from_listener(moved_listener, &moved_addr, &handle)
                     .unwrap();
@@ -232,7 +266,7 @@ fn start_service(addr: std::net::SocketAddr,
             let acceptor = listener
                 .incoming()
                 .for_each(|(io, addr)| {
-                    http.bind_connection(&handle, io, addr, moved_service.clone());
+                    http.bind_connection(&handle, io, addr, FluxService::new(remote.clone()));
                     Ok(())
                 });
             println!("Worker #{} is started.", idx);

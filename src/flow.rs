@@ -1,4 +1,4 @@
-use futures::{Future, Stream, future, stream};
+use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::HashMap;
 use std::result::Result as StdResult;
@@ -28,10 +28,11 @@ pub struct Flow {
     pub size: Option<u64>,
     active_stamp: Instant,
     next_index: u64,
-    tail_index: u64,
+    pub tail_index: u64,
     chunk_bucket: HashMap<u64, Chunk>,
     wait_list: HashMap<u64, Vec<oneshot::Sender<Chunk>>>,
-    stat_size: u64,
+    pub stat_pushed: u64,
+    pub stat_dropped: u64,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -46,7 +47,8 @@ impl Flow {
             tail_index: 0,
             chunk_bucket: HashMap::new(),
             wait_list: HashMap::new(),
-            stat_size: 0,
+            stat_pushed: 0,
+            stat_dropped: 0,
         }
     }
 
@@ -55,7 +57,7 @@ impl Flow {
             return future::err(Error::Invalid).boxed();
         }
         if let Some(size) = self.size {
-            if (data.len() as u64) + self.stat_size > size {
+            if (data.len() as u64) + self.stat_pushed > size {
                 return future::err(Error::Invalid).boxed();
             }
         }
@@ -72,7 +74,7 @@ impl Flow {
         // Insert the chunk.
         self.chunk_bucket.insert(chunk_index, chunk);
 
-        self.stat_size += data.len() as u64;
+        self.stat_pushed += data.len() as u64;
         future::ok(chunk_index).boxed()
     }
 
