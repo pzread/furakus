@@ -1,9 +1,9 @@
+use futures::{Future, Stream, future, stream};
+use futures::sync::oneshot;
 use std::collections::HashMap;
 use std::result::Result as StdResult;
 use std::time::Instant;
 use uuid::Uuid;
-use futures::{Future, Stream, future, stream};
-use futures::sync::oneshot;
 
 #[derive(Debug, PartialEq)]
 pub enum Error {
@@ -95,11 +95,7 @@ impl Flow {
         let (tx, rx) = oneshot::channel();
         let waits = self.wait_list.entry(chunk_index).or_insert(Vec::new());
         waits.push(tx);
-        rx.and_then(|chunk| {
-            future::ok(chunk.data)
-        }).or_else(|_| {
-            future::err(Error::Other)
-        }).boxed()
+        rx.and_then(|chunk| future::ok(chunk.data)).or_else(|_| future::err(Error::Other)).boxed()
     }
 }
 
@@ -134,5 +130,7 @@ mod tests {
         let mut flow = Flow::new(None);
 
         assert_eq!(flow.pull(0, Some(0)).wait(), Err(Error::NotReady));
+        assert_eq!(flow.pull(1, None).join3(flow.push(b"ello"), flow.push(b"hello")).wait(),
+                   Ok((Vec::from(b"hello" as &[u8]), 0, 1)));
     }
 }
