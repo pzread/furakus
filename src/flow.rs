@@ -34,7 +34,7 @@ pub struct Flow {
     stat_size: u64,
 }
 
-type FlowFuture<T> = Box<Future<Item = T, Error = Error> + Send>;
+type FlowFuture<T> = future::BoxFuture<T, Error>;
 
 impl Flow {
     pub fn new(size: Option<u64>) -> Self {
@@ -108,7 +108,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flow_chunk() {
+    fn basic_flow_operations() {
         let mut flow = Flow::new(None);
 
         assert_eq!(flow.push(&[1u8; 1234]).wait(), Ok(0));
@@ -116,16 +116,23 @@ mod tests {
         assert_eq!(flow.push(b"hello").wait(), Ok(2));
         assert_eq!(flow.push(&[2u8; MAX_SIZE + 1]).wait(), Err(Error::Invalid));
 
-        assert_eq!(flow.fetch(2), Ok(b"hello" as &[u8]));
-        assert_eq!(flow.fetch(100), Err(Error::NotFound));
+        assert_eq!(flow.pull(2, Some(0)).wait(), Ok(Vec::from(b"hello" as &[u8])));
+        assert_eq!(flow.pull(100, Some(0)).wait(), Err(Error::NotReady));
     }
 
     #[test]
-    fn flow_fixed_size() {
+    fn fixed_size_flow() {
         let mut flow = Flow::new(Some(10));
 
         assert_eq!(flow.push(b"hello").wait(), Ok(0));
         assert_eq!(flow.push(b"world").wait(), Ok(1));
         assert_eq!(flow.push(b"!").wait(), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn pull_chunk() {
+        let mut flow = Flow::new(None);
+
+        assert_eq!(flow.pull(0, Some(0)).wait(), Err(Error::NotReady));
     }
 }

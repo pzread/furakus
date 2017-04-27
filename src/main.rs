@@ -44,7 +44,7 @@ struct FlowReqParam {
     pub size: Option<u64>,
 }
 
-type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
+type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
 impl FluxService {
     fn new() -> Self {
