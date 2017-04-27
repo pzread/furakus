@@ -44,7 +44,7 @@ struct FlowReqParam {
     pub size: Option<u64>,
 }
 
-type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error>>;
+type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
 
 impl FluxService {
     fn new() -> Self {
@@ -117,9 +117,9 @@ impl FluxService {
                     let mut flow = flow.write().unwrap();
                     flow.push(&flush_chunk).map(|_| ret_chunk).map_err(|_| {
                         hyper::error::Error::Incomplete
-                    })
+                    }).boxed()
                 } else {
-                    Ok(ret_chunk)
+                    future::ok(ret_chunk).boxed()
                 }
             })
             .and_then(|_| {
