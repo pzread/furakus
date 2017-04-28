@@ -48,10 +48,10 @@ struct FlowReqParam {
 type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
 impl FluxService {
-    fn new(remote: reactor::Remote) -> Self {
+    fn new(flow_bucket: Arc<RwLock<HashMap<String, SharedFlow>>>, remote: reactor::Remote) -> Self {
         FluxService {
             remote: remote,
-            flow_bucket: Arc::new(RwLock::new(HashMap::new())),
+            flow_bucket,
         }
     }
 
@@ -99,33 +99,41 @@ impl FluxService {
         // Read the body and push chunks.
         let init_chunk = Vec::<u8>::with_capacity(flow::MAX_SIZE);
         body_stream
-            .fold(init_chunk, move |mut rem_chunk, chunk| {
-                let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
-                    if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
-                        let caplen = flow::MAX_SIZE - rem_chunk.len();
-                        rem_chunk.extend_from_slice(&chunk[..caplen]);
-                        (Some(rem_chunk), chunk[caplen..].to_vec())
+            .fold(init_chunk, {
+                let flow = flow.clone();
+                move |mut rem_chunk, chunk| {
+                    let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
+                        if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
+                            let caplen = flow::MAX_SIZE - rem_chunk.len();
+                            rem_chunk.extend_from_slice(&chunk[..caplen]);
+                            (Some(rem_chunk), chunk[caplen..].to_vec())
+                        } else {
+                            rem_chunk.extend_from_slice(&chunk);
+                            (None, rem_chunk)
+                        }
                     } else {
-                        rem_chunk.extend_from_slice(&chunk);
-                        (None, rem_chunk)
+                        // EOF, flush the remaining chunk.
+                        if rem_chunk.len() > 0 {
+                            (Some(rem_chunk), Vec::new())
+                        } else {
+                            (None, Vec::new())
+                        }
+                    };
+                    match flush_chunk {
+                        Some(flush_chunk) => {
+                            let mut flow = flow.write().unwrap();
+                            flow.push(&flush_chunk)
+                                .map(|_| ret_chunk)
+                                .map_err(|_| hyper::error::Error::Incomplete)
+                                .boxed()
+                        }
+                        None => future::ok(ret_chunk).boxed(),
                     }
-                } else {
-                    // EOF, flush the remaining chunk.
-                    if rem_chunk.len() > 0 {
-                        (Some(rem_chunk), Vec::new())
-                    } else {
-                        (None, Vec::new())
-                    }
-                };
-                if let Some(flush_chunk) = flush_chunk {
-                    let mut flow = flow.write().unwrap();
-                    flow.push(&flush_chunk)
-                        .map(|_| ret_chunk)
-                        .map_err(|_| hyper::error::Error::Incomplete)
-                        .boxed()
-                } else {
-                    future::ok(ret_chunk).boxed()
                 }
+            })
+            .and_then(move |_| {
+                let mut flow = flow.write().unwrap();
+                flow.close().map(|_| ()).map_err(|_| hyper::error::Error::Incomplete)
             })
             .and_then(|_| {
                 let body = "Ok";
@@ -183,13 +191,34 @@ impl FluxService {
         let begin = {
             let mut flow = flow.write().unwrap();
             let start_index = flow.tail_index;
-            flow.pull(start_index, None)
+            flow.pull(start_index, None).map(move |chunk| (start_index, chunk))
         };
         // Get the remote reactor.
         let remote = self.remote.clone();
         begin
-            .map(move |first_chunk| {
-                let body_stream = stream::once(Ok(Ok(hyper::Chunk::from(first_chunk))));
+            .map(move |(start_index, first_chunk)| {
+                let body_stream = stream::once(Ok(Ok(hyper::Chunk::from(first_chunk))))
+                    .chain(stream::unfold(Some(start_index + 1), move |chunk_index| {
+                        // Check if the flow is EOF.
+                        if let Some(chunk_index) = chunk_index {
+                            let mut flow = flow.write().unwrap();
+                            let fut = flow.pull(chunk_index, None)
+                                .and_then(move |chunk| {
+                                    let hyper_chunk = Ok(hyper::Chunk::from(chunk));
+                                    future::ok((hyper_chunk, Some(chunk_index + 1)))
+                                })
+                                .or_else(|err| match err {
+                                             flow::Error::Eof => {
+                                                 future::ok((Ok(hyper::Chunk::from(&[] as &[u8])),
+                                                             None))
+                                             }
+                                             _ => future::ok((Err(hyper::Error::Incomplete), None)),
+                                         });
+                            Some(fut)
+                        } else {
+                            None
+                        }
+                    }));
                 let (tx, body) = hyper::Body::pair();
                 // Schedule the sender to the reactor.
                 remote.spawn(move |_| {
@@ -223,8 +252,6 @@ impl Service for FluxService {
                     self.handle_new(req, route)
                 } else if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
-                } else if let Some(route) = PATTERN_PULL.captures(path) {
-                    self.handle_pull(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
@@ -248,6 +275,7 @@ fn start_service(addr: std::net::SocketAddr,
                  block: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
+    let flow_bucket = Arc::new(RwLock::new(HashMap::new()));
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
@@ -255,6 +283,7 @@ fn start_service(addr: std::net::SocketAddr,
         let moved_addr = addr.clone();
         let moved_listener = upstream_listener.try_clone().unwrap();
         let moved_barrier = barrier.clone();
+        let moved_bucket = flow_bucket.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
@@ -266,7 +295,10 @@ fn start_service(addr: std::net::SocketAddr,
             let acceptor = listener
                 .incoming()
                 .for_each(|(io, addr)| {
-                    http.bind_connection(&handle, io, addr, FluxService::new(remote.clone()));
+                    http.bind_connection(&handle,
+                                         io,
+                                         addr,
+                                         FluxService::new(moved_bucket.clone(), remote.clone()));
                     Ok(())
                 });
             println!("Worker #{} is started.", idx);
@@ -303,7 +335,7 @@ mod tests {
     use hyper::client::{Client, Request};
     use hyper::status::StatusCode;
     use regex::Regex;
-    use std::str;
+    use std::{str, thread};
     use tokio::reactor::Core;
 
     fn spawn_server() -> String {
@@ -360,7 +392,7 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
+    // #[test]
     fn handle_push_fetch() {
         let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
@@ -492,6 +524,66 @@ mod tests {
                     .concat()
                     .and_then(|body| {
                         assert_eq!(&body as &[u8], payload2);
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn handle_push_pull() {
+        let prefix = &spawn_server();
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let mut flow_id = String::new();
+        let payload: &[u8] = b"The quick brown fox jumps over the lazy dog";
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body("{}");
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        flow_id = str::from_utf8(&body).unwrap().to_owned();
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        thread::spawn({
+            let prefix = prefix.clone();
+            let flow_id = flow_id.clone();
+            let payload = payload.clone();
+            move || {
+                let mut core = Core::new().unwrap();
+                let client = Client::new(&core.handle());
+
+                let mut req = Request::new(Post,
+                                           format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+                req.set_body(payload);
+                core.run(client
+                             .request(req)
+                             .and_then(|res| {
+                        assert_eq!(res.status(), StatusCode::Ok);
+                        Ok(())
+                    }))
+                    .unwrap();
+            }
+        });
+
+        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(&body as &[u8], payload);
                         Ok(())
                     })
             }))
