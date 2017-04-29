@@ -182,5 +182,6 @@ mod tests {
         assert_eq!(flow.pull(0, Some(0)).wait(), Ok(Vec::from(b"hello" as &[u8])));
         assert_eq!(flow.close().wait(), Ok(()));
         assert_eq!(flow.pull(1, Some(0)).wait(), Err(Error::Eof));
+        assert_eq!(flow.close().wait(), Err(Error::Invalid));
     }
 }

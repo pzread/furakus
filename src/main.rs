@@ -140,8 +140,12 @@ impl FluxService {
                     Some(size) if pushed == size => {
                         let mut flow = flow.write().unwrap();
                         flow.close()
-                            .map(|_| ())
-                            .map_err(|_| hyper::error::Error::Incomplete)
+                            .then(|result| match result {
+                                      // Ignore invalid close error.
+                                      Ok(_) |
+                                      Err(flow::Error::Invalid) => Ok(()),
+                                      _ => Err(hyper::Error::Incomplete),
+                                  })
                             .boxed()
                     }
                     _ => future::ok(()).boxed(),
