@@ -1,6 +1,7 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -18,9 +19,11 @@ pub const MAX_SIZE: usize = 65536;
 
 #[derive(Clone, Debug)]
 pub enum Chunk {
-    Data(Vec<u8>),
-    Eof,
+    Data(u64, Vec<u8>),
+    Eof(u64),
 }
+
+type SharedChunk = Arc<RwLock<Chunk>>;
 
 pub struct Flow {
     pub id: String,
@@ -28,8 +31,8 @@ pub struct Flow {
     active_stamp: Instant,
     next_index: u64,
     pub tail_index: u64,
-    chunk_bucket: HashMap<u64, Chunk>,
-    wait_list: HashMap<u64, Vec<oneshot::Sender<Chunk>>>,
+    chunk_bucket: HashMap<u64, SharedChunk>,
+    wait_list: HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>,
     pub stat_pushed: u64,
     pub stat_dropped: u64,
 }
@@ -51,22 +54,24 @@ impl Flow {
         }
     }
 
-    fn push_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
+    fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
+        let shared_chunk = Arc::new(RwLock::new(chunk));
         let chunk_index = self.next_index;
         self.next_index += 1;
         // Wake up the waiting fetch.
         if let Some(waits) = self.wait_list.remove(&chunk_index) {
             for wait in waits {
-                wait.send(chunk.clone()).unwrap();
+                // Don't unwrap, since the receiver can early quit.
+                wait.send(shared_chunk.clone()).is_ok();
             }
         }
         // Insert the chunk.
-        self.chunk_bucket.insert(chunk_index, chunk);
+        self.chunk_bucket.insert(chunk_index, shared_chunk);
         future::ok(chunk_index).boxed()
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
-        self.push_chunk(Chunk::Eof).map(|_| ()).boxed()
+        self.acquire_chunk(Chunk::Eof(1)).map(|_| ()).boxed()
     }
 
     pub fn push(&mut self, data: &[u8]) -> FlowFuture<u64> {
@@ -79,16 +84,26 @@ impl Flow {
             }
         }
         self.stat_pushed += data.len() as u64;
-        self.push_chunk(Chunk::Data(data.to_vec()))
+        self.acquire_chunk(Chunk::Data(1, data.to_vec()))
+    }
+
+    fn deref_chunk(shared_chunk: &SharedChunk) -> Result<Vec<u8>, Error> {
+        let mut chunk = shared_chunk.write().unwrap();
+        match *chunk {
+            Chunk::Data(ref mut count, ref data) => {
+                *count += 1;
+                Ok(data.to_vec())
+            }
+            Chunk::Eof(ref mut count) => {
+                *count += 1;
+                Err(Error::Eof)
+            }
+        }
     }
 
     pub fn pull(&mut self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
-        if let Some(chunk) = self.chunk_bucket.get(&chunk_index) {
-            return match *chunk {
-                           Chunk::Data(ref data) => future::ok(data.clone()),
-                           Chunk::Eof => future::err(Error::Eof),
-                       }
-                       .boxed();
+        if let Some(chunk) = self.chunk_bucket.get_mut(&chunk_index) {
+            return future::result(Flow::deref_chunk(chunk)).boxed();
         } else if chunk_index < self.next_index {
             return future::err(Error::Dropped).boxed();
         } else if let Some(0) = timeout {
@@ -98,10 +113,7 @@ impl Flow {
         let waits = self.wait_list.entry(chunk_index).or_insert(Vec::new());
         waits.push(tx);
         rx.map_err(|_| Error::Other)
-            .and_then(|chunk| match chunk {
-                          Chunk::Data(ref data) => future::ok(data.clone()),
-                          Chunk::Eof => future::err(Error::Eof),
-                      })
+            .and_then(|chunk| future::result(Flow::deref_chunk(&chunk)))
             .boxed()
     }
 }
