@@ -132,9 +132,13 @@ impl FluxService {
                 }
             })
             .and_then(move |_| {
-                let mut flow = flow.write().unwrap();
-                match flow.size {
-                    Some(size) if flow.stat_pushed == size => {
+                let (size, pushed) = {
+                    let flow = flow.read().unwrap();
+                    (flow.size, flow.stat_pushed)
+                };
+                match size {
+                    Some(size) if pushed == size => {
+                        let mut flow = flow.write().unwrap();
                         flow.close()
                             .map(|_| ())
                             .map_err(|_| hyper::error::Error::Incomplete)
@@ -170,7 +174,7 @@ impl FluxService {
             }
         };
         {
-            let mut flow = flow.write().unwrap();
+            let flow = flow.read().unwrap();
             flow.pull(chunk_index, Some(0))
                 .and_then(|chunk| {
                     future::ok(Response::new()
@@ -207,7 +211,7 @@ impl FluxService {
 
         // Occupy the first chunk to make sure it's always valid.
         let begin = {
-            let mut flow = flow.write().unwrap();
+            let flow = flow.read().unwrap();
             let start_index = flow.tail_index;
             flow.pull(start_index, None).map(move |chunk| (start_index, chunk))
         };
@@ -219,7 +223,7 @@ impl FluxService {
                     .chain(stream::unfold(Some(start_index + 1), move |chunk_index| {
                         // Check if the flow is EOF.
                         if let Some(chunk_index) = chunk_index {
-                            let mut flow = flow.write().unwrap();
+                            let flow = flow.read().unwrap();
                             let fut = flow.pull(chunk_index, None)
                                 .and_then(move |chunk| {
                                     let hyper_chunk = Ok(hyper::Chunk::from(chunk));

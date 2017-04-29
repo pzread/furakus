@@ -1,7 +1,7 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -18,6 +18,12 @@ pub enum Error {
 pub const MAX_SIZE: usize = 65536;
 
 #[derive(Clone, Debug)]
+enum State {
+    Streaming,
+    Stop,
+}
+
+#[derive(Clone, Debug)]
 pub enum Chunk {
     Data(u64, Vec<u8>),
     Eof(u64),
@@ -28,13 +34,14 @@ type SharedChunk = Arc<RwLock<Chunk>>;
 pub struct Flow {
     pub id: String,
     pub size: Option<u64>,
+    state: State,
     active_stamp: Instant,
     next_index: u64,
     pub tail_index: u64,
-    chunk_bucket: HashMap<u64, SharedChunk>,
-    wait_list: HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>,
     pub stat_pushed: u64,
     pub stat_dropped: u64,
+    chunk_bucket: HashMap<u64, SharedChunk>,
+    wait_list: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -44,13 +51,21 @@ impl Flow {
         Flow {
             id: Uuid::new_v4().simple().to_string(),
             size: size,
+            state: State::Streaming,
             active_stamp: Instant::now(),
             next_index: 0,
             tail_index: 0,
             chunk_bucket: HashMap::new(),
-            wait_list: HashMap::new(),
+            wait_list: Arc::new(Mutex::new(HashMap::new())),
             stat_pushed: 0,
             stat_dropped: 0,
+        }
+    }
+
+    fn is_streaming(&self) -> bool {
+        match self.state {
+            State::Streaming => true,
+            _ => false,
         }
     }
 
@@ -59,10 +74,13 @@ impl Flow {
         let chunk_index = self.next_index;
         self.next_index += 1;
         // Wake up the waiting fetch.
-        if let Some(waits) = self.wait_list.remove(&chunk_index) {
-            for wait in waits {
-                // Don't unwrap, since the receiver can early quit.
-                wait.send(shared_chunk.clone()).is_ok();
+        {
+            let mut wait_list = self.wait_list.lock().unwrap();
+            if let Some(waits) = wait_list.remove(&chunk_index) {
+                for wait in waits {
+                    // Don't unwrap, since the receiver can early quit.
+                    wait.send(shared_chunk.clone()).is_ok();
+                }
             }
         }
         // Insert the chunk.
@@ -71,7 +89,12 @@ impl Flow {
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
-        self.acquire_chunk(Chunk::Eof(1)).map(|_| ()).boxed()
+        if self.is_streaming() {
+            self.state = State::Stop;
+            self.acquire_chunk(Chunk::Eof(1)).map(|_| ()).boxed()
+        } else {
+            future::err(Error::Invalid).boxed()
+        }
     }
 
     pub fn push(&mut self, data: &[u8]) -> FlowFuture<u64> {
@@ -101,8 +124,8 @@ impl Flow {
         }
     }
 
-    pub fn pull(&mut self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
-        if let Some(chunk) = self.chunk_bucket.get_mut(&chunk_index) {
+    pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
+        if let Some(chunk) = self.chunk_bucket.get(&chunk_index) {
             return future::result(Flow::deref_chunk(chunk)).boxed();
         } else if chunk_index < self.next_index {
             return future::err(Error::Dropped).boxed();
@@ -110,8 +133,11 @@ impl Flow {
             return future::err(Error::NotReady).boxed();
         }
         let (tx, rx) = oneshot::channel();
-        let waits = self.wait_list.entry(chunk_index).or_insert(Vec::new());
-        waits.push(tx);
+        {
+            let mut wait_list = self.wait_list.lock().unwrap();
+            let waits = wait_list.entry(chunk_index).or_insert(Vec::new());
+            waits.push(tx);
+        }
         rx.map_err(|_| Error::Other)
             .and_then(|chunk| future::result(Flow::deref_chunk(&chunk)))
             .boxed()
