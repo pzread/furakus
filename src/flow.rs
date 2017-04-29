@@ -1,7 +1,6 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::HashMap;
-use std::result::Result as StdResult;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -14,8 +13,6 @@ pub enum Error {
     Eof,
     Other,
 }
-
-pub type Result<T> = StdResult<T, Error>;
 
 pub const MAX_SIZE: usize = 65536;
 
@@ -85,23 +82,13 @@ impl Flow {
         self.push_chunk(Chunk::Data(data.to_vec()))
     }
 
-    pub fn fetch(&self, chunk_index: u64) -> Result<&[u8]> {
-        if let Some(chunk) = self.chunk_bucket.get(&chunk_index) {
-            match *chunk {
-                Chunk::Data(ref data) => Ok(data),
-                Chunk::Eof => Err(Error::Eof),
-            }
-        } else {
-            Err(Error::NotFound)
-        }
-    }
-
     pub fn pull(&mut self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
         if let Some(chunk) = self.chunk_bucket.get(&chunk_index) {
             return match *chunk {
-                       Chunk::Data(ref data) => future::ok(data.clone()).boxed(),
-                       Chunk::Eof => future::err(Error::Eof).boxed(),
-                   };
+                           Chunk::Data(ref data) => future::ok(data.clone()),
+                           Chunk::Eof => future::err(Error::Eof),
+                       }
+                       .boxed();
         } else if chunk_index < self.next_index {
             return future::err(Error::Dropped).boxed();
         } else if let Some(0) = timeout {

@@ -133,7 +133,15 @@ impl FluxService {
             })
             .and_then(move |_| {
                 let mut flow = flow.write().unwrap();
-                flow.close().map(|_| ()).map_err(|_| hyper::error::Error::Incomplete)
+                match flow.size {
+                    Some(size) if flow.stat_pushed == size => {
+                        flow.close()
+                            .map(|_| ())
+                            .map_err(|_| hyper::error::Error::Incomplete)
+                            .boxed()
+                    }
+                    _ => future::ok(()).boxed(),
+                }
             })
             .and_then(|_| {
                 let body = "Ok";
@@ -161,19 +169,29 @@ impl FluxService {
                 return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
             }
         };
-        let chunk = {
-            let flow = flow.read().unwrap();
-            if let Ok(chunk) = flow.fetch(chunk_index) {
-                chunk.to_vec()
-            } else {
-                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
-            }
-        };
-        future::ok(Response::new()
-                       .with_header(ContentType(mime!(Application / OctetStream)))
-                       .with_header(ContentLength(chunk.len() as u64))
-                       .with_body(chunk))
+        {
+            let mut flow = flow.write().unwrap();
+            flow.pull(chunk_index, Some(0))
+                .and_then(|chunk| {
+                    future::ok(Response::new()
+                                   .with_header(ContentType(mime!(Application / OctetStream)))
+                                   .with_header(ContentLength(chunk.len() as u64))
+                                   .with_body(chunk))
+                })
+                .or_else(|err| match err {
+                             flow::Error::Eof | flow::Error::Dropped => {
+                                 future::ok(Response::new().with_status(StatusCode::NotFound))
+                             }
+                             flow::Error::NotReady => {
+                                 future::ok(Response::new().with_status(StatusCode::RequestTimeout))
+                             }
+                             _ => {
+                                 future::ok(Response::new()
+                                                .with_status(StatusCode::InternalServerError))
+                             }
+                         })
                 .boxed()
+        }
     }
 
     fn handle_pull(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
@@ -280,17 +298,16 @@ fn start_service(addr: std::net::SocketAddr,
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
     for idx in 0..num_worker {
-        let moved_addr = addr.clone();
-        let moved_listener = upstream_listener.try_clone().unwrap();
-        let moved_barrier = barrier.clone();
-        let moved_bucket = flow_bucket.clone();
+        let addr = addr.clone();
+        let listener = upstream_listener.try_clone().unwrap();
+        let barrier = barrier.clone();
+        let bucket = flow_bucket.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
-            let listener =
-                tokio::net::TcpListener::from_listener(moved_listener, &moved_addr, &handle)
-                    .unwrap();
+            let listener = tokio::net::TcpListener::from_listener(listener, &addr, &handle)
+                .unwrap();
             let http = Http::new();
             let acceptor = listener
                 .incoming()
@@ -298,11 +315,11 @@ fn start_service(addr: std::net::SocketAddr,
                     http.bind_connection(&handle,
                                          io,
                                          addr,
-                                         FluxService::new(moved_bucket.clone(), remote.clone()));
+                                         FluxService::new(bucket.clone(), remote.clone()));
                     Ok(())
                 });
             println!("Worker #{} is started.", idx);
-            moved_barrier.wait();
+            barrier.wait();
             core.run(acceptor).unwrap();
         });
         workers.push(worker);
@@ -392,7 +409,7 @@ mod tests {
             .unwrap();
     }
 
-    // #[test]
+    #[test]
     fn handle_push_fetch() {
         let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
@@ -438,7 +455,7 @@ mod tests {
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
+                assert_eq!(res.status(), StatusCode::RequestTimeout);
                 Ok(())
             }))
             .unwrap();
@@ -496,7 +513,7 @@ mod tests {
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
+                assert_eq!(res.status(), StatusCode::RequestTimeout);
                 Ok(())
             }))
             .unwrap();
@@ -540,7 +557,7 @@ mod tests {
         let payload: &[u8] = b"The quick brown fox jumps over the lazy dog";
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body("{}");
+        req.set_body(format!(r#"{{"size": {}}}"#, payload.len()));
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -554,11 +571,11 @@ mod tests {
             }))
             .unwrap();
 
-        thread::spawn({
+        {
             let prefix = prefix.clone();
             let flow_id = flow_id.clone();
             let payload = payload.clone();
-            move || {
+            thread::spawn(move || {
                 let mut core = Core::new().unwrap();
                 let client = Client::new(&core.handle());
 
@@ -572,8 +589,8 @@ mod tests {
                         Ok(())
                     }))
                     .unwrap();
-            }
-        });
+            });
+        }
 
         let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
         core.run(client
