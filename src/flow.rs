@@ -84,6 +84,12 @@ impl Flow {
     }
 
     fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
+        if !self.is_streaming() {
+            return future::err(Error::Invalid).boxed();
+        }
+        if let Chunk::Eof(_) = chunk {
+            self.state = State::Stop;
+        }
         let shared_chunk = Arc::new(RwLock::new(chunk));
         let chunk_index = self.next_index;
         self.next_index += 1;
@@ -104,7 +110,6 @@ impl Flow {
 
     pub fn close(&mut self) -> FlowFuture<()> {
         if self.is_streaming() {
-            self.state = State::Stop;
             self.acquire_chunk(Chunk::Eof(1)).map(|_| ()).boxed()
         } else {
             future::err(Error::Invalid).boxed()
@@ -201,6 +206,7 @@ mod tests {
         assert_eq!(flow.push(b"hello").wait(), Ok(0));
         assert_eq!(flow.pull(0, Some(0)).wait(), Ok(Vec::from(b"hello" as &[u8])));
         assert_eq!(flow.close().wait(), Ok(()));
+        assert_eq!(flow.push(b"hello").wait(), Err(Error::Invalid));
         assert_eq!(flow.pull(1, Some(0)).wait(), Err(Error::Eof));
         assert_eq!(flow.close().wait(), Err(Error::Invalid));
     }

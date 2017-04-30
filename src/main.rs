@@ -676,6 +676,16 @@ mod tests {
             }))
             .unwrap();
 
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(b"Hello" as &[u8]);
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::InternalServerError);
+                Ok(())
+            }))
+            .unwrap();
+
         let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
