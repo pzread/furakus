@@ -2,7 +2,6 @@ use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
@@ -16,12 +15,7 @@ pub enum Error {
 }
 
 pub const MAX_SIZE: usize = 65536;
-
-#[derive(Clone, Debug)]
-enum State {
-    Streaming,
-    Stop,
-}
+pub const MAX_CAPACITY: u64 = 16777216;
 
 #[derive(Clone, Debug)]
 pub enum Chunk {
@@ -31,15 +25,30 @@ pub enum Chunk {
 
 type SharedChunk = Arc<RwLock<Chunk>>;
 
+#[derive(Clone, Debug)]
+enum State {
+    Streaming,
+    Stop,
+}
+
+pub struct Config {
+    pub length: Option<u64>,
+    pub capacity: u64,
+}
+
+pub struct Statistic {
+    pub pushed: u64,
+    pub dropped: u64,
+}
+
 pub struct Flow {
     pub id: String,
-    pub size: Option<u64>,
+    pub config: Config,
+    pub statistic: Statistic,
     state: State,
-    active_stamp: Instant,
     next_index: u64,
     pub tail_index: u64,
-    pub stat_pushed: u64,
-    pub stat_dropped: u64,
+    buffered: u64,
     chunk_bucket: HashMap<u64, SharedChunk>,
     wait_list: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
 }
@@ -47,18 +56,23 @@ pub struct Flow {
 type FlowFuture<T> = future::BoxFuture<T, Error>;
 
 impl Flow {
-    pub fn new(size: Option<u64>) -> Self {
+    pub fn new(length: Option<u64>) -> Self {
         Flow {
             id: Uuid::new_v4().simple().to_string(),
-            size: size,
+            config: Config {
+                length,
+                capacity: MAX_CAPACITY,
+            },
+            statistic: Statistic {
+                pushed: 0,
+                dropped: 0,
+            },
             state: State::Streaming,
-            active_stamp: Instant::now(),
             next_index: 0,
             tail_index: 0,
+            buffered: 0,
             chunk_bucket: HashMap::new(),
             wait_list: Arc::new(Mutex::new(HashMap::new())),
-            stat_pushed: 0,
-            stat_dropped: 0,
         }
     }
 
@@ -73,7 +87,7 @@ impl Flow {
         let shared_chunk = Arc::new(RwLock::new(chunk));
         let chunk_index = self.next_index;
         self.next_index += 1;
-        // Wake up the waiting fetch.
+        // Wake up the waiting pulls.
         {
             let mut wait_list = self.wait_list.lock().unwrap();
             if let Some(waits) = wait_list.remove(&chunk_index) {
@@ -101,12 +115,18 @@ impl Flow {
         if data.len() > MAX_SIZE {
             return future::err(Error::Invalid).boxed();
         }
-        if let Some(size) = self.size {
-            if (data.len() as u64) + self.stat_pushed > size {
-                return future::err(Error::Invalid).boxed();
+        match self.statistic.pushed.checked_add(data.len() as u64) {
+            Some(new_pushed) => {
+                if let Some(length) = self.config.length {
+                    // Check if the length is over.
+                    if new_pushed > length {
+                        return future::err(Error::Invalid).boxed();
+                    }
+                }
+                self.statistic.pushed = new_pushed;
             }
-        }
-        self.stat_pushed += data.len() as u64;
+            None => return future::err(Error::Invalid).boxed(),
+        };
         self.acquire_chunk(Chunk::Data(1, data.to_vec()))
     }
 

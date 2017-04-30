@@ -99,56 +99,33 @@ impl FluxService {
         // Read the body and push chunks.
         let init_chunk = Vec::<u8>::with_capacity(flow::MAX_SIZE);
         body_stream
-            .fold(init_chunk, {
-                let flow = flow.clone();
-                move |mut rem_chunk, chunk| {
-                    let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
-                        if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
-                            let caplen = flow::MAX_SIZE - rem_chunk.len();
-                            rem_chunk.extend_from_slice(&chunk[..caplen]);
-                            (Some(rem_chunk), chunk[caplen..].to_vec())
-                        } else {
-                            rem_chunk.extend_from_slice(&chunk);
-                            (None, rem_chunk)
-                        }
+            .fold(init_chunk, move |mut rem_chunk, chunk| {
+                let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
+                    if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
+                        let caplen = flow::MAX_SIZE - rem_chunk.len();
+                        rem_chunk.extend_from_slice(&chunk[..caplen]);
+                        (Some(rem_chunk), chunk[caplen..].to_vec())
                     } else {
-                        // EOF, flush the remaining chunk.
-                        if rem_chunk.len() > 0 {
-                            (Some(rem_chunk), Vec::new())
-                        } else {
-                            (None, Vec::new())
-                        }
-                    };
-                    match flush_chunk {
-                        Some(flush_chunk) => {
-                            let mut flow = flow.write().unwrap();
-                            flow.push(&flush_chunk)
-                                .map(|_| ret_chunk)
-                                .map_err(|_| hyper::error::Error::Incomplete)
-                                .boxed()
-                        }
-                        None => future::ok(ret_chunk).boxed(),
+                        rem_chunk.extend_from_slice(&chunk);
+                        (None, rem_chunk)
                     }
-                }
-            })
-            .and_then(move |_| {
-                let (size, pushed) = {
-                    let flow = flow.read().unwrap();
-                    (flow.size, flow.stat_pushed)
+                } else {
+                    // EOF, flush the remaining chunk.
+                    if rem_chunk.len() > 0 {
+                        (Some(rem_chunk), Vec::new())
+                    } else {
+                        (None, Vec::new())
+                    }
                 };
-                match size {
-                    Some(size) if pushed == size => {
+                match flush_chunk {
+                    Some(flush_chunk) => {
                         let mut flow = flow.write().unwrap();
-                        flow.close()
-                            .then(|result| match result {
-                                      // Ignore invalid close error.
-                                      Ok(_) |
-                                      Err(flow::Error::Invalid) => Ok(()),
-                                      _ => Err(hyper::Error::Incomplete),
-                                  })
+                        flow.push(&flush_chunk)
+                            .map(|_| ret_chunk)
+                            .map_err(|_| hyper::error::Error::Incomplete)
                             .boxed()
                     }
-                    _ => future::ok(()).boxed(),
+                    None => future::ok(ret_chunk).boxed(),
                 }
             })
             .and_then(|_| {
@@ -160,6 +137,35 @@ impl FluxService {
             })
             .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
             .boxed()
+    }
+
+    fn handle_eof(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
+        let flow_id = route.get(1).unwrap().as_str();
+        let flow = {
+            let bucket = self.flow_bucket.read().unwrap();
+            if let Some(flow) = bucket.get(flow_id) {
+                flow.clone()
+            } else {
+                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            }
+        };
+        {
+            let mut flow = flow.write().unwrap();
+            flow.close()
+                .then(|result| match result {
+                          Ok(_) => Ok("Ok"),
+                          Err(flow::Error::Invalid) => Ok("Closed"),
+                          Err(err) => Err(err),
+                      })
+                .and_then(|body| {
+                    Ok(Response::new()
+                           .with_header(ContentType::plaintext())
+                           .with_header(ContentLength(body.len() as u64))
+                           .with_body(body))
+                })
+                .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
+                .boxed()
+        }
     }
 
     fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
@@ -267,6 +273,7 @@ impl Service for FluxService {
         lazy_static! {
             static ref PATTERN_NEW: Regex = Regex::new(r"/new").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"/([a-f0-9]{32})/push").unwrap();
+            static ref PATTERN_EOF: Regex = Regex::new(r"/([a-f0-9]{32})/eof").unwrap();
             static ref PATTERN_FETCH: Regex = Regex::new(r"/([a-f0-9]{32})/fetch/(\d+)").unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
         }
@@ -278,6 +285,8 @@ impl Service for FluxService {
                     self.handle_new(req, route)
                 } else if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
+                } else if let Some(route) = PATTERN_EOF.captures(path) {
+                    self.handle_eof(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
@@ -597,6 +606,21 @@ mod tests {
                         Ok(())
                     }))
                     .unwrap();
+
+                let req = Request::new(Post,
+                                       format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
+                core.run(client
+                             .request(req)
+                             .and_then(|res| {
+                        assert_eq!(res.status(), StatusCode::Ok);
+                        res.body()
+                            .concat()
+                            .and_then(|body| {
+                                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                                Ok(())
+                            })
+                    }))
+                    .unwrap();
             });
         }
 
@@ -609,6 +633,58 @@ mod tests {
                     .concat()
                     .and_then(|body| {
                         assert_eq!(&body as &[u8], payload);
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+    }
+
+    #[test]
+    fn handle_eof() {
+        let prefix = &spawn_server();
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let mut flow_id = String::new();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{}"#);
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        flow_id = str::from_utf8(&body).unwrap().to_owned();
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(str::from_utf8(&body).unwrap(), "Closed");
                         Ok(())
                     })
             }))
