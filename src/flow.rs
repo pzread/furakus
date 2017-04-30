@@ -84,6 +84,7 @@ impl Flow {
     }
 
     fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
+        // Check if the flow is EOF.
         if !self.is_streaming() {
             return future::err(Error::Invalid).boxed();
         }

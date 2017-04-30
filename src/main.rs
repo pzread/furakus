@@ -56,6 +56,14 @@ impl FluxService {
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
+        if let Some(&ContentLength(length)) = req.headers().get() {
+            if length == 0 {
+                return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed();
+            }
+        } else {
+            return future::ok(Response::new().with_status(StatusCode::LengthRequired)).boxed();
+        }
+
         let flow_bucket = self.flow_bucket.clone();
         req.body()
             .concat()
@@ -368,6 +376,7 @@ mod tests {
     use futures::{Future, Stream};
     use hyper::Method::{Get, Post, Put};
     use hyper::client::{Client, Request};
+    use hyper::header::ContentLength;
     use hyper::status::StatusCode;
     use regex::Regex;
     use std::{str, thread};
@@ -376,6 +385,31 @@ mod tests {
     fn spawn_server() -> String {
         let port = start_service("127.0.0.1:0".parse().unwrap(), 1, false).unwrap().port();
         format!("http://127.0.0.1:{}", port)
+    }
+
+    fn create_flow(prefix: &str, param: &str) -> String {
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+
+        req.set_body(param.to_owned());
+        req.headers_mut().set(ContentLength(param.len() as u64));
+
+        let mut flow_id = String::new();
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        flow_id = str::from_utf8(&body).unwrap().to_owned();
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        flow_id
     }
 
     #[test]
@@ -420,6 +454,7 @@ mod tests {
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
+        req.headers_mut().set(ContentLength(2));
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -436,6 +471,7 @@ mod tests {
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4096}"#);
+        req.headers_mut().set(ContentLength(14));
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -451,7 +487,18 @@ mod tests {
             .unwrap();
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{}"#);
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::LengthRequired);
+                Ok(())
+            }))
+            .unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4O96}"#);
+        req.headers_mut().set(ContentLength(14));
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -467,25 +514,10 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut flow_id = String::new();
+        let flow_id = create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
-        let payload1: &[u8] = b"The quick brown fox jumps over the lazy dog";
-        let payload2: &[u8] = b"The quick brown fox jumps over the lazy dog";
-
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body("{}");
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        flow_id = str::from_utf8(&body).unwrap().to_owned();
-                        Ok(())
-                    })
-            }))
-            .unwrap();
+        let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
+        let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
 
         // The empty chunk should be ignored.
         let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
@@ -605,24 +637,9 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut flow_id = String::new();
-        let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         let payload = vec![1u8; flow::MAX_SIZE * 10];
-
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(format!(r#"{{"size": {}}}"#, payload.len()));
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        flow_id = str::from_utf8(&body).unwrap().to_owned();
-                        Ok(())
-                    })
-            }))
-            .unwrap();
+        let flow_id = create_flow(prefix, &format!(r#"{{"size": {}}}"#, payload.len()));
+        let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
         {
             let prefix = prefix.clone();
@@ -692,23 +709,8 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut flow_id = String::new();
+        let flow_id = create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
-
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{}"#);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        flow_id = str::from_utf8(&body).unwrap().to_owned();
-                        Ok(())
-                    })
-            }))
-            .unwrap();
 
         let req = Request::new(Post, format!("{}/{}/eof", prefix, fake_id).parse().unwrap());
         core.run(client
