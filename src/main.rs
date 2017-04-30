@@ -364,8 +364,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::start_service;
+    use flow;
     use futures::{Future, Stream};
-    use hyper::Method::{Get, Post};
+    use hyper::Method::{Get, Post, Put};
     use hyper::client::{Client, Request};
     use hyper::status::StatusCode;
     use regex::Regex;
@@ -375,6 +376,40 @@ mod tests {
     fn spawn_server() -> String {
         let port = start_service("127.0.0.1:0".parse().unwrap(), 1, false).unwrap().port();
         format!("http://127.0.0.1:{}", port)
+    }
+
+    #[test]
+    fn invalid_route() {
+        let prefix = &spawn_server();
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let req = Request::new(Post, format!("{}/neo", prefix).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Get, format!("{}/neo", prefix).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Put, format!("{}/neo", prefix).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::MethodNotAllowed);
+                Ok(())
+            }))
+            .unwrap();
     }
 
     #[test]
@@ -571,7 +606,8 @@ mod tests {
         let client = Client::new(&core.handle());
 
         let mut flow_id = String::new();
-        let payload: &[u8] = b"The quick brown fox jumps over the lazy dog";
+        let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
+        let payload = vec![1u8; flow::MAX_SIZE * 10];
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(format!(r#"{{"size": {}}}"#, payload.len()));
@@ -596,16 +632,18 @@ mod tests {
                 let mut core = Core::new().unwrap();
                 let client = Client::new(&core.handle());
 
-                let mut req = Request::new(Post,
-                                           format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-                req.set_body(payload);
-                core.run(client
-                             .request(req)
-                             .and_then(|res| {
-                        assert_eq!(res.status(), StatusCode::Ok);
-                        Ok(())
-                    }))
-                    .unwrap();
+                for chunk in payload.chunks(flow::MAX_SIZE * 2 + 13) {
+                    let mut req =
+                        Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+                    req.set_body(chunk.to_vec());
+                    core.run(client
+                                 .request(req)
+                                 .and_then(|res| {
+                            assert_eq!(res.status(), StatusCode::Ok);
+                            Ok(())
+                        }))
+                        .unwrap();
+                }
 
                 let req = Request::new(Post,
                                        format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
@@ -624,6 +662,15 @@ mod tests {
             });
         }
 
+        let req = Request::new(Get, format!("{}/{}/pull", prefix, fake_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
         let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
@@ -632,7 +679,7 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        assert_eq!(&body as &[u8], payload);
+                        assert_eq!(&body as &[u8], &payload as &[u8]);
                         Ok(())
                     })
             }))
@@ -646,6 +693,7 @@ mod tests {
         let client = Client::new(&core.handle());
 
         let mut flow_id = String::new();
+        let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
@@ -659,6 +707,15 @@ mod tests {
                         flow_id = str::from_utf8(&body).unwrap().to_owned();
                         Ok(())
                     })
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/eof", prefix, fake_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
             }))
             .unwrap();
 
