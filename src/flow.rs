@@ -1,7 +1,7 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
@@ -23,8 +23,6 @@ pub enum Chunk {
     Eof(u64),
 }
 
-type SharedChunk = Arc<RwLock<Chunk>>;
-
 #[derive(Clone, Debug)]
 enum State {
     Streaming,
@@ -34,6 +32,7 @@ enum State {
 pub struct Config {
     pub length: Option<u64>,
     pub capacity: u64,
+    pub lifecount: u64,
 }
 
 pub struct Statistic {
@@ -42,9 +41,9 @@ pub struct Statistic {
 }
 
 struct Buffer {
-    buffering: u64,
-    bucket: HashMap<u64, SharedChunk>,
-    waiting_pull: HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>,
+    buffered: u64,
+    bucket: HashMap<u64, Chunk>,
+    waiting_pull: HashMap<u64, Vec<oneshot::Sender<()>>>,
 }
 
 pub struct Flow {
@@ -53,8 +52,9 @@ pub struct Flow {
     pub statistic: Statistic,
     state: State,
     next_index: u64,
+    head_index: u64,
     pub tail_index: u64,
-    buffer: Arc<RwLock<Buffer>>,
+    buffer: Arc<Mutex<Buffer>>,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -66,6 +66,7 @@ impl Flow {
             config: Config {
                 length,
                 capacity: MAX_CAPACITY,
+                lifecount: 1,
             },
             statistic: Statistic {
                 pushed: 0,
@@ -73,12 +74,13 @@ impl Flow {
             },
             state: State::Streaming,
             next_index: 0,
+            head_index: 0,
             tail_index: 0,
-            buffer: Arc::new(RwLock::new(Buffer {
-                                             buffering: 0,
-                                             bucket: HashMap::new(),
-                                             waiting_pull: HashMap::new(),
-                                         })),
+            buffer: Arc::new(Mutex::new(Buffer {
+                                            buffered: 0,
+                                            bucket: HashMap::new(),
+                                            waiting_pull: HashMap::new(),
+                                        })),
         }
     }
 
@@ -86,6 +88,25 @@ impl Flow {
         match self.state {
             State::Streaming => true,
             _ => false,
+        }
+    }
+
+    fn sanitize_chunk(&mut self) {
+        let mut buffer = self.buffer.lock().unwrap();
+        let mut tail_index = self.tail_index;
+        let head_index = self.head_index;
+        while tail_index < head_index {
+            // Get should always success.
+            let count = match *buffer.bucket.get(&tail_index).unwrap() {
+                Chunk::Data(count, _) => count,
+                Chunk::Eof(count) => count,
+            };
+            if count < self.config.lifecount {
+                break;
+            }
+            // Remove should always success.
+            buffer.bucket.remove(&tail_index).unwrap();
+            tail_index += 1;
         }
     }
 
@@ -98,23 +119,23 @@ impl Flow {
             self.state = State::Stop;
         }
 
-        let shared_chunk = Arc::new(RwLock::new(chunk));
         let chunk_index = self.next_index;
         self.next_index += 1;
 
         {
-            let mut buffer = self.buffer.write().unwrap();
+            let mut buffer = self.buffer.lock().unwrap();
+            // Insert the chunk.
+            buffer.bucket.insert(chunk_index, chunk);
             // Wake up the waiting pulls.
             if let Some(waits) = buffer.waiting_pull.remove(&chunk_index) {
                 for wait in waits {
                     // Don't unwrap, since the receiver can early quit.
-                    wait.send(shared_chunk.clone()).is_ok();
+                    wait.send(()).is_ok();
                 }
             }
-            // Insert the chunk.
-            buffer.bucket.insert(chunk_index, shared_chunk);
-            future::ok(chunk_index).boxed()
         }
+
+        future::ok(chunk_index).boxed()
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
@@ -144,8 +165,7 @@ impl Flow {
         self.acquire_chunk(Chunk::Data(1, data.to_vec()))
     }
 
-    fn deref_chunk(shared_chunk: &SharedChunk) -> Result<Vec<u8>, Error> {
-        let mut chunk = shared_chunk.write().unwrap();
+    fn deref_chunk(chunk: &mut Chunk) -> Result<Vec<u8>, Error> {
         match *chunk {
             Chunk::Data(ref mut count, ref data) => {
                 *count += 1;
@@ -160,24 +180,41 @@ impl Flow {
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
         // Fast check
-        if let Some(chunk) = self.buffer.read().unwrap().bucket.get(&chunk_index) {
-            return future::result(Flow::deref_chunk(chunk)).boxed();
-        } else if chunk_index < self.next_index {
+        {
+            let mut buffer = self.buffer.lock().unwrap();
+            if let Some(chunk) = buffer.bucket.get_mut(&chunk_index) {
+                return future::result(Flow::deref_chunk(chunk)).boxed();
+            }
+        }
+        // Error check
+        if chunk_index < self.next_index {
             return future::err(Error::Dropped).boxed();
         } else if let Some(0) = timeout {
             return future::err(Error::NotReady).boxed();
         }
         // Slow check
-        {
-            let mut buffer = self.buffer.write().unwrap();
-            if let Some(chunk) = buffer.bucket.get(&chunk_index) {
+        let rx = {
+            let mut buffer = self.buffer.lock().unwrap();
+            if let Some(chunk) = buffer.bucket.get_mut(&chunk_index) {
                 return future::result(Flow::deref_chunk(chunk)).boxed();
             }
             let (tx, rx) = oneshot::channel();
             let waits = buffer.waiting_pull.entry(chunk_index).or_insert(Vec::new());
             waits.push(tx);
+            rx
+        };
+        {
+            let buffer = self.buffer.clone();
             rx.map_err(|_| Error::Other)
-                .and_then(|chunk| future::result(Flow::deref_chunk(&chunk)))
+                .and_then(move |_| {
+                    let mut buffer = buffer.lock().unwrap();
+                    let chunk = buffer.bucket.get_mut(&chunk_index);
+                    if let Some(chunk) = chunk {
+                        future::result(Flow::deref_chunk(chunk)).boxed()
+                    } else {
+                        future::err(Error::Dropped).boxed()
+                    }
+                })
                 .boxed()
         }
     }
