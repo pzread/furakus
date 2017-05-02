@@ -6,7 +6,7 @@ authors = ["PZ Read"]
 [dependencies]
 dotenv = "0.10"
 futures = "0.1"
-hyper = { git = "https://github.com/pzread/hyper" }
+hyper = { git = "https://github.com/pzread/hyper", branch = "expect" }
 lazy_static = "0.2"
 mime = "0.2"
 regex = "0.2"

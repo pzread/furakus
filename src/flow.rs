@@ -17,7 +17,7 @@ pub enum Error {
 pub const MAX_SIZE: usize = 65536;
 pub const MAX_CAPACITY: u64 = 16777216;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum Chunk {
     Data(u64, Vec<u8>),
     Eof(u64),
@@ -41,6 +41,12 @@ pub struct Statistic {
     pub dropped: u64,
 }
 
+struct Buffer {
+    buffering: u64,
+    bucket: HashMap<u64, SharedChunk>,
+    waiting_pull: HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>,
+}
+
 pub struct Flow {
     pub id: String,
     pub config: Config,
@@ -48,9 +54,7 @@ pub struct Flow {
     state: State,
     next_index: u64,
     pub tail_index: u64,
-    buffered: u64,
-    chunk_bucket: HashMap<u64, SharedChunk>,
-    wait_list: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
+    buffer: Arc<RwLock<Buffer>>,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -70,9 +74,11 @@ impl Flow {
             state: State::Streaming,
             next_index: 0,
             tail_index: 0,
-            buffered: 0,
-            chunk_bucket: HashMap::new(),
-            wait_list: Arc::new(Mutex::new(HashMap::new())),
+            buffer: Arc::new(RwLock::new(Buffer {
+                                             buffering: 0,
+                                             bucket: HashMap::new(),
+                                             waiting_pull: HashMap::new(),
+                                         })),
         }
     }
 
@@ -91,22 +97,24 @@ impl Flow {
         if let Chunk::Eof(_) = chunk {
             self.state = State::Stop;
         }
+
         let shared_chunk = Arc::new(RwLock::new(chunk));
         let chunk_index = self.next_index;
         self.next_index += 1;
-        // Wake up the waiting pulls.
+
         {
-            let mut wait_list = self.wait_list.lock().unwrap();
-            if let Some(waits) = wait_list.remove(&chunk_index) {
+            let mut buffer = self.buffer.write().unwrap();
+            // Wake up the waiting pulls.
+            if let Some(waits) = buffer.waiting_pull.remove(&chunk_index) {
                 for wait in waits {
                     // Don't unwrap, since the receiver can early quit.
                     wait.send(shared_chunk.clone()).is_ok();
                 }
             }
+            // Insert the chunk.
+            buffer.bucket.insert(chunk_index, shared_chunk);
+            future::ok(chunk_index).boxed()
         }
-        // Insert the chunk.
-        self.chunk_bucket.insert(chunk_index, shared_chunk);
-        future::ok(chunk_index).boxed()
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
@@ -151,22 +159,27 @@ impl Flow {
     }
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
-        if let Some(chunk) = self.chunk_bucket.get(&chunk_index) {
+        // Fast check
+        if let Some(chunk) = self.buffer.read().unwrap().bucket.get(&chunk_index) {
             return future::result(Flow::deref_chunk(chunk)).boxed();
         } else if chunk_index < self.next_index {
             return future::err(Error::Dropped).boxed();
         } else if let Some(0) = timeout {
             return future::err(Error::NotReady).boxed();
         }
-        let (tx, rx) = oneshot::channel();
+        // Slow check
         {
-            let mut wait_list = self.wait_list.lock().unwrap();
-            let waits = wait_list.entry(chunk_index).or_insert(Vec::new());
+            let mut buffer = self.buffer.write().unwrap();
+            if let Some(chunk) = buffer.bucket.get(&chunk_index) {
+                return future::result(Flow::deref_chunk(chunk)).boxed();
+            }
+            let (tx, rx) = oneshot::channel();
+            let waits = buffer.waiting_pull.entry(chunk_index).or_insert(Vec::new());
             waits.push(tx);
+            rx.map_err(|_| Error::Other)
+                .and_then(|chunk| future::result(Flow::deref_chunk(&chunk)))
+                .boxed()
         }
-        rx.map_err(|_| Error::Other)
-            .and_then(|chunk| future::result(Flow::deref_chunk(&chunk)))
-            .boxed()
     }
 }
 
