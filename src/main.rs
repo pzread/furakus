@@ -373,7 +373,7 @@ fn main() {
 mod tests {
     use super::start_service;
     use flow;
-    use futures::{Future, Stream};
+    use futures::{Future, Stream, future};
     use hyper::Method::{Get, Post, Put};
     use hyper::client::{Client, Request};
     use hyper::header::ContentLength;
@@ -390,8 +390,8 @@ mod tests {
     fn create_flow(prefix: &str, param: &str) -> String {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
 
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(param.to_owned());
         req.headers_mut().set(ContentLength(param.len() as u64));
 
@@ -410,6 +410,122 @@ mod tests {
             .unwrap();
 
         flow_id
+    }
+
+    fn req_push(prefix: &str, flow_id: &str, payload: &[u8]) -> (StatusCode, Option<String>) {
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(payload.to_vec());
+
+        let mut status_code = StatusCode::ImATeapot;
+        let mut response = None;
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                status_code = res.status();
+                let fut = if status_code == StatusCode::Ok {
+                    res.body()
+                        .concat()
+                        .and_then(|body| Ok(Some(String::from_utf8(body.to_vec()).unwrap())))
+                        .boxed()
+                } else {
+                    future::ok(None).boxed()
+                };
+                fut.and_then(|body| {
+                    response = body;
+                    Ok(())
+                })
+            }))
+            .unwrap();
+
+        (status_code, response)
+    }
+
+    fn req_close(prefix: &str, flow_id: &str) -> (StatusCode, Option<String>) {
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
+
+        let mut status_code = StatusCode::ImATeapot;
+        let mut response = None;
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                status_code = res.status();
+                let fut = if status_code == StatusCode::Ok {
+                    res.body()
+                        .concat()
+                        .and_then(|body| Ok(Some(String::from_utf8(body.to_vec()).unwrap())))
+                        .boxed()
+                } else {
+                    future::ok(None).boxed()
+                };
+                fut.and_then(|body| {
+                    response = body;
+                    Ok(())
+                })
+            }))
+            .unwrap();
+
+        (status_code, response)
+    }
+
+    fn req_fetch(prefix: &str, flow_id: &str, index: u64) -> (StatusCode, Option<Vec<u8>>) {
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let req = Request::new(Get,
+                               format!("{}/{}/fetch/{}", prefix, flow_id, index).parse().unwrap());
+
+        let mut status_code = StatusCode::ImATeapot;
+        let mut response = None;
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                status_code = res.status();
+                let fut = if status_code == StatusCode::Ok {
+                    res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                } else {
+                    future::ok(None).boxed()
+                };
+                fut.and_then(|body| {
+                    response = body;
+                    Ok(())
+                })
+            }))
+            .unwrap();
+
+        (status_code, response)
+    }
+
+    fn req_pull(prefix: &str, flow_id: &str) -> (StatusCode, Option<Vec<u8>>) {
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
+
+        let mut status_code = StatusCode::ImATeapot;
+        let mut response = None;
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                status_code = res.status();
+                let fut = if status_code == StatusCode::Ok {
+                    res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                } else {
+                    future::ok(None).boxed()
+                };
+                fut.and_then(|body| {
+                    response = body;
+                    Ok(())
+                })
+            }))
+            .unwrap();
+
+        (status_code, response)
     }
 
     #[test]
@@ -514,12 +630,13 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let flow_id = create_flow(prefix, r#"{}"#);
+        let flow_id = &create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
 
         // The empty chunk should be ignored.
+        // No content length.
         let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
@@ -533,112 +650,26 @@ mod tests {
                     })
             }))
             .unwrap();
-
+        // With 0 content length.
+        assert_eq!(req_push(prefix, flow_id, b""), (StatusCode::Ok, Some(String::from("Ok"))));
         // There should be no chunk.
-        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::RequestTimeout);
-                Ok(())
-            }))
-            .unwrap();
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::RequestTimeout, None));
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, fake_id).parse().unwrap());
-        req.set_body(payload1);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
-                Ok(())
-            }))
-            .unwrap();
+        assert_eq!(req_push(prefix, fake_id, payload1), (StatusCode::NotFound, None));
+        assert_eq!(req_push(prefix, flow_id, payload1), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, payload2), (StatusCode::Ok, Some(String::from("Ok"))));
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(payload1);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(payload2);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, fake_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/fetch/10", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::RequestTimeout);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(&body as &[u8], payload1);
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/fetch/1", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(&body as &[u8], payload2);
-                        Ok(())
-                    })
-            }))
-            .unwrap();
+        assert_eq!(req_fetch(prefix, fake_id, 0), (StatusCode::NotFound, None));
+        assert_eq!(req_fetch(prefix, flow_id, 10), (StatusCode::RequestTimeout, None));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
+        assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::Ok, Some(payload2.to_vec())));
     }
 
     #[test]
     fn handle_push_pull() {
-        let prefix = &spawn_server();
-        let mut core = Core::new().unwrap();
-        let client = Client::new(&core.handle());
-
         let payload = vec![1u8; flow::MAX_SIZE * 10];
-        let flow_id = create_flow(prefix, &format!(r#"{{"size": {}}}"#, payload.len()));
+        let prefix = &spawn_server();
+        let flow_id = &create_flow(prefix, &format!(r#"{{"size": {}}}"#, payload.len()));
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
         {
@@ -646,209 +677,45 @@ mod tests {
             let flow_id = flow_id.clone();
             let payload = payload.clone();
             thread::spawn(move || {
-                let mut core = Core::new().unwrap();
-                let client = Client::new(&core.handle());
+                let prefix = &prefix;
+                let flow_id = &flow_id;
 
                 for chunk in payload.chunks(flow::MAX_SIZE * 2 + 13) {
-                    let mut req =
-                        Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-                    req.set_body(chunk.to_vec());
-                    core.run(client
-                                 .request(req)
-                                 .and_then(|res| {
-                            assert_eq!(res.status(), StatusCode::Ok);
-                            Ok(())
-                        }))
-                        .unwrap();
+                    assert_eq!(req_push(prefix, flow_id, chunk),
+                               (StatusCode::Ok, Some(String::from("Ok"))));
                 }
-
-                let req = Request::new(Post,
-                                       format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
-                core.run(client
-                             .request(req)
-                             .and_then(|res| {
-                        assert_eq!(res.status(), StatusCode::Ok);
-                        res.body()
-                            .concat()
-                            .and_then(|body| {
-                                assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                                Ok(())
-                            })
-                    }))
-                    .unwrap();
+                assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
             });
         }
 
-        let req = Request::new(Get, format!("{}/{}/pull", prefix, fake_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(&body as &[u8], &payload as &[u8]);
-                        Ok(())
-                    })
-            }))
-            .unwrap();
+        assert_eq!(req_pull(prefix, fake_id), (StatusCode::NotFound, None));
+        assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload)));
     }
 
     #[test]
     fn handle_eof() {
         let prefix = &spawn_server();
-        let mut core = Core::new().unwrap();
-        let client = Client::new(&core.handle());
-
-        let flow_id = create_flow(prefix, r#"{}"#);
+        let flow_id = &create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
-        let req = Request::new(Post, format!("{}/{}/eof", prefix, fake_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(b"Hello" as &[u8]);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::InternalServerError);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Closed");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
+        assert_eq!(req_close(prefix, fake_id), (StatusCode::NotFound, None));
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, b"Hello"), (StatusCode::InternalServerError, None));
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Closed"))));
     }
 
     #[test]
     fn fetch_dropped() {
         let prefix = &spawn_server();
-        let mut core = Core::new().unwrap();
-        let client = Client::new(&core.handle());
-
-        let flow_id = create_flow(prefix, r#"{}"#);
+        let flow_id = &create_flow(prefix, r#"{}"#);
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
 
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(payload1);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        req.set_body(payload2);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(&body as &[u8], payload1);
-                        Ok(())
-                    })
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(&body as &[u8], &payload2 as &[u8]);
-                        Ok(())
-                    })
-            }))
-            .unwrap();
+        assert_eq!(req_push(prefix, flow_id, payload1), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, payload2), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(Vec::from(payload1))));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
+        assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(Vec::from(payload2))));
     }
 }
