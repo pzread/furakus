@@ -72,11 +72,11 @@ impl FluxService {
                 serde_json::from_slice::<FlowReqParam>(&body).map_err(|_| Error::Invalid)
             })
             .and_then(move |param| {
-                let flow = Flow::new(param.size);
-                let flow_id = flow.id.clone();
+                let flow_ptr = Flow::new(param.size);
+                let flow_id = flow_ptr.read().unwrap().id.clone();
                 {
                     let mut bucket = flow_bucket.write().unwrap();
-                    bucket.insert(flow_id.clone(), Arc::new(RwLock::new(flow)));
+                    bucket.insert(flow_id.clone(), flow_ptr);
                 }
                 let body = flow_id.into_bytes();
                 future::ok(Response::new()
