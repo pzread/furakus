@@ -74,7 +74,6 @@ pub struct Flow {
     pub statistic: Statistic,
     state: State,
     next_index: u64,
-    head_index: u64,
     pub tail_index: u64,
     bucket: HashMap<u64, SharedChunk>,
     waiting_push: VecDeque<(u64, oneshot::Sender<()>)>,
@@ -85,7 +84,7 @@ type FlowFuture<T> = future::BoxFuture<T, Error>;
 
 impl Flow {
     pub fn new(length: Option<u64>) -> Arc<RwLock<Self>> {
-        let mut flow = Flow {
+        let flow = Flow {
             reference: Weak::new(),
             id: Uuid::new_v4().simple().to_string(),
             config: Config {
@@ -100,7 +99,6 @@ impl Flow {
             },
             state: State::Streaming,
             next_index: 0,
-            head_index: 0,
             tail_index: 0,
             bucket: HashMap::new(),
             waiting_push: VecDeque::new(),
@@ -186,13 +184,14 @@ impl Flow {
 
     fn sanitize_buffer(&mut self) {
         let mut tail_index = self.tail_index;
-        let head_index = self.head_index;
+        let next_index = self.next_index;
+        let lifecount = self.config.lifecount;
 
-        while tail_index < head_index {
+        while tail_index < next_index {
             {
                 // Get should always success.
                 let chunk = self.bucket.get(&tail_index).unwrap().lock().unwrap();
-                if chunk.count() < self.config.lifecount {
+                if chunk.count() < lifecount {
                     break;
                 }
 
@@ -274,15 +273,18 @@ impl Flow {
                     None => return future::err(Error::Other),
                 };
 
-                let mut chunk = chunk.lock().unwrap();
-                let (count, result) = match *chunk {
-                    Chunk::Data(ref mut count, ref data) => (count, Ok(data.to_vec())),
-                    Chunk::Eof(ref mut count) => (count, Err(Error::Eof)),
+                let (count, result) = {
+                    let mut chunk = chunk.lock().unwrap();
+                    let (count, result) = match *chunk {
+                        Chunk::Data(ref mut count, ref data) => (count, Ok(data.to_vec())),
+                        Chunk::Eof(ref mut count) => (count, Err(Error::Eof)),
+                    };
+                    *count += 1;
+                    (*count, result)
                 };
 
-                *count += 1;
-
-                if *count >= lifecount {
+                // Fast check if we need to sanitize.
+                if count >= lifecount {
                     let mut flow = flow_ptr.write().unwrap();
                     flow.sanitize_buffer();
                 }
@@ -311,6 +313,7 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(&[2u8; MAX_SIZE]), Ok(1));
         sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(2));
         sync_assert_eq!(ptr.write().unwrap().push(&[2u8; MAX_SIZE + 1]), Err(Error::Invalid));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(&[1u8; 1234] as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(100, Some(0)), Err(Error::NotReady));
     }
@@ -342,5 +345,15 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Err(Error::Invalid));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn dropped_chunk() {
+        let ptr = Flow::new(None);
+        sync_assert_eq!(ptr.write().unwrap().push(b"A"), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(b"B"), Ok(1));
+        sync_assert_eq!(ptr.write().unwrap().push(b"C"), Ok(2));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
     }
 }
