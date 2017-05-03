@@ -168,7 +168,7 @@ impl Flow {
         let fut = if self.statistic.buffered > self.config.capacity {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_len, tx));
-            rx.map_err(|_| {println!("xxxxxxxxxx"); Error::Other}).boxed()
+            rx.map_err(|_| Error::Other).boxed()
         } else {
             future::ok(()).boxed()
         };
