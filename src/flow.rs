@@ -378,12 +378,10 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(b"D"), Ok(base_idx));
 
         let fut = ptr.write().unwrap().push(&[0u8; MAX_SIZE]);
+        sync_assert_eq!(ptr.write().unwrap().push(b"C"), Err(Error::Invalid));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(vec![0u8; MAX_SIZE]));
         sync_assert_eq!(fut, Ok(base_idx + 1));
-
-        ptr.write().unwrap().push(&[0u8; MAX_SIZE]);
-        sync_assert_eq!(ptr.write().unwrap().push(b"C"), Err(Error::Invalid));
     }
 
     #[test]
