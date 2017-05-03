@@ -230,7 +230,7 @@ impl FluxService {
         // Occupy the first chunk to make sure it's always valid.
         let begin = {
             let flow = flow.read().unwrap();
-            let start_index = flow.tail_index;
+            let start_index = flow.get_range().0;
             flow.pull(start_index, None).map(move |chunk| (start_index, chunk))
         };
         // Get the remote reactor.

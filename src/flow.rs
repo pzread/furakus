@@ -7,14 +7,13 @@ use uuid::Uuid;
 #[derive(Debug, PartialEq)]
 pub enum Error {
     Invalid,
-    NotFound,
     Dropped,
     NotReady,
     Eof,
     Other,
 }
 
-pub const MAX_SIZE: usize = 65536;
+pub const MAX_SIZE: usize = 1048576;
 pub const MAX_CAPACITY: u64 = 16777216;
 
 #[derive(Debug)]
@@ -55,13 +54,13 @@ enum State {
     Stop,
 }
 
-pub struct Config {
+struct Config {
     pub length: Option<u64>,
     pub capacity: u64,
     pub lifecount: u64,
 }
 
-pub struct Statistic {
+struct Statistic {
     pub pushed: u64,
     pub dropped: u64,
     pub buffered: u64,
@@ -70,11 +69,11 @@ pub struct Statistic {
 pub struct Flow {
     reference: Weak<RwLock<Flow>>,
     pub id: String,
-    pub config: Config,
-    pub statistic: Statistic,
+    config: Config,
+    statistic: Statistic,
     state: State,
     next_index: u64,
-    pub tail_index: u64,
+    tail_index: u64,
     bucket: HashMap<u64, SharedChunk>,
     waiting_push: VecDeque<(u64, oneshot::Sender<()>)>,
     waiting_pull: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
@@ -107,6 +106,10 @@ impl Flow {
         let flow_ptr = Arc::new(RwLock::new(flow));
         flow_ptr.write().unwrap().reference = Arc::downgrade(&flow_ptr);
         flow_ptr
+    }
+
+    pub fn get_range(&self) -> (u64, u64) {
+        (self.tail_index, self.next_index)
     }
 
     fn is_streaming(&self) -> bool {
@@ -165,7 +168,7 @@ impl Flow {
         let fut = if self.statistic.buffered > self.config.capacity {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_len, tx));
-            rx.map_err(|_| Error::Other).boxed()
+            rx.map_err(|_| {println!("xxxxxxxxxx"); Error::Other}).boxed()
         } else {
             future::ok(()).boxed()
         };
@@ -196,24 +199,27 @@ impl Flow {
                 }
 
                 self.statistic.buffered -= chunk.len();
+                self.statistic.dropped += chunk.len();
 
                 let mut remain = chunk.len();
                 while remain > 0 {
-                    let new_wait = if let Some(wait) = self.waiting_push.front_mut() {
-                        let (new_remain, new_wait) = if remain >= wait.0 {
+                    let new_len = if let Some(wait) = self.waiting_push.front_mut() {
+                        let (new_remain, new_len) = if remain >= wait.0 {
                             (remain - wait.0, 0)
                         } else {
                             (0, wait.0 - remain)
                         };
                         remain = new_remain;
-                        wait.0 = new_wait;
+                        wait.0 = new_len;
                         wait.0
                     } else {
                         break;
                     };
-                    if new_wait == 0 {
+                    if new_len == 0 {
                         // Remove should always success.
-                        self.waiting_push.pop_front().unwrap();
+                        let wait = self.waiting_push.pop_front().unwrap();
+                        // Don't unwrap, since the receiver can early quit.
+                        wait.1.send(()).is_ok();
                     }
                 }
             }
@@ -327,16 +333,6 @@ mod tests {
     }
 
     #[test]
-    fn pull_chunk() {
-        let ptr = Flow::new(None);
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::NotReady));
-        let fut = ptr.read().unwrap().pull(1, None);
-        let fut1 = ptr.write().unwrap().push(b"ello");
-        let fut2 = ptr.write().unwrap().push(b"hello");
-        sync_assert_eq!(fut.join3(fut1, fut2), Ok((Vec::from(b"hello" as &[u8]), 0, 1)));
-    }
-
-    #[test]
     fn close_flow() {
         let ptr = Flow::new(None);
         sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(0));
@@ -355,5 +351,34 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(b"C"), Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(Vec::from(b"B" as &[u8])));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Dropped));
+        assert_eq!(ptr.read().unwrap().get_range(), (2, 3));
+    }
+
+    #[test]
+    fn waiting_pull() {
+        let ptr = Flow::new(None);
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::NotReady));
+        let fut = ptr.read().unwrap().pull(1, None);
+        let fut1 = ptr.write().unwrap().push(b"ello");
+        let fut2 = ptr.write().unwrap().push(b"hello");
+        sync_assert_eq!(fut.join3(fut1, fut2), Ok((Vec::from(b"hello" as &[u8]), 0, 1)));
+    }
+
+    #[test]
+    fn waiting_push() {
+        let ptr = Flow::new(None);
+
+        for idx in 0..(MAX_CAPACITY / MAX_SIZE as u64) {
+            sync_assert_eq!(ptr.write().unwrap().push(&[0u8; MAX_SIZE]), Ok(idx));
+        }
+        let base_idx = MAX_CAPACITY / MAX_SIZE as u64;
+
+        let fut = ptr.write().unwrap().push(b"B");
+        sync_assert_eq!(ptr.write().unwrap().push(&[0u8; MAX_SIZE]), Err(Error::Invalid));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(vec![0u8; MAX_SIZE]));
+        sync_assert_eq!(fut, Ok(base_idx));
+        sync_assert_eq!(ptr.write().unwrap().push(b"C"), Ok(base_idx + 1));
     }
 }
