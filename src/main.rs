@@ -759,4 +759,96 @@ mod tests {
             }))
             .unwrap();
     }
+
+    #[test]
+    fn fetch_dropped() {
+        let prefix = &spawn_server();
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let flow_id = create_flow(prefix, r#"{}"#);
+        let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
+        let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
+
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(payload1);
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let mut req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        req.set_body(payload2);
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(&body as &[u8], payload1);
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let req = Request::new(Get, format!("{}/{}/fetch/0", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(&body as &[u8], &payload2 as &[u8]);
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+    }
 }
