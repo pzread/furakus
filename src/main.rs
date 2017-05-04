@@ -136,14 +136,14 @@ impl FluxService {
                     None => future::ok(ret_chunk).boxed(),
                 }
             })
-            .and_then(|_| {
-                let body = "Ok";
+            .and_then(|_| Ok("Ok"))
+            .or_else(|_| Ok("NotReady"))
+            .and_then(|body| {
                 Ok(Response::new()
                        .with_header(ContentType::plaintext())
                        .with_header(ContentLength(body.len() as u64))
                        .with_body(body))
             })
-            .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
             .boxed()
     }
 
@@ -163,6 +163,7 @@ impl FluxService {
                 .then(|result| match result {
                           Ok(_) => Ok("Ok"),
                           Err(flow::Error::Invalid) => Ok("Closed"),
+                          Err(flow::Error::NotReady) => Ok("NotReady"),
                           Err(err) => Err(err),
                       })
                 .and_then(|body| {
@@ -697,7 +698,8 @@ mod tests {
 
         assert_eq!(req_close(prefix, fake_id), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
-        assert_eq!(req_push(prefix, flow_id, b"Hello"), (StatusCode::InternalServerError, None));
+        assert_eq!(req_push(prefix, flow_id, b"Hello"),
+                   (StatusCode::Ok, Some(String::from("NotReady"))));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Closed"))));
     }
 
@@ -717,41 +719,86 @@ mod tests {
     }
 
     #[test]
+    fn full_push() {
+        let prefix = &spawn_server();
+        let flow_id = &create_flow(prefix, r#"{}"#);
+
+        assert_eq!(req_push(prefix, flow_id, b"Hello"), (StatusCode::Ok, Some(String::from("Ok"))));
+
+        let (tx, rx) = mpsc::channel();
+
+        {
+            let prefix = prefix.clone();
+            let flow_id = flow_id.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                req_push(prefix, flow_id, &vec![0u8; flow::MAX_CAPACITY as usize]);
+                req_close(prefix, flow_id);
+                tx.send(()).unwrap();
+            });
+        }
+
+        {
+            let prefix = prefix.clone();
+            let flow_id = flow_id.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                req_push(prefix, flow_id, &vec![0u8; flow::MAX_CAPACITY as usize]);
+                req_close(prefix, flow_id);
+                tx.send(()).unwrap();
+            });
+        }
+
+        rx.recv().unwrap();
+        assert_eq!(req_push(prefix, flow_id, b"hello"),
+                   (StatusCode::Ok, Some(String::from("NotReady"))));
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("NotReady"))));
+
+        req_pull(prefix, flow_id);
+        rx.recv().unwrap();
+    }
+
+    #[test]
     fn racing_pull() {
         let prefix = &spawn_server();
         let flow_id = &create_flow(prefix, r#"{}"#);
+
+        let (send_tx, send_rx) = mpsc::channel();
 
         {
             let prefix = prefix.clone();
             let flow_id = flow_id.clone();
             thread::spawn(move || {
-                let prefix = &prefix;
-                let flow_id = &flow_id;
+                let prefix = prefix;
+                let flow_id = flow_id;
 
                 let mut core = Core::new().unwrap();
                 let handle = core.handle();
                 let client = Client::new(&handle);
 
                 // Infinite flow.
-                let body_stream = stream::unfold((), move |_| {
+                let body_stream = stream::unfold((), move |_| if send_rx.try_recv().is_ok() {
+                    None
+                } else {
                     Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; 4096])), ())))
                 });
-                let mut req = Request::new(Post,
-                                           format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+
+                let mut req =
+                    Request::new(Post, format!("{}/{}/push", &prefix, &flow_id).parse().unwrap());
                 let (tx, body) = hyper::Body::pair();
                 req.set_body(body);
 
                 // Schedule the sender to the reactor.
                 handle.spawn(tx.send_all(body_stream)
-                                 .and_then(|(mut tx, _)| tx.close())
-                                 .then(|_| Ok(())));
-                core.run(client
-                             .request(req)
-                             .and_then(|res| {
-                        assert_eq!(res.status(), StatusCode::Ok);
-                        Ok(())
-                    }))
-                    .unwrap();
+                                 .then(move |_| {
+                    req_close(&prefix, &flow_id);
+                    Ok(())
+                }));
+                core.run(client.request(req).and_then(|_| Ok(()))).unwrap();
             });
         }
 
@@ -801,6 +848,8 @@ mod tests {
             });
         }
 
+        rx.recv().unwrap();
+        send_tx.send(()).unwrap();
         rx.recv().unwrap();
     }
 }
