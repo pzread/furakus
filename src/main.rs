@@ -227,47 +227,44 @@ impl FluxService {
             }
         };
 
-        // Occupy the first chunk to make sure it's always valid.
-        let begin = {
-            let flow = flow.read().unwrap();
-            let start_index = flow.get_range().0;
-            flow.pull(start_index, None).map(move |chunk| (start_index, chunk))
-        };
-        // Get the remote reactor.
-        let remote = self.remote.clone();
-        begin
-            .map(move |(start_index, first_chunk)| {
-                let body_stream = stream::once(Ok(Ok(hyper::Chunk::from(first_chunk))))
-                    .chain(stream::unfold(Some(start_index + 1), move |chunk_index| {
-                        // Check if the flow is EOF.
-                        if let Some(chunk_index) = chunk_index {
-                            let flow = flow.read().unwrap();
-                            let fut = flow.pull(chunk_index, None)
-                                .and_then(move |chunk| {
-                                    let hyper_chunk = Ok(hyper::Chunk::from(chunk));
-                                    future::ok((hyper_chunk, Some(chunk_index + 1)))
-                                })
-                                .or_else(|err| match err {
-                                             flow::Error::Eof => {
-                                                 future::ok((Ok(hyper::Chunk::from(&[] as &[u8])),
-                                                             None))
-                                             }
-                                             _ => future::ok((Err(hyper::Error::Incomplete), None)),
-                                         });
-                            Some(fut)
-                        } else {
-                            None
-                        }
-                    }));
-                let (tx, body) = hyper::Body::pair();
-                // Schedule the sender to the reactor.
-                remote.spawn(move |_| {
-                    tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
-                });
-                Response::new().with_body(body)
-            })
-            .or_else(|_| future::ok(Response::new().with_status(StatusCode::InternalServerError)))
-            .boxed()
+        let body_stream = stream::unfold(Some(0), move |chunk_index| {
+            // Check if the flow is EOF.
+            if let Some(chunk_index) = chunk_index {
+                let flow = flow.read().unwrap();
+
+                // Check if we need to get the first chunk index.
+                let chunk_index = if chunk_index == 0 {
+                    flow.get_range().0
+                } else {
+                    chunk_index
+                };
+
+                let fut = flow.pull(chunk_index, None)
+                    .and_then(move |chunk| {
+                        let hyper_chunk = Ok(hyper::Chunk::from(chunk));
+                        future::ok((hyper_chunk, Some(chunk_index + 1)))
+                    })
+                    .or_else(|err| match err {
+                                 flow::Error::Eof => {
+                                     future::ok((Ok(hyper::Chunk::from(vec![])), None))
+                                 }
+                                 _ => future::ok((Err(hyper::Error::Incomplete), None)),
+                             });
+                Some(fut)
+            } else {
+                None
+            }
+        });
+        let (tx, body) = hyper::Body::pair();
+        // Schedule the sender to the reactor.
+        self.remote
+            .spawn(move |_| {
+                tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
+            });
+        future::ok(Response::new()
+                       .with_header(ContentType(mime!(Application / OctetStream)))
+                       .with_body(body))
+                .boxed()
     }
 }
 
@@ -705,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_dropped() {
+    fn dropped() {
         let prefix = &spawn_server();
         let flow_id = &create_flow(prefix, r#"{}"#);
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";

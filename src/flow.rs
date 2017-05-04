@@ -54,13 +54,13 @@ enum State {
     Stop,
 }
 
-struct Config {
+pub struct Config {
     pub length: Option<u64>,
     pub capacity: u64,
     pub lifecount: u64,
 }
 
-struct Statistic {
+pub struct Statistic {
     pub pushed: u64,
     pub dropped: u64,
     pub buffered: u64,
@@ -131,7 +131,7 @@ impl Flow {
             return future::err(Error::Invalid).boxed();
         }
 
-        // Update statistic.
+        // Check and update statistic.
         let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
             Some(new_pushed) => {
                 if let Some(length) = self.config.length {
