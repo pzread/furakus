@@ -802,7 +802,7 @@ mod tests {
             });
         }
 
-        fn puller(prefix: &str, flow_id: &str, sleep: u64) {
+        fn puller(prefix: &str, flow_id: &str, mut sleep: u64) {
             let mut core = Core::new().unwrap();
             let client = Client::new(&core.handle());
 
@@ -815,6 +815,7 @@ mod tests {
                     res.body()
                         .for_each(move |_| {
                             thread::sleep(Duration::from_millis(sleep));
+                            sleep = 0;
                             Ok(())
                         })
                         .boxed()
@@ -831,7 +832,7 @@ mod tests {
             thread::spawn(move || {
                 let prefix = &prefix;
                 let flow_id = &flow_id;
-                puller(prefix, flow_id, 1);
+                puller(prefix, flow_id, 10000);
                 tx.send(()).unwrap();
             });
         }
