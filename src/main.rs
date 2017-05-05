@@ -1,8 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
 #[macro_use]
-extern crate mime;
-#[macro_use]
 extern crate serde_derive;
 extern crate dotenv;
 extern crate futures;
@@ -197,7 +195,7 @@ impl FluxService {
             flow.pull(chunk_index, Some(0))
                 .and_then(|chunk| {
                     future::ok(Response::new()
-                                   .with_header(ContentType(mime!(Application / OctetStream)))
+                                   .with_header(ContentType::octet_stream())
                                    .with_header(ContentLength(chunk.len() as u64))
                                    .with_body(chunk))
                 })
@@ -260,7 +258,7 @@ impl FluxService {
             });
 
         future::ok(Response::new()
-                       .with_header(ContentType(mime!(Application / OctetStream)))
+                       .with_header(ContentType::octet_stream())
                        .with_body(body))
                 .boxed()
     }
@@ -832,7 +830,7 @@ mod tests {
             thread::spawn(move || {
                 let prefix = &prefix;
                 let flow_id = &flow_id;
-                puller(prefix, flow_id, 10000);
+                puller(prefix, flow_id, 5000);
                 tx.send(()).unwrap();
             });
         }
