@@ -192,7 +192,7 @@ impl FluxService {
         };
         {
             let flow = flow.read().unwrap();
-            flow.pull(chunk_index, Some(0))
+            flow.pull(chunk_index, None)
                 .and_then(|chunk| {
                     future::ok(Response::new()
                                    .with_header(ContentType::octet_stream())
@@ -202,9 +202,6 @@ impl FluxService {
                 .or_else(|err| match err {
                              flow::Error::Eof | flow::Error::Dropped => {
                                  future::ok(Response::new().with_status(StatusCode::NotFound))
-                             }
-                             flow::Error::NotReady => {
-                                 future::ok(Response::new().with_status(StatusCode::RequestTimeout))
                              }
                              _ => {
                                  future::ok(Response::new()
@@ -648,15 +645,12 @@ mod tests {
             .unwrap();
         // With 0 content length.
         assert_eq!(req_push(prefix, flow_id, b""), (StatusCode::Ok, Some(String::from("Ok"))));
-        // There should be no chunk.
-        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::RequestTimeout, None));
 
         assert_eq!(req_push(prefix, fake_id, payload1), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, payload1), (StatusCode::Ok, Some(String::from("Ok"))));
         assert_eq!(req_push(prefix, flow_id, payload2), (StatusCode::Ok, Some(String::from("Ok"))));
 
         assert_eq!(req_fetch(prefix, fake_id, 0), (StatusCode::NotFound, None));
-        assert_eq!(req_fetch(prefix, flow_id, 10), (StatusCode::RequestTimeout, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
         assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::Ok, Some(payload2.to_vec())));
     }
