@@ -254,10 +254,7 @@ impl FluxService {
                 tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
             });
 
-        future::ok(Response::new()
-                       .with_header(ContentType::octet_stream())
-                       .with_body(body))
-                .boxed()
+        future::ok(Response::new().with_header(ContentType::octet_stream()).with_body(body)).boxed()
     }
 }
 
@@ -653,6 +650,23 @@ mod tests {
         assert_eq!(req_fetch(prefix, fake_id, 0), (StatusCode::NotFound, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
         assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::Ok, Some(payload2.to_vec())));
+
+        let thd = {
+            let prefix = prefix.clone();
+            let flow_id = flow_id.clone();
+            let payload1 = payload1.clone();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                thread::park();
+                thread::sleep(Duration::from_millis(1000));
+                assert_eq!(req_push(prefix, flow_id, payload1),
+                           (StatusCode::Ok, Some(String::from("Ok"))));
+            })
+        };
+
+        thd.thread().unpark();
+        assert_eq!(req_fetch(prefix, flow_id, 2), (StatusCode::Ok, Some(payload1.to_vec())));
     }
 
     #[test]
@@ -705,9 +719,9 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, payload1), (StatusCode::Ok, Some(String::from("Ok"))));
         assert_eq!(req_push(prefix, flow_id, payload2), (StatusCode::Ok, Some(String::from("Ok"))));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
-        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(Vec::from(payload1))));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
-        assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(Vec::from(payload2))));
+        assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload2.to_vec())));
     }
 
     #[test]
