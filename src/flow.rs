@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn basic_flow_operations() {
+    fn basic_operations() {
         let ptr = Flow::new(None);
         sync_assert_eq!(ptr.write().unwrap().push(&[1u8; 1234]), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(&[2u8; MAX_SIZE]), Ok(1));

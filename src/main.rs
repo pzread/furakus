@@ -11,6 +11,7 @@ extern crate serde_json;
 extern crate tokio_core as tokio;
 extern crate uuid;
 mod flow;
+mod pool;
 
 use dotenv::dotenv;
 use flow::Flow;
@@ -18,9 +19,9 @@ use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
 use hyper::header::{ContentLength, ContentType};
 use hyper::server::{Http, Request, Response, Service};
+use pool::Pool;
 use regex::Regex;
 use std::{env, thread};
-use std::collections::HashMap;
 use std::sync::{Arc, Barrier, RwLock};
 use tokio::reactor::{self, Core};
 
@@ -30,12 +31,10 @@ pub enum Error {
     Internal(hyper::Error),
 }
 
-type SharedFlow = Arc<RwLock<Flow>>;
-
 #[derive(Clone)]
 struct FluxService {
     remote: reactor::Remote,
-    flow_bucket: Arc<RwLock<HashMap<String, SharedFlow>>>,
+    pool: Arc<RwLock<Pool>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,11 +45,8 @@ struct FlowReqParam {
 type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
 impl FluxService {
-    fn new(flow_bucket: Arc<RwLock<HashMap<String, SharedFlow>>>, remote: reactor::Remote) -> Self {
-        FluxService {
-            remote: remote,
-            flow_bucket,
-        }
+    fn new(pool: Arc<RwLock<Pool>>, remote: reactor::Remote) -> Self {
+        FluxService { remote, pool }
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
@@ -62,7 +58,7 @@ impl FluxService {
             return future::ok(Response::new().with_status(StatusCode::LengthRequired)).boxed();
         }
 
-        let flow_bucket = self.flow_bucket.clone();
+        let pool_ptr = self.pool.clone();
         req.body()
             .concat()
             .map_err(|err| Error::Internal(err))
@@ -73,8 +69,8 @@ impl FluxService {
                 let flow_ptr = Flow::new(param.size);
                 let flow_id = flow_ptr.read().unwrap().id.clone();
                 {
-                    let mut bucket = flow_bucket.write().unwrap();
-                    bucket.insert(flow_id.clone(), flow_ptr);
+                    let mut pool = pool_ptr.write().unwrap();
+                    pool.insert(&flow_id, flow_ptr);
                 }
                 let body = flow_id.into_bytes();
                 future::ok(Response::new()
@@ -92,8 +88,8 @@ impl FluxService {
     fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
         let flow = {
-            let bucket = self.flow_bucket.read().unwrap();
-            if let Some(flow) = bucket.get(flow_id) {
+            let pool = self.pool.read().unwrap();
+            if let Some(flow) = pool.get(flow_id) {
                 flow.clone()
             } else {
                 return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
@@ -148,8 +144,8 @@ impl FluxService {
     fn handle_eof(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
         let flow = {
-            let bucket = self.flow_bucket.read().unwrap();
-            if let Some(flow) = bucket.get(flow_id) {
+            let pool = self.pool.read().unwrap();
+            if let Some(flow) = pool.get(flow_id) {
                 flow.clone()
             } else {
                 return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
@@ -183,8 +179,8 @@ impl FluxService {
             return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed();
         };
         let flow = {
-            let bucket = self.flow_bucket.read().unwrap();
-            if let Some(flow) = bucket.get(flow_id) {
+            let pool = self.pool.read().unwrap();
+            if let Some(flow) = pool.get(flow_id) {
                 flow.clone()
             } else {
                 return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
@@ -215,8 +211,8 @@ impl FluxService {
     fn handle_pull(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
         let flow = {
-            let bucket = self.flow_bucket.read().unwrap();
-            if let Some(flow) = bucket.get(flow_id) {
+            let pool = self.pool.read().unwrap();
+            if let Some(flow) = pool.get(flow_id) {
                 flow.clone()
             } else {
                 return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
@@ -305,7 +301,7 @@ fn start_service(addr: std::net::SocketAddr,
                  block: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
-    let flow_bucket = Arc::new(RwLock::new(HashMap::new()));
+    let pool_ptr = Pool::new();
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
@@ -313,7 +309,7 @@ fn start_service(addr: std::net::SocketAddr,
         let addr = addr.clone();
         let listener = upstream_listener.try_clone().unwrap();
         let barrier = barrier.clone();
-        let bucket = flow_bucket.clone();
+        let pool_ptr = pool_ptr.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
@@ -327,7 +323,7 @@ fn start_service(addr: std::net::SocketAddr,
                     http.bind_connection(&handle,
                                          io,
                                          addr,
-                                         FluxService::new(bucket.clone(), remote.clone()));
+                                         FluxService::new(pool_ptr.clone(), remote.clone()));
                     Ok(())
                 });
             println!("Worker #{} is started.", idx);
