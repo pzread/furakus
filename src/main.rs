@@ -784,7 +784,7 @@ mod tests {
                 let body_stream = stream::unfold((), move |_| if send_rx.try_recv().is_ok() {
                     None
                 } else {
-                    Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; 4096])), ())))
+                    Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; flow::MAX_SIZE])), ())))
                 });
 
                 let mut req =
