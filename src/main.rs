@@ -67,10 +67,10 @@ impl FluxService {
             })
             .and_then(move |param| {
                 let flow_ptr = Flow::new(param.size);
-                let flow_id = flow_ptr.read().unwrap().id.clone();
+                let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
                     let mut pool = pool_ptr.write().unwrap();
-                    pool.insert(&flow_id, flow_ptr);
+                    pool.insert(flow_ptr);
                 }
                 let body = flow_id.into_bytes();
                 future::ok(Response::new()
