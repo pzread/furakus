@@ -48,10 +48,17 @@ impl Chunk {
 
 type SharedChunk = Arc<Mutex<Chunk>>;
 
-#[derive(Clone, Debug)]
+pub trait Observer {
+    fn on_close(&self, _flow: &Flow) {}
+}
+
+type SharedObserver = Box<Observer + Send + Sync + 'static>;
+
+#[derive(Clone, Debug, PartialEq)]
 enum State {
     Streaming,
     Stop,
+    Closed,
 }
 
 pub struct Config {
@@ -77,6 +84,7 @@ pub struct Flow {
     bucket: HashMap<u64, SharedChunk>,
     waiting_push: VecDeque<(u64, oneshot::Sender<()>)>,
     waiting_pull: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
+    observers: Vec<SharedObserver>,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -102,6 +110,7 @@ impl Flow {
             bucket: HashMap::new(),
             waiting_push: VecDeque::new(),
             waiting_pull: Arc::new(Mutex::new(HashMap::new())),
+            observers: Vec::new(),
         };
         let flow_ptr = Arc::new(RwLock::new(flow));
         flow_ptr.write().unwrap().reference = Arc::downgrade(&flow_ptr);
@@ -112,26 +121,42 @@ impl Flow {
         (self.tail_index, self.next_index)
     }
 
-    fn is_streaming(&self) -> bool {
-        match self.state {
-            State::Streaming => true,
-            _ => false,
+    pub fn observe(&mut self, observer: SharedObserver) {
+        self.observers.push(observer);
+    }
+
+    fn update_state(&mut self, new_state: State) -> Result<(), Error> {
+        match new_state {
+            State::Streaming if self.state == State::Streaming => {
+                self.state = State::Streaming;
+                Ok(())
+            }
+            State::Stop if self.state == State::Streaming => {
+                self.state = State::Stop;
+                Ok(())
+            }
+            State::Closed if self.state == State::Streaming || self.state == State::Stop => {
+                self.state = State::Closed;
+                for observer in self.observers.iter() {
+                    observer.on_close(&self);
+                }
+                Ok(())
+            }
+            _ => Err(Error::Invalid),
         }
     }
 
     fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
         let chunk_len = chunk.len() as u64;
 
-        // Check if the flow is EOF.
-        if !self.is_streaming() {
-            return future::err(Error::Invalid).boxed();
-        }
-        // Check if the flow is already overflow.
+        // The order of following code is important. We first check and return immediately if
+        // failed, then update consistently.
+
+        // Check if the flow is already overflow. Return if failed.
         if self.statistic.buffered > self.config.capacity {
             return future::err(Error::NotReady).boxed();
         }
-
-        // Check and update statistic.
+        // Check statistic. Return if failed.
         let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
             Some(new_pushed) => {
                 if let Some(length) = self.config.length {
@@ -148,13 +173,18 @@ impl Flow {
             Some(new_buffered) => new_buffered,
             None => return future::err(Error::Invalid).boxed(),
         };
+
+        // Check and update state. Return if failed.
+        if self.update_state(match chunk {
+                                 Chunk::Data(..) => State::Streaming,
+                                 Chunk::Eof(..) => State::Stop,
+                             })
+               .is_err() {
+            return future::err(Error::Invalid).boxed();
+        }
+        // Update statistic.
         self.statistic.pushed = new_pushed;
         self.statistic.buffered = new_buffered;
-
-        // Update EOF state.
-        if let Chunk::Eof(..) = chunk {
-            self.state = State::Stop;
-        }
 
         // Acquire the chunk index.
         let chunk_index = self.next_index;
@@ -191,7 +221,7 @@ impl Flow {
         let lifecount = self.config.lifecount;
 
         while tail_index < next_index {
-            {
+            let closed = {
                 // Get should always success.
                 let chunk = self.bucket.get(&tail_index).unwrap().lock().unwrap();
                 if chunk.count() < lifecount {
@@ -222,6 +252,16 @@ impl Flow {
                         wait.1.send(()).is_ok();
                     }
                 }
+
+                match *chunk {
+                    Chunk::Eof(..) => true,
+                    _ => false,
+                }
+            };
+
+            // Try to close the flow.
+            if closed {
+                self.update_state(State::Closed).is_ok();
             }
 
             // Remove should always success.
@@ -241,11 +281,7 @@ impl Flow {
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
-        if self.is_streaming() {
-            self.acquire_chunk(Chunk::eof()).map(|_| ()).boxed()
-        } else {
-            future::err(Error::Invalid).boxed()
-        }
+        self.acquire_chunk(Chunk::eof()).map(|_| ()).boxed()
     }
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
@@ -258,7 +294,9 @@ impl Flow {
         let fut = if let Some(chunk) = chunk {
             future::ok(chunk).boxed()
         } else {
-            if chunk_index < self.next_index {
+            if self.state != State::Streaming {
+                future::err(Error::Eof).boxed()
+            } else if chunk_index < self.next_index {
                 future::err(Error::Dropped).boxed()
             } else if let Some(0) = timeout {
                 future::err(Error::NotReady).boxed()
@@ -337,8 +375,10 @@ mod tests {
         let ptr = Flow::new(None);
         sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(0));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
+        sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::NotReady));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
         sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Err(Error::Invalid));
+        sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
     }
@@ -393,5 +433,38 @@ mod tests {
             flow.pull(0, Some(0))
         };
         sync_assert_eq!(fut, Err(Error::Other));
+    }
+
+    #[test]
+    fn observer() {
+        let ptr = Flow::new(None);
+
+        #[derive(Clone)]
+        struct Ob(pub Arc<Mutex<bool>>);
+
+        impl Ob {
+            fn new() -> Self {
+                Ob(Arc::new(Mutex::new(false)))
+            }
+        }
+
+        impl Observer for Ob {
+            fn on_close(&self, _flow: &Flow) {
+                let mut flag = self.0.lock().unwrap();
+                *flag = true;
+            }
+        }
+
+        let ob1 = Box::new(Ob::new());
+        let ob2 = Box::new(Ob::new());
+        {
+            ptr.write().unwrap().observe(ob1.clone());
+            ptr.write().unwrap().observe(ob2.clone());
+        }
+
+        sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Eof));
+        assert_eq!(*ob1.0.lock().unwrap(), true);
+        assert_eq!(*ob2.0.lock().unwrap(), true);
     }
 }

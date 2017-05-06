@@ -756,7 +756,7 @@ mod tests {
         }
 
         rx.recv().unwrap();
-        assert_eq!(req_push(prefix, flow_id, b"hello"),
+        assert_eq!(req_push(prefix, flow_id, b"Hello"),
                    (StatusCode::Ok, Some(String::from("NotReady"))));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("NotReady"))));
 
