@@ -703,6 +703,18 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, b"Hello"),
                    (StatusCode::Ok, Some(String::from("NotReady"))));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Closed"))));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
+    }
+
+    #[test]
+    fn recycle() {
+        let prefix = &spawn_server();
+        let flow_id = &create_flow(prefix, r#"{}"#);
+
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Closed"))));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
+        assert_eq!(req_close(prefix, flow_id), (StatusCode::NotFound, None));
     }
 
     #[test]
