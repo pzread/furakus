@@ -795,9 +795,8 @@ mod tests {
                 let client = Client::new(&handle);
 
                 // Infinite flow.
-                let body_stream = stream::unfold((), move |_| if send_rx.try_recv().is_ok() {
-                    None
-                } else {
+                let body_stream = stream::unfold((), move |_| {
+                    send_tx.send(()).unwrap();
                     Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; flow::MAX_SIZE])), ())))
                 });
 
@@ -816,55 +815,46 @@ mod tests {
             });
         }
 
-        fn puller(prefix: &str, flow_id: &str, mut sleep: u64) {
-            let mut core = Core::new().unwrap();
-            let client = Client::new(&core.handle());
-
-            let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
-
-            core.run(client
-                         .request(req)
-                         .and_then(|res| {
-                    assert_eq!(res.status(), StatusCode::Ok);
-                    res.body()
-                        .for_each(move |_| {
-                            thread::sleep(Duration::from_millis(sleep));
-                            sleep = 0;
-                            Ok(())
-                        })
-                        .boxed()
-                }))
-                .unwrap();
-        }
-
-        let (tx, rx) = mpsc::channel();
-
-        {
+        let thd = {
             let prefix = prefix.clone();
             let flow_id = flow_id.clone();
-            let tx = tx.clone();
             thread::spawn(move || {
+                let mut core = Core::new().unwrap();
+                let client = Client::new(&core.handle());
                 let prefix = &prefix;
                 let flow_id = &flow_id;
-                puller(prefix, flow_id, 5000);
-                tx.send(()).unwrap();
-            });
+
+                let req = Request::new(Get,
+                                       format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
+
+                let mut park_once = true;
+                core.run(client
+                             .request(req)
+                             .and_then(|res| {
+                        assert_eq!(res.status(), StatusCode::Ok);
+                        res.body()
+                            .for_each(move |_| {
+                                if park_once {
+                                    park_once = false;
+                                    thread::park();
+                                }
+                                Ok(())
+                            })
+                            .boxed()
+                    }))
+                    .unwrap();
+            })
+        };
+
+        while !send_rx.recv_timeout(Duration::from_millis(5000)).is_err() {}
+
+        for idx in 0.. {
+            if req_fetch(prefix, flow_id, idx).0 == StatusCode::Ok {
+                break;
+            }
         }
 
-        {
-            let prefix = prefix.clone();
-            let flow_id = flow_id.clone();
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let prefix = &prefix;
-                let flow_id = &flow_id;
-                puller(prefix, flow_id, 0);
-                tx.send(()).unwrap();
-            });
-        }
-
-        rx.recv().unwrap();
-        send_tx.send(()).unwrap();
-        rx.recv().unwrap();
+        thd.thread().unpark();
+        thd.join().unwrap();
     }
 }

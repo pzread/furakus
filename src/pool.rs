@@ -44,9 +44,9 @@ impl Observer for Weak<RwLock<Pool>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use flow::Flow;
     use std::sync::Arc;
-    use super::*;
     use tokio::reactor::Core;
 
     #[test]
