@@ -5,18 +5,18 @@ use std::sync::{Arc, RwLock, Weak};
 type SharedFlow = Arc<RwLock<Flow>>;
 
 pub struct Pool {
-    reference: Weak<RwLock<Pool>>,
+    weakref: Weak<RwLock<Pool>>,
     bucket: HashMap<String, SharedFlow>,
 }
 
 impl Pool {
     pub fn new() -> Arc<RwLock<Self>> {
         let pool = Pool {
-            reference: Weak::new(),
+            weakref: Weak::new(),
             bucket: HashMap::new(),
         };
         let pool_ptr = Arc::new(RwLock::new(pool));
-        pool_ptr.write().unwrap().reference = Arc::downgrade(&pool_ptr);
+        pool_ptr.write().unwrap().weakref = Arc::downgrade(&pool_ptr);
         pool_ptr
     }
 
@@ -24,7 +24,7 @@ impl Pool {
         // Occupy the flow to prevent from race condition.
         let mut flow = flow_ptr.write().unwrap();
         self.bucket.insert(flow.id.to_owned(), flow_ptr.clone());
-        flow.observe(Box::new(self.reference.clone()));
+        flow.observe(self.weakref.clone());
     }
 
     pub fn get(&self, flow_id: &str) -> Option<SharedFlow> {

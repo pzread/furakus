@@ -52,8 +52,6 @@ pub trait Observer {
     fn on_close(&self, _flow: &Flow) {}
 }
 
-type SharedObserver = Box<Observer + Send + Sync + 'static>;
-
 #[derive(Clone, Debug, PartialEq)]
 enum State {
     Streaming,
@@ -74,7 +72,7 @@ pub struct Statistic {
 }
 
 pub struct Flow {
-    reference: Weak<RwLock<Flow>>,
+    weakref: Weak<RwLock<Flow>>,
     pub id: String,
     config: Config,
     statistic: Statistic,
@@ -84,7 +82,7 @@ pub struct Flow {
     bucket: HashMap<u64, SharedChunk>,
     waiting_push: VecDeque<(u64, oneshot::Sender<()>)>,
     waiting_pull: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
-    observers: Vec<SharedObserver>,
+    observers: Vec<Box<Observer + Send + Sync + 'static>>,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -92,7 +90,7 @@ type FlowFuture<T> = future::BoxFuture<T, Error>;
 impl Flow {
     pub fn new(length: Option<u64>) -> Arc<RwLock<Self>> {
         let flow = Flow {
-            reference: Weak::new(),
+            weakref: Weak::new(),
             id: Uuid::new_v4().simple().to_string(),
             config: Config {
                 length,
@@ -113,7 +111,7 @@ impl Flow {
             observers: Vec::new(),
         };
         let flow_ptr = Arc::new(RwLock::new(flow));
-        flow_ptr.write().unwrap().reference = Arc::downgrade(&flow_ptr);
+        flow_ptr.write().unwrap().weakref = Arc::downgrade(&flow_ptr);
         flow_ptr
     }
 
@@ -121,8 +119,8 @@ impl Flow {
         (self.tail_index, self.next_index)
     }
 
-    pub fn observe(&mut self, observer: SharedObserver) {
-        self.observers.push(observer);
+    pub fn observe<T: Observer + Sync + Send + 'static>(&mut self, observer: T) {
+        self.observers.push(Box::new(observer));
     }
 
     fn update_state(&mut self, new_state: State) -> Result<(), Error> {
@@ -309,7 +307,7 @@ impl Flow {
             }
         };
 
-        let flow_ref = self.reference.clone();
+        let flow_ref = self.weakref.clone();
         let lifecount = self.config.lifecount;
         fut.and_then(move |chunk| {
                 let flow_ptr = match flow_ref.upgrade() {
@@ -455,8 +453,8 @@ mod tests {
             }
         }
 
-        let ob1 = Box::new(Ob::new());
-        let ob2 = Box::new(Ob::new());
+        let ob1 = Ob::new();
+        let ob2 = Ob::new();
         {
             ptr.write().unwrap().observe(ob1.clone());
             ptr.write().unwrap().observe(ob2.clone());
