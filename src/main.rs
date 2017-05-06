@@ -806,11 +806,7 @@ mod tests {
                 req.set_body(body);
 
                 // Schedule the sender to the reactor.
-                handle.spawn(tx.send_all(body_stream)
-                                 .then(move |_| {
-                    req_close(&prefix, &flow_id);
-                    Ok(())
-                }));
+                handle.spawn(tx.send_all(body_stream).then(|_| Err(())));
                 core.run(client.request(req).and_then(|_| Ok(()))).unwrap();
             });
         }
