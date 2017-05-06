@@ -262,11 +262,11 @@ impl Service for FluxService {
 
     fn call(&self, req: Request) -> Self::Future {
         lazy_static! {
-            static ref PATTERN_NEW: Regex = Regex::new(r"/new").unwrap();
-            static ref PATTERN_PUSH: Regex = Regex::new(r"/([a-f0-9]{32})/push").unwrap();
-            static ref PATTERN_EOF: Regex = Regex::new(r"/([a-f0-9]{32})/eof").unwrap();
-            static ref PATTERN_FETCH: Regex = Regex::new(r"/([a-f0-9]{32})/fetch/(\d+)").unwrap();
-            static ref PATTERN_PULL: Regex = Regex::new(r"/([a-f0-9]{32})/pull").unwrap();
+            static ref PATTERN_NEW: Regex = Regex::new(r"^/new$").unwrap();
+            static ref PATTERN_PUSH: Regex = Regex::new(r"^/([a-f0-9]{32})/push$").unwrap();
+            static ref PATTERN_EOF: Regex = Regex::new(r"^/([a-f0-9]{32})/eof$").unwrap();
+            static ref PATTERN_FETCH: Regex = Regex::new(r"^/([a-f0-9]{32})/fetch/(\d+)$").unwrap();
+            static ref PATTERN_PULL: Regex = Regex::new(r"^/([a-f0-9]{32})/pull$").unwrap();
         }
 
         let path = &req.path().to_owned();
@@ -515,10 +515,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_route() {
+    fn validate_route() {
         let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
+        let flow_id = &create_flow(prefix, r#"{}"#);
+
+        // Not support URL resolving now.
+        let req = Request::new(Post, format!("{}/{}/x/../push", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
 
         let req = Request::new(Post, format!("{}/neo", prefix).parse().unwrap());
         core.run(client
@@ -529,7 +540,61 @@ mod tests {
             }))
             .unwrap();
 
+        let req = Request::new(Post, format!("{}/x/{}/push", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/x/{}/push", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/pusha", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Post, format!("{}/{}/eofa", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
         let req = Request::new(Get, format!("{}/neo", prefix).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Get, format!("{}/{}/pullb", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
+
+        let req = Request::new(Get, format!("{}/{}/fetchb", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
