@@ -9,6 +9,7 @@ extern crate regex;
 extern crate serde;
 extern crate serde_json;
 extern crate tokio_core as tokio;
+extern crate url;
 extern crate uuid;
 mod flow;
 mod pool;
@@ -17,7 +18,7 @@ use dotenv::dotenv;
 use flow::Flow;
 use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
-use hyper::header::{ContentLength, ContentType};
+use hyper::header::{ContentLength, ContentType, Host};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
@@ -269,7 +270,31 @@ impl Service for FluxService {
             static ref PATTERN_PULL: Regex = Regex::new(r"^/([a-f0-9]{32})/pull$").unwrap();
         }
 
-        let path = &req.path().to_owned();
+        let url = {
+            let uri = req.uri().to_owned();
+            let resolved = if uri.is_absolute() {
+                url::Url::parse(uri.as_ref())
+            } else {
+                if let Some(host) = req.headers().get::<Host>() {
+                    let hostname = host.hostname();
+                    let base = match host.port() {
+                        Some(port) => format!("http://{}:{}", hostname, port),
+                        None => format!("http://{}", hostname),
+                    };
+                    url::Url::parse(&base).and_then(|url| url.join(uri.as_ref()))
+                } else {
+                    Err(url::ParseError::RelativeUrlWithoutBase)
+                }
+            };
+            match resolved {
+                Ok(url) => url,
+                Err(_) => {
+                    return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed()
+                }
+            }
+        };
+
+        let path = url.path();
         match req.method() {
             &Method::Post => {
                 if let Some(route) = PATTERN_NEW.captures(path) {
@@ -364,13 +389,15 @@ mod tests {
     use hyper::status::StatusCode;
     use regex::Regex;
     use std::{str, thread};
+    use std::io::prelude::*;
+    use std::net::TcpStream;
     use std::sync::mpsc;
     use std::time::Duration;
     use tokio::reactor::Core;
 
-    fn spawn_server() -> String {
+    fn spawn_server() -> (String, String) {
         let port = start_service("127.0.0.1:0".parse().unwrap(), 1, false).unwrap().port();
-        format!("http://127.0.0.1:{}", port)
+        (format!("http://127.0.0.1:{}", port), format!("127.0.0.1:{}", port))
     }
 
     fn create_flow(prefix: &str, param: &str) -> String {
@@ -516,31 +543,33 @@ mod tests {
 
     #[test]
     fn validate_route() {
-        let prefix = &spawn_server();
+        let (ref prefix, ref ip_prefix) = spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
         let flow_id = &create_flow(prefix, r#"{}"#);
 
-        // Not support URL resolving now.
         let req = Request::new(Post, format!("{}/{}/x/../push", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
+                assert_eq!(res.status(), StatusCode::Ok);
                 Ok(())
             }))
             .unwrap();
+
+        let mut stream = TcpStream::connect(ip_prefix).unwrap();
+        stream.write(b"GET /neo HTTP/1.0\r\n\r\n").unwrap();
+        let mut data = [0u8; 12];
+        stream.read_exact(&mut data).unwrap();
+        assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 400");
+
+        let mut stream = TcpStream::connect(ip_prefix).unwrap();
+        stream.write(&format!("GET {}/neo HTTP/1.0\r\n\r\n", prefix).into_bytes()).unwrap();
+        let mut data = [0u8; 12];
+        stream.read_exact(&mut data).unwrap();
+        assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 404");
 
         let req = Request::new(Post, format!("{}/neo", prefix).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::NotFound);
-                Ok(())
-            }))
-            .unwrap();
-
-        let req = Request::new(Post, format!("{}/x/{}/push", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -615,7 +644,7 @@ mod tests {
 
     #[test]
     fn handle_new() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -677,7 +706,7 @@ mod tests {
 
     #[test]
     fn handle_push_fetch() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -733,7 +762,7 @@ mod tests {
     #[test]
     fn handle_push_pull() {
         let payload = vec![1u8; flow::MAX_SIZE * 10];
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, &format!(r#"{{"size": {}}}"#, payload.len()));
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
@@ -759,7 +788,7 @@ mod tests {
 
     #[test]
     fn handle_eof() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
@@ -773,7 +802,7 @@ mod tests {
 
     #[test]
     fn recycle() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, r#"{}"#);
 
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
@@ -784,7 +813,7 @@ mod tests {
 
     #[test]
     fn dropped() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, r#"{}"#);
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
@@ -799,7 +828,7 @@ mod tests {
 
     #[test]
     fn full_push() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, r#"{}"#);
 
         assert_eq!(req_push(prefix, flow_id, b"Hello"), (StatusCode::Ok, Some(String::from("Ok"))));
@@ -843,7 +872,7 @@ mod tests {
 
     #[test]
     fn racing_pull() {
-        let prefix = &spawn_server();
+        let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, r#"{}"#);
 
         let (send_tx, send_rx) = mpsc::channel();
