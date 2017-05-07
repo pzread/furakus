@@ -24,6 +24,7 @@ use pool::Pool;
 use regex::Regex;
 use std::{env, thread};
 use std::sync::{Arc, Barrier, RwLock};
+use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
 
 #[derive(Debug)]
@@ -339,8 +340,7 @@ fn start_service(addr: std::net::SocketAddr,
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
-            let listener = tokio::net::TcpListener::from_listener(listener, &addr, &handle)
-                .unwrap();
+            let listener = TcpListener::from_listener(listener, &addr, &handle).unwrap();
             let http = Http::new();
             let acceptor = listener
                 .incoming()
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 400");
 
         let mut stream = TcpStream::connect(ip_prefix).unwrap();
-        stream.write(b"GET http://x/neo HTTP/1.0\r\n\r\n").unwrap();
+        stream.write(b"GET /neo HTTP/1.0\r\nHost: http://x\r\n\r\n").unwrap();
         let mut data = [0u8; 12];
         stream.read_exact(&mut data).unwrap();
         assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 404");
@@ -821,7 +821,6 @@ mod tests {
                            (StatusCode::InternalServerError, None));
             })
         };
-
         rx.recv().unwrap();
         thread::sleep(Duration::from_millis(1000));
 
