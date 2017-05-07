@@ -807,14 +807,30 @@ mod tests {
     }
 
     #[test]
-    fn recycle() {
+    fn recycle_and_release() {
         let prefix = &spawn_server().0;
         let flow_id = &create_flow(prefix, r#"{}"#);
+
+        let (tx, rx) = mpsc::channel();
+        let thd = {
+            let prefix = prefix.to_owned();
+            let flow_id = flow_id.to_owned();
+            thread::spawn(move || {
+                tx.send(()).unwrap();
+                assert_eq!(req_fetch(&prefix, &flow_id, 100),
+                           (StatusCode::InternalServerError, None));
+            })
+        };
+
+        rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(1000));
 
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Ok"))));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::Ok, Some(String::from("Closed"))));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id), (StatusCode::NotFound, None));
+
+        thd.join().unwrap();
     }
 
     #[test]
