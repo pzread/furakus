@@ -564,6 +564,12 @@ mod tests {
         assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 400");
 
         let mut stream = TcpStream::connect(ip_prefix).unwrap();
+        stream.write(b"GET http://x/neo HTTP/1.0\r\n\r\n").unwrap();
+        let mut data = [0u8; 12];
+        stream.read_exact(&mut data).unwrap();
+        assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 404");
+
+        let mut stream = TcpStream::connect(ip_prefix).unwrap();
         stream.write(&format!("GET {}/neo HTTP/1.0\r\n\r\n", prefix).into_bytes()).unwrap();
         let mut data = [0u8; 12];
         stream.read_exact(&mut data).unwrap();
