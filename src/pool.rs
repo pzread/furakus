@@ -25,19 +25,49 @@ pub struct Pool {
 }
 
 impl Entry {
-    fn new(flow_id: &str,
-           flow_ptr: SharedFlow,
-           prev: Option<LinkPointer<TimeLinkNode>>,
-           next: Option<LinkPointer<TimeLinkNode>>)
-           -> Self {
+    fn new(flow_id: &str, flow_ptr: SharedFlow) -> Self {
         Entry {
             flow: flow_ptr,
             timelink: Arc::new(Mutex::new(TimeLinkNode {
                                               key: flow_id.to_owned(),
-                                              prev,
-                                              next,
+                                              prev: Some(Weak::new()),
+                                              next: Some(Weak::new()),
                                           })),
         }
+    }
+}
+
+impl TimeLinkNode {
+    fn push(timelink: &Arc<Mutex<TimeLinkNode>>, pool: &mut Pool) {
+        let mut link = timelink.lock().unwrap();
+        link.prev = None;
+        link.next = pool.timelink_head.clone();
+        let link_ptr = Arc::downgrade(timelink);
+        if let Some(ref head) = pool.timelink_head {
+            let head = head.upgrade().unwrap();
+            head.lock().unwrap().prev = Some(link_ptr.clone());
+        }
+        pool.timelink_head = Some(link_ptr);
+    }
+
+    fn unlink(timelink: &Arc<Mutex<TimeLinkNode>>, pool: &mut Pool) {
+        let mut link = timelink.lock().unwrap();
+        if let Some(ref prev) = link.prev {
+            // Upgrade should always success.
+            let prev = prev.upgrade().unwrap();
+            prev.lock().unwrap().next = link.next.clone();
+        } else {
+            pool.timelink_head = link.next.clone();
+        }
+        if let Some(ref next) = link.next {
+            // Upgrade should always success.
+            let next = next.upgrade().unwrap();
+            next.lock().unwrap().prev = link.prev.clone();
+        } else {
+            pool.timelink_tail = link.prev.clone();
+        }
+        link.prev = Some(Weak::new());
+        link.next = Some(Weak::new());
     }
 }
 
@@ -57,23 +87,15 @@ impl Pool {
     pub fn insert(&mut self, flow_ptr: SharedFlow) {
         // Occupy the flow to prevent from race condition.
         let mut flow = flow_ptr.write().unwrap();
-
-        let entry =
+        let timelink = {
             self.bucket
                 .entry(flow.id.to_owned())
-                .or_insert(Entry::new(&flow.id,
-                                      flow_ptr.clone(),
-                                      None,
-                                      self.timelink_head.clone()));
-
+                .or_insert(Entry::new(&flow.id, flow_ptr.clone()))
+                .timelink
+                .clone()
+        };
         flow.observe(self.weakref.clone());
-
-        let link_ptr = Arc::downgrade(&entry.timelink);
-        if let Some(ref head) = self.timelink_head {
-            let head = head.upgrade().unwrap();
-            head.lock().unwrap().prev = Some(link_ptr.clone());
-        }
-        self.timelink_head = Some(link_ptr);
+        TimeLinkNode::push(&timelink, self);
     }
 
     pub fn get(&self, flow_id: &str) -> Option<SharedFlow> {
@@ -85,27 +107,26 @@ impl Pool {
             .remove(flow_id)
             .ok_or(())
             .and_then(|entry| {
-                let link = entry.timelink.lock().unwrap();
-                if let Some(ref prev) = link.prev {
-                    // Upgrade should always success.
-                    let prev = prev.upgrade().unwrap();
-                    prev.lock().unwrap().next = link.next.clone();
-                } else {
-                    self.timelink_head = link.next.clone();
-                }
-                if let Some(ref next) = link.next {
-                    // Upgrade should always success.
-                    let next = next.upgrade().unwrap();
-                    next.lock().unwrap().prev = link.prev.clone();
-                } else {
-                    self.timelink_tail = link.prev.clone();
-                }
+                TimeLinkNode::unlink(&entry.timelink, self);
                 Ok(())
             })
     }
 }
 
 impl Observer for Weak<RwLock<Pool>> {
+    fn on_active(&self, flow: &Flow) {
+        if let Some(pool_ptr) = self.upgrade() {
+            // TODO minimize the pool write lock.
+            let mut pool = pool_ptr.write().unwrap();
+            let timelink = match pool.bucket.get(&flow.id) {
+                Some(entry) => entry.timelink.clone(),
+                None => return,
+            };
+            TimeLinkNode::unlink(&timelink, &mut pool);
+            TimeLinkNode::push(&timelink, &mut pool);
+        }
+    }
+
     fn on_close(&self, flow: &Flow) {
         if let Some(pool_ptr) = self.upgrade() {
             let mut pool = pool_ptr.write().unwrap();

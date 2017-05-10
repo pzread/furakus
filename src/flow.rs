@@ -50,6 +50,7 @@ impl Chunk {
 type SharedChunk = Arc<Mutex<Chunk>>;
 
 pub trait Observer {
+    fn on_active(&self, _flow: &Flow) {}
     fn on_close(&self, _flow: &Flow) {}
 }
 
@@ -214,6 +215,9 @@ impl Flow {
         }
 
         self.statistic.active_timestamp = Instant::now();
+        for observer in self.observers.iter() {
+            observer.on_active(&self);
+        }
 
         fut.map(move |_| chunk_index).boxed()
     }
