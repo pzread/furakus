@@ -1,8 +1,8 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
-use std::time::Instant;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
