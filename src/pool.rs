@@ -139,7 +139,7 @@ impl Observer for Weak<RwLock<Pool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow::Flow;
+    use flow::{self, Flow};
     use std::sync::Arc;
     use tokio::reactor::Core;
 
@@ -169,7 +169,7 @@ mod tests {
             assert!(Arc::ptr_eq(&pool.get(&flowb_id).unwrap(), &flow_b));
             assert!(!Arc::ptr_eq(&pool.get(&flowa_id).unwrap(), &flow_b));
             assert!(!Arc::ptr_eq(&pool.get(&flowb_id).unwrap(), &flow_a));
-            assert!(!pool.get("C").is_some());
+            assert!(pool.get("C").is_none());
         }
 
         {
@@ -177,6 +177,13 @@ mod tests {
             assert_eq!(pool.remove(&flowb_id), Ok(()));
             assert_eq!(pool.remove(&flowa_id), Ok(()));
             assert_eq!(pool.remove(&flowc_id), Ok(()));
+        }
+
+        {
+            let pool = ptr.read().unwrap();
+            assert!(pool.get(&flowa_id).is_none());
+            assert!(pool.get(&flowb_id).is_none());
+            assert!(pool.get(&flowc_id).is_none());
         }
     }
 
@@ -198,7 +205,7 @@ mod tests {
 
         {
             let fut = flow.write().unwrap().close();
-            core.run(fut).is_ok();
+            core.run(fut).unwrap();
         }
 
         {
@@ -208,7 +215,42 @@ mod tests {
 
         {
             let pool = ptr.read().unwrap();
-            assert!(!pool.get(&flow_id).is_some());
+            assert!(pool.get(&flow_id).is_none());
+        }
+    }
+
+    #[test]
+    fn dropped() {
+        let mut core = Core::new().unwrap();
+        let flow = Flow::new(None);
+
+        {
+            let ptr = Pool::new();
+
+            let flow_id = {
+                flow.read().unwrap().id.to_owned()
+            };
+
+            {
+                let mut pool = ptr.write().unwrap();
+                pool.insert(flow.clone());
+                pool.remove(&flow_id).unwrap();
+            }
+
+            {
+                let pool = ptr.read().unwrap();
+                assert!(pool.get(&flow_id).is_none());
+            }
+
+            {
+                let fut = flow.write().unwrap().close();
+                core.run(fut).unwrap();
+            }
+        }
+
+        {
+            let fut = flow.read().unwrap().pull(0, Some(0));
+            assert_eq!(core.run(fut), Err(flow::Error::Eof));
         }
     }
 }
