@@ -1,5 +1,6 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
+use std::time::Instant;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use uuid::Uuid;
@@ -69,6 +70,7 @@ pub struct Statistic {
     pub pushed: u64,
     pub dropped: u64,
     pub buffered: u64,
+    pub active_timestamp: Instant,
 }
 
 pub struct Flow {
@@ -101,6 +103,7 @@ impl Flow {
                 pushed: 0,
                 dropped: 0,
                 buffered: 0,
+                active_timestamp: Instant::now(),
             },
             state: State::Streaming,
             next_index: 0,
@@ -209,6 +212,8 @@ impl Flow {
                 wait.send(shared_chunk.clone()).is_ok();
             }
         }
+
+        self.statistic.active_timestamp = Instant::now();
 
         fut.map(move |_| chunk_index).boxed()
     }

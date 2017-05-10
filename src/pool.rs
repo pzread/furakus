@@ -1,12 +1,44 @@
 use flow::{Flow, Observer};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 type SharedFlow = Arc<RwLock<Flow>>;
 
+type LinkPointer<T> = Weak<Mutex<T>>;
+
+struct TimeLinkNode {
+    key: String,
+    prev: Option<LinkPointer<TimeLinkNode>>,
+    next: Option<LinkPointer<TimeLinkNode>>,
+}
+
+struct Entry {
+    flow: SharedFlow,
+    timelink: Arc<Mutex<TimeLinkNode>>,
+}
+
 pub struct Pool {
     weakref: Weak<RwLock<Pool>>,
-    bucket: HashMap<String, SharedFlow>,
+    bucket: HashMap<String, Entry>,
+    timelink_head: Option<LinkPointer<TimeLinkNode>>,
+    timelink_tail: Option<LinkPointer<TimeLinkNode>>,
+}
+
+impl Entry {
+    fn new(flow_id: &str,
+           flow_ptr: SharedFlow,
+           prev: Option<LinkPointer<TimeLinkNode>>,
+           next: Option<LinkPointer<TimeLinkNode>>)
+           -> Self {
+        Entry {
+            flow: flow_ptr,
+            timelink: Arc::new(Mutex::new(TimeLinkNode {
+                                              key: flow_id.to_owned(),
+                                              prev,
+                                              next,
+                                          })),
+        }
+    }
 }
 
 impl Pool {
@@ -14,6 +46,8 @@ impl Pool {
         let pool = Pool {
             weakref: Weak::new(),
             bucket: HashMap::new(),
+            timelink_head: None,
+            timelink_tail: None,
         };
         let pool_ptr = Arc::new(RwLock::new(pool));
         pool_ptr.write().unwrap().weakref = Arc::downgrade(&pool_ptr);
@@ -23,12 +57,51 @@ impl Pool {
     pub fn insert(&mut self, flow_ptr: SharedFlow) {
         // Occupy the flow to prevent from race condition.
         let mut flow = flow_ptr.write().unwrap();
-        self.bucket.insert(flow.id.to_owned(), flow_ptr.clone());
+
+        let entry =
+            self.bucket
+                .entry(flow.id.to_owned())
+                .or_insert(Entry::new(&flow.id,
+                                      flow_ptr.clone(),
+                                      None,
+                                      self.timelink_head.clone()));
+
         flow.observe(self.weakref.clone());
+
+        let link_ptr = Arc::downgrade(&entry.timelink);
+        if let Some(ref head) = self.timelink_head {
+            let head = head.upgrade().unwrap();
+            head.lock().unwrap().prev = Some(link_ptr.clone());
+        }
+        self.timelink_head = Some(link_ptr);
     }
 
     pub fn get(&self, flow_id: &str) -> Option<SharedFlow> {
-        self.bucket.get(flow_id).map(|flow_ptr| flow_ptr.clone())
+        self.bucket.get(flow_id).map(|entry| entry.flow.clone())
+    }
+
+    pub fn remove(&mut self, flow_id: &str) -> Result<(), ()> {
+        self.bucket
+            .remove(flow_id)
+            .ok_or(())
+            .and_then(|entry| {
+                let link = entry.timelink.lock().unwrap();
+                if let Some(ref prev) = link.prev {
+                    // Upgrade should always success.
+                    let prev = prev.upgrade().unwrap();
+                    prev.lock().unwrap().next = link.next.clone();
+                } else {
+                    self.timelink_head = link.next.clone();
+                }
+                if let Some(ref next) = link.next {
+                    // Upgrade should always success.
+                    let next = next.upgrade().unwrap();
+                    next.lock().unwrap().prev = link.prev.clone();
+                } else {
+                    self.timelink_tail = link.prev.clone();
+                }
+                Ok(())
+            })
     }
 }
 
@@ -37,7 +110,7 @@ impl Observer for Weak<RwLock<Pool>> {
         if let Some(pool_ptr) = self.upgrade() {
             let mut pool = pool_ptr.write().unwrap();
             // Try to remove the flow.
-            pool.bucket.remove(&flow.id).is_some();
+            pool.remove(&flow.id).is_ok();
         }
     }
 }
@@ -54,15 +127,19 @@ mod tests {
         let ptr = Pool::new();
         let flow_a = Flow::new(None);
         let flow_b = Flow::new(None);
+        let flow_c = Flow::new(None);
 
-        let (flowa_id, flowb_id) = {
-            (flow_a.read().unwrap().id.to_owned(), flow_b.read().unwrap().id.to_owned())
+        let (flowa_id, flowb_id, flowc_id) = {
+            (flow_a.read().unwrap().id.to_owned(),
+             flow_b.read().unwrap().id.to_owned(),
+             flow_c.read().unwrap().id.to_owned())
         };
 
         {
             let mut pool = ptr.write().unwrap();
             pool.insert(flow_a.clone());
             pool.insert(flow_b.clone());
+            pool.insert(flow_c.clone());
         }
 
         {
@@ -72,6 +149,13 @@ mod tests {
             assert!(!Arc::ptr_eq(&pool.get(&flowa_id).unwrap(), &flow_b));
             assert!(!Arc::ptr_eq(&pool.get(&flowb_id).unwrap(), &flow_a));
             assert!(!pool.get("C").is_some());
+        }
+
+        {
+            let mut pool = ptr.write().unwrap();
+            assert_eq!(pool.remove(&flowb_id), Ok(()));
+            assert_eq!(pool.remove(&flowa_id), Ok(()));
+            assert_eq!(pool.remove(&flowc_id), Ok(()));
         }
     }
 
