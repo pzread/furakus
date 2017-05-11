@@ -2,7 +2,6 @@ use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug, PartialEq)]
@@ -71,7 +70,6 @@ pub struct Statistic {
     pub pushed: u64,
     pub dropped: u64,
     pub buffered: u64,
-    pub active_timestamp: Instant,
 }
 
 pub struct Flow {
@@ -104,7 +102,6 @@ impl Flow {
                 pushed: 0,
                 dropped: 0,
                 buffered: 0,
-                active_timestamp: Instant::now(),
             },
             state: State::Streaming,
             next_index: 0,
@@ -214,7 +211,6 @@ impl Flow {
             }
         }
 
-        self.statistic.active_timestamp = Instant::now();
         for observer in self.observers.iter() {
             observer.on_active(&self);
         }

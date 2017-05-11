@@ -30,6 +30,7 @@ use tokio::reactor::{self, Core};
 #[derive(Debug)]
 pub enum Error {
     Invalid,
+    NotReady,
     Internal(hyper::Error),
 }
 
@@ -72,8 +73,10 @@ impl FluxService {
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
                     let mut pool = pool_ptr.write().unwrap();
-                    pool.insert(flow_ptr);
+                    pool.insert(flow_ptr).map(|_| flow_id).map_err(|_| Error::NotReady)
                 }
+            })
+            .and_then(|flow_id| {
                 let body = flow_id.into_bytes();
                 future::ok(Response::new()
                                .with_header(ContentType::plaintext())
@@ -82,6 +85,9 @@ impl FluxService {
             })
             .or_else(|err| match err {
                          Error::Invalid => Ok(Response::new().with_status(StatusCode::BadRequest)),
+                         Error::NotReady => {
+                             Ok(Response::new().with_status(StatusCode::ServiceUnavailable))
+                         }
                          Error::Internal(err) => Err(err),
                      })
             .boxed()
@@ -327,7 +333,7 @@ fn start_service(addr: std::net::SocketAddr,
                  block: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
-    let pool_ptr = Pool::new();
+    let pool_ptr = Pool::new(None, None);
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
