@@ -24,6 +24,7 @@ use pool::Pool;
 use regex::Regex;
 use std::{env, thread};
 use std::sync::{Arc, Barrier, RwLock};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
 
@@ -330,10 +331,12 @@ impl Service for FluxService {
 
 fn start_service(addr: std::net::SocketAddr,
                  num_worker: usize,
+                 pool_size: Option<usize>,
+                 deactive_timeout: Option<Duration>,
                  block: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
-    let pool_ptr = Pool::new(None, None);
+    let pool_ptr = Pool::new(pool_size, deactive_timeout);
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
@@ -380,7 +383,13 @@ fn main() {
     dotenv().ok();
     let addr: std::net::SocketAddr = env::var("SERVER_ADDRESS").unwrap().parse().unwrap();
     let num_worker: usize = env::var("NUM_WORKER").unwrap().parse().unwrap();
-    start_service(addr, num_worker, true);
+    let pool_size: usize = env::var("POOL_SIZE").unwrap().parse().unwrap();
+    let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
+    start_service(addr,
+                  num_worker,
+                  Some(pool_size),
+                  Some(Duration::from_secs(deactive_timeout)),
+                  true);
 }
 
 #[cfg(test)]
@@ -402,7 +411,13 @@ mod tests {
     use tokio::reactor::Core;
 
     fn spawn_server() -> (String, String) {
-        let port = start_service("127.0.0.1:0".parse().unwrap(), 1, false).unwrap().port();
+        let port = start_service("127.0.0.1:0".parse().unwrap(),
+                                 1,
+                                 Some(32),
+                                 Some(Duration::from_secs(6)),
+                                 false)
+                .unwrap()
+                .port();
         (format!("http://127.0.0.1:{}", port), format!("127.0.0.1:{}", port))
     }
 
@@ -973,5 +988,46 @@ mod tests {
 
         thd.thread().unpark();
         thd.join().unwrap();
+    }
+
+    #[test]
+    fn overload() {
+        let prefix = &spawn_server().0;
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let flow_id = &create_flow(prefix, r#"{}"#);
+        for _ in 1..32 {
+            create_flow(prefix, r#"{}"#);
+        }
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{}"#);
+        req.headers_mut().set(ContentLength(2));
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::ServiceUnavailable);
+                Ok(())
+            }))
+            .unwrap();
+
+        thread::sleep(Duration::from_secs(4));
+        assert_eq!(req_push(prefix, flow_id, b"Hello"), (StatusCode::Ok, Some(String::from("Ok"))));
+        thread::sleep(Duration::from_secs(4));
+        for _ in 0..31 {
+            create_flow(prefix, r#"{}"#);
+        }
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{}"#);
+        req.headers_mut().set(ContentLength(2));
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::ServiceUnavailable);
+                Ok(())
+            }))
+            .unwrap();
     }
 }

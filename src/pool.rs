@@ -23,8 +23,8 @@ struct Entry {
 pub struct Pool {
     weakref: Weak<RwLock<Pool>>,
     bucket: HashMap<String, Entry>,
-    size_limit: Option<usize>,
-    timeout_limit: Option<Duration>,
+    pool_size: Option<usize>,
+    deactive_timeout: Option<Duration>,
     timelink_head: Option<LinkPointer<TimeLinkNode>>,
     timelink_tail: Option<LinkPointer<TimeLinkNode>>,
 }
@@ -76,12 +76,12 @@ impl TimeLinkNode {
 }
 
 impl Pool {
-    pub fn new(size_limit: Option<usize>, timeout_limit: Option<Duration>) -> Arc<RwLock<Self>> {
+    pub fn new(pool_size: Option<usize>, deactive_timeout: Option<Duration>) -> Arc<RwLock<Self>> {
         let pool = Pool {
             weakref: Weak::new(),
             bucket: HashMap::new(),
-            size_limit,
-            timeout_limit,
+            pool_size,
+            deactive_timeout,
             timelink_head: None,
             timelink_tail: None,
         };
@@ -91,10 +91,10 @@ impl Pool {
     }
 
     pub fn insert(&mut self, flow_ptr: SharedFlow) -> Result<(), ()> {
-        if let Some(size_limit) = self.size_limit {
-            if self.bucket.len() >= size_limit {
+        if let Some(pool_size) = self.pool_size {
+            if self.bucket.len() >= pool_size {
                 self.sanitize_bucket();
-                if self.bucket.len() >= size_limit {
+                if self.bucket.len() >= pool_size {
                     return Err(());
                 }
             }
@@ -109,7 +109,9 @@ impl Pool {
                 .timelink
                 .clone()
         };
+
         flow.observe(self.weakref.clone());
+
         {
             let mut link = timelink.lock().unwrap();
             TimeLinkNode::push(&mut link, &timelink, self);
@@ -134,8 +136,8 @@ impl Pool {
     }
 
     fn sanitize_bucket(&mut self) {
-        let timeout = match self.timeout_limit {
-            Some(timeout) => timeout,
+        let deactive_timeout = match self.deactive_timeout {
+            Some(deactive_timeout) => deactive_timeout,
             None => return,
         };
 
@@ -149,7 +151,7 @@ impl Pool {
                               })
                     .and_then(|tail_ptr| {
                         let node = tail_ptr.lock().unwrap();
-                        if node.timestamp.elapsed() <= timeout {
+                        if node.timestamp.elapsed() <= deactive_timeout {
                             None
                         } else {
                             *tail_link = node.prev.clone();
@@ -327,7 +329,7 @@ mod tests {
         }
         thread::sleep(Duration::from_secs(4));
         {
-            let fut = flow_a.write().unwrap().push(b"Hello" as &[u8]);
+            let fut = flow_a.write().unwrap().push(b"Hello");
             core.run(fut).unwrap();
         }
         thread::sleep(Duration::from_secs(4));
