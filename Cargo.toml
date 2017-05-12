@@ -1,7 +1,13 @@
 [package]
-name = "flux"
-version = "0.1.0"
-authors = ["PZ Read"]
+name = "furakus"
+version = "0.0.1"
+authors = ["PZ Read <netfirewall@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/pzread/furakus"
+
+[badges]
+travis-ci = { repository = "pzread/furakus" }
+appveyor = { repository = "pzread/furakus" }
 
 [dependencies]
 dotenv = "0.10"
