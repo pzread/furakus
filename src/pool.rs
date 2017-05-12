@@ -17,7 +17,7 @@ struct TimeLinkNode {
 
 struct Entry {
     flow: SharedFlow,
-    timelink: Arc<Mutex<TimeLinkNode>>,
+    node: Arc<Mutex<TimeLinkNode>>,
 }
 
 pub struct Pool {
@@ -33,12 +33,12 @@ impl Entry {
     fn new(flow_id: &str, flow_ptr: SharedFlow) -> Self {
         Entry {
             flow: flow_ptr,
-            timelink: Arc::new(Mutex::new(TimeLinkNode {
-                                              key: flow_id.to_owned(),
-                                              timestamp: Instant::now(),
-                                              prev: Some(Weak::new()),
-                                              next: Some(Weak::new()),
-                                          })),
+            node: Arc::new(Mutex::new(TimeLinkNode {
+                                          key: flow_id.to_owned(),
+                                          timestamp: Instant::now(),
+                                          prev: Some(Weak::new()),
+                                          next: Some(Weak::new()),
+                                      })),
         }
     }
 }
@@ -99,24 +99,22 @@ impl Pool {
                 }
             }
         }
-
-        // Occupy the flow to prevent from race condition.
-        let mut flow = flow_ptr.write().unwrap();
-        let timelink = {
-            self.bucket
-                .entry(flow.id.to_owned())
-                .or_insert(Entry::new(&flow.id, flow_ptr.clone()))
-                .timelink
-                .clone()
-        };
-
-        flow.observe(self.weakref.clone());
-
         {
-            let mut link = timelink.lock().unwrap();
-            TimeLinkNode::push(&mut link, &timelink, self);
+            // Occupy the flow to prevent from race condition.
+            let mut flow = flow_ptr.write().unwrap();
+            let node_ptr = {
+                self.bucket
+                    .entry(flow.id.to_owned())
+                    .or_insert(Entry::new(&flow.id, flow_ptr.clone()))
+                    .node
+                    .clone()
+            };
+            {
+                let mut node = node_ptr.lock().unwrap();
+                TimeLinkNode::push(&mut node, &node_ptr, self);
+            }
+            flow.observe(self.weakref.clone());
         }
-
         Ok(())
     }
 
@@ -129,8 +127,8 @@ impl Pool {
             .remove(flow_id)
             .ok_or(())
             .and_then(|entry| {
-                let mut link = entry.timelink.lock().unwrap();
-                TimeLinkNode::unlink(&mut link, self);
+                let mut node = entry.node.lock().unwrap();
+                TimeLinkNode::unlink(&mut node, self);
                 Ok(())
             })
     }
@@ -142,19 +140,16 @@ impl Pool {
         };
 
         let droplist = iter::repeat(())
-            .scan(self.timelink_tail.clone(), |tail_link, _| {
-                tail_link
+            .scan(self.timelink_tail.clone(), |tail_weakref, _| {
+                tail_weakref
                     .as_ref()
-                    .and_then(|tail| match tail.upgrade() {
-                                  Some(tail_ptr) => Some(tail_ptr),
-                                  None => None,
-                              })
+                    .and_then(|weakref| weakref.upgrade())
                     .and_then(|tail_ptr| {
                         let node = tail_ptr.lock().unwrap();
                         if node.timestamp.elapsed() <= deactive_timeout {
                             None
                         } else {
-                            *tail_link = node.prev.clone();
+                            *tail_weakref = node.prev.clone();
                             Some(node.key.to_owned())
                         }
                     })
@@ -173,15 +168,15 @@ impl Observer for Weak<RwLock<Pool>> {
         if let Some(pool_ptr) = self.upgrade() {
             // TODO minimize the pool write lock.
             let mut pool = pool_ptr.write().unwrap();
-            let link_ptr = match pool.bucket.get(&flow.id) {
-                Some(entry) => entry.timelink.clone(),
+            let node_ptr = match pool.bucket.get(&flow.id) {
+                Some(entry) => entry.node.clone(),
                 None => return,
             };
             {
-                let mut link = link_ptr.lock().unwrap();
-                link.timestamp = Instant::now();
-                TimeLinkNode::unlink(&mut link, &mut pool);
-                TimeLinkNode::push(&mut link, &link_ptr, &mut pool);
+                let mut node = node_ptr.lock().unwrap();
+                node.timestamp = Instant::now();
+                TimeLinkNode::unlink(&mut node, &mut pool);
+                TimeLinkNode::push(&mut node, &node_ptr, &mut pool);
             }
         }
     }
