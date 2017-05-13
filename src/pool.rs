@@ -199,12 +199,18 @@ mod tests {
     use std::time::Duration;
     use tokio::reactor::Core;
 
+    const FLOW_CONFIG: flow::Config = flow::Config {
+        length: None,
+        capacity: 16777216,
+        keepcount: Some(1),
+    };
+
     #[test]
     fn basic_operations() {
         let ptr = Pool::new(None, None);
-        let flow_a = Flow::new(None);
-        let flow_b = Flow::new(None);
-        let flow_c = Flow::new(None);
+        let flow_a = Flow::new(FLOW_CONFIG);
+        let flow_b = Flow::new(FLOW_CONFIG);
+        let flow_c = Flow::new(FLOW_CONFIG);
         let (flowa_id, flowb_id, flowc_id) = {
             (flow_a.read().unwrap().id.to_owned(),
              flow_b.read().unwrap().id.to_owned(),
@@ -242,7 +248,7 @@ mod tests {
     fn close_recycle() {
         let mut core = Core::new().unwrap();
         let ptr = Pool::new(None, None);
-        let flow = Flow::new(None);
+        let flow = Flow::new(FLOW_CONFIG);
         let flow_id = {
             flow.read().unwrap().id.to_owned()
         };
@@ -268,7 +274,7 @@ mod tests {
     #[test]
     fn dropped() {
         let mut core = Core::new().unwrap();
-        let flow = Flow::new(None);
+        let flow = Flow::new(FLOW_CONFIG);
         {
             let ptr = Pool::new(None, None);
             let flow_id = {
@@ -297,8 +303,8 @@ mod tests {
     #[test]
     fn overload_size() {
         let ptr = Pool::new(Some(1), None);
-        let flow_a = Flow::new(None);
-        let flow_b = Flow::new(None);
+        let flow_a = Flow::new(FLOW_CONFIG);
+        let flow_b = Flow::new(FLOW_CONFIG);
         {
             let mut pool = ptr.write().unwrap();
             assert_eq!(pool.insert(flow_a.clone()), Ok(()));
@@ -310,12 +316,12 @@ mod tests {
     fn overload_time() {
         let mut core = Core::new().unwrap();
         let ptr = Pool::new(Some(3), Some(Duration::from_secs(6)));
-        let flow_a = Flow::new(None);
-        let flow_b = Flow::new(None);
-        let flow_c = Flow::new(None);
-        let flow_d = Flow::new(None);
-        let flow_e = Flow::new(None);
-        let flow_f = Flow::new(None);
+        let flow_a = Flow::new(FLOW_CONFIG);
+        let flow_b = Flow::new(FLOW_CONFIG);
+        let flow_c = Flow::new(FLOW_CONFIG);
+        let flow_d = Flow::new(FLOW_CONFIG);
+        let flow_e = Flow::new(FLOW_CONFIG);
+        let flow_f = Flow::new(FLOW_CONFIG);
         {
             let mut pool = ptr.write().unwrap();
             assert_eq!(pool.insert(flow_a.clone()), Ok(()));

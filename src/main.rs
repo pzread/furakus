@@ -70,7 +70,11 @@ impl FluxService {
                 serde_json::from_slice::<FlowReqParam>(&body).map_err(|_| Error::Invalid)
             })
             .and_then(move |param| {
-                let flow_ptr = Flow::new(param.size);
+                let flow_ptr = Flow::new(flow::Config {
+                                             length: param.size,
+                                             capacity: 16777216,
+                                             keepcount: Some(1),
+                                         });
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
                     let mut pool = pool_ptr.write().unwrap();
@@ -409,6 +413,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
     use tokio::reactor::Core;
+
+    const MAX_CAPACITY: u64 = 16777216;
 
     fn spawn_server() -> (String, String) {
         let port = start_service("127.0.0.1:0".parse().unwrap(),
@@ -884,7 +890,7 @@ mod tests {
             thread::spawn(move || {
                 let prefix = &prefix;
                 let flow_id = &flow_id;
-                req_push(prefix, flow_id, &vec![0u8; flow::MAX_CAPACITY as usize]);
+                req_push(prefix, flow_id, &vec![0u8; MAX_CAPACITY as usize]);
                 req_close(prefix, flow_id);
                 tx.send(()).unwrap();
             });
@@ -897,7 +903,7 @@ mod tests {
             thread::spawn(move || {
                 let prefix = &prefix;
                 let flow_id = &flow_id;
-                req_push(prefix, flow_id, &vec![0u8; flow::MAX_CAPACITY as usize]);
+                req_push(prefix, flow_id, &vec![0u8; MAX_CAPACITY as usize]);
                 req_close(prefix, flow_id);
                 tx.send(()).unwrap();
             });
@@ -982,6 +988,9 @@ mod tests {
 
         for idx in 0.. {
             if req_fetch(prefix, flow_id, idx).0 == StatusCode::Ok {
+                for succ_idx in (idx + 1)..(idx + MAX_CAPACITY / flow::MAX_SIZE as u64) {
+                    assert_eq!(req_fetch(prefix, flow_id, succ_idx).0, StatusCode::Ok);
+                }
                 break;
             }
         }
