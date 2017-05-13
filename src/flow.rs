@@ -144,8 +144,7 @@ impl Flow {
 
     fn check_overflow(&self) -> bool {
         lazy_static! {   
-            static ref META_SIZE: u64 = (mem::size_of::<Chunk>() +
-                                         mem::size_of::<Mutex<Chunk>>() +
+            static ref META_SIZE: u64 = (mem::size_of::<Mutex<Chunk>>() +
                                          mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
         }
         (self.statistic.buffered > self.config.data_capacity) ||
