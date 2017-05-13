@@ -39,6 +39,8 @@ pub enum Error {
 struct FluxService {
     remote: reactor::Remote,
     pool: Arc<RwLock<Pool>>,
+    meta_capacity: u64,
+    data_capacity: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,8 +51,17 @@ struct FlowReqParam {
 type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
 impl FluxService {
-    fn new(pool: Arc<RwLock<Pool>>, remote: reactor::Remote) -> Self {
-        FluxService { remote, pool }
+    fn new(pool: Arc<RwLock<Pool>>,
+           remote: reactor::Remote,
+           meta_capacity: u64,
+           data_capacity: u64)
+           -> Self {
+        FluxService {
+            remote,
+            pool,
+            meta_capacity,
+            data_capacity,
+        }
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
@@ -63,6 +74,8 @@ impl FluxService {
         }
 
         let pool_ptr = self.pool.clone();
+        let meta_capacity = self.meta_capacity;
+        let data_capacity = self.data_capacity;
         req.body()
             .concat()
             .map_err(|err| Error::Internal(err))
@@ -72,8 +85,8 @@ impl FluxService {
             .and_then(move |param| {
                 let flow_ptr = Flow::new(flow::Config {
                                              length: param.size,
-                                             meta_capacity: 16777216,
-                                             data_capacity: 16777216,
+                                             meta_capacity,
+                                             data_capacity,
                                              keepcount: Some(1),
                                          });
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
@@ -338,7 +351,9 @@ fn start_service(addr: std::net::SocketAddr,
                  num_worker: usize,
                  pool_size: Option<usize>,
                  deactive_timeout: Option<Duration>,
-                 block: bool)
+                 meta_capacity: u64,
+                 data_capacity: u64,
+                 blocking: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
@@ -359,10 +374,11 @@ fn start_service(addr: std::net::SocketAddr,
             let acceptor = listener
                 .incoming()
                 .for_each(|(io, addr)| {
-                    http.bind_connection(&handle,
-                                         io,
-                                         addr,
-                                         FluxService::new(pool_ptr.clone(), remote.clone()));
+                    let service = FluxService::new(pool_ptr.clone(),
+                                                   remote.clone(),
+                                                   meta_capacity,
+                                                   data_capacity);
+                    http.bind_connection(&handle, io, addr, service);
                     Ok(())
                 });
             println!("Worker #{} is started.", idx);
@@ -374,7 +390,7 @@ fn start_service(addr: std::net::SocketAddr,
 
     barrier.wait();
 
-    if block {
+    if blocking {
         for worker in workers {
             worker.join().unwrap();
         }
@@ -390,10 +406,14 @@ fn main() {
     let num_worker: usize = env::var("NUM_WORKER").unwrap().parse().unwrap();
     let pool_size: usize = env::var("POOL_SIZE").unwrap().parse().unwrap();
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
+    let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
+    let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
     start_service(addr,
                   num_worker,
                   Some(pool_size),
                   Some(Duration::from_secs(deactive_timeout)),
+                  meta_capacity,
+                  data_capacity,
                   true);
 }
 
@@ -422,6 +442,8 @@ mod tests {
                                  1,
                                  Some(32),
                                  Some(Duration::from_secs(6)),
+                                 MAX_CAPACITY,
+                                 MAX_CAPACITY,
                                  false)
                 .unwrap()
                 .port();
