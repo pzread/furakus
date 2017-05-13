@@ -72,7 +72,8 @@ impl FluxService {
             .and_then(move |param| {
                 let flow_ptr = Flow::new(flow::Config {
                                              length: param.size,
-                                             capacity: 16777216,
+                                             meta_capacity: 16777216,
+                                             data_capacity: 16777216,
                                              keepcount: Some(1),
                                          });
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();

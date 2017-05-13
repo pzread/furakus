@@ -1,6 +1,7 @@
 use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::{HashMap, VecDeque};
+use std::mem;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use uuid::Uuid;
 
@@ -61,7 +62,8 @@ enum State {
 
 pub struct Config {
     pub length: Option<u64>,
-    pub capacity: u64,
+    pub meta_capacity: u64,
+    pub data_capacity: u64,
     pub keepcount: Option<u64>,
 }
 
@@ -89,9 +91,6 @@ type FlowFuture<T> = future::BoxFuture<T, Error>;
 
 impl Flow {
     pub fn new(config: Config) -> Arc<RwLock<Self>> {
-        if config.capacity < MAX_SIZE as u64 {
-            panic!("Invalid capacity");
-        }
         let flow = Flow {
             weakref: Weak::new(),
             id: Uuid::new_v4().simple().to_string(),
@@ -143,6 +142,16 @@ impl Flow {
         }
     }
 
+    fn check_overflow(&self) -> bool {
+        lazy_static! {   
+            static ref META_SIZE: u64 = (mem::size_of::<Chunk>() +
+                                         mem::size_of::<Mutex<Chunk>>() +
+                                         mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
+        }
+        (self.statistic.buffered > self.config.data_capacity) ||
+        ((self.bucket.len() as u64 * *META_SIZE) > self.config.meta_capacity)
+    }
+
     fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
         let chunk_len = chunk.len() as u64;
 
@@ -150,7 +159,7 @@ impl Flow {
         // failed, then update consistently.
 
         // Check if the flow is already overflow. Return if failed.
-        if self.statistic.buffered > self.config.capacity {
+        if self.check_overflow() {
             return future::err(Error::NotReady).boxed();
         }
         // Check statistic. Return if failed.
@@ -192,7 +201,7 @@ impl Flow {
         self.bucket.insert(chunk_index, shared_chunk.clone());
 
         // Check if we need to block for overflow.
-        let fut = if self.statistic.buffered > self.config.capacity {
+        let fut = if self.check_overflow() {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_len, tx));
             rx.map_err(|_| Error::Other).boxed()
@@ -357,7 +366,8 @@ mod tests {
 
     const FLOW_CONFIG: Config = Config {
         length: None,
-        capacity: 16777216,
+        meta_capacity: 16777216,
+        data_capacity: 16777216,
         keepcount: Some(1),
     };
 
@@ -384,7 +394,8 @@ mod tests {
     fn fixed_size_flow() {
         let ptr = Flow::new(Config {
                                 length: Some(10),
-                                capacity: 16777216,
+                                meta_capacity: 16777216,
+                                data_capacity: 16777216,
                                 keepcount: Some(1),
                             });
         sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(0));
@@ -409,7 +420,8 @@ mod tests {
     fn dropped_chunk() {
         let ptr = Flow::new(Config {
                                 length: None,
-                                capacity: (MAX_SIZE * 2) as u64,
+                                meta_capacity: (MAX_SIZE * 2) as u64,
+                                data_capacity: (MAX_SIZE * 2) as u64,
                                 keepcount: Some(2),
                             });
         let payload1 = vec![0u8; MAX_SIZE];
@@ -444,19 +456,48 @@ mod tests {
     #[test]
     fn waiting_push() {
         let ptr = Flow::new(FLOW_CONFIG);
+        let payload = vec![0u8; MAX_SIZE];
 
         sync_assert_eq!(ptr.write().unwrap().push(b"A"), Ok(0));
-        for idx in 1..(FLOW_CONFIG.capacity / MAX_SIZE as u64) {
-            sync_assert_eq!(ptr.write().unwrap().push(&[0u8; MAX_SIZE]), Ok(idx));
+        for idx in 1..(FLOW_CONFIG.data_capacity / MAX_SIZE as u64) {
+            sync_assert_eq!(ptr.write().unwrap().push(&payload), Ok(idx));
         }
-        let base_idx = FLOW_CONFIG.capacity / MAX_SIZE as u64;
+        let base_idx = FLOW_CONFIG.data_capacity / MAX_SIZE as u64;
         sync_assert_eq!(ptr.write().unwrap().push(b"D"), Ok(base_idx));
 
         let fut = ptr.write().unwrap().push(&[0u8; MAX_SIZE]);
         sync_assert_eq!(ptr.write().unwrap().push(b"C"), Err(Error::NotReady));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(vec![0u8; MAX_SIZE]));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload));
         sync_assert_eq!(fut, Ok(base_idx + 1));
+    }
+
+    #[test]
+    fn waiting_meta() {
+        let ptr = Flow::new(Config {
+                                length: None,
+                                meta_capacity: 4096,
+                                data_capacity: 65536,
+                                keepcount: Some(1),
+                            });
+
+        for _ in 0..4096 {
+            ptr.write().unwrap().push(b"A");
+        }
+
+        sync_assert_eq!(ptr.write().unwrap().push(b"B"), Err(Error::NotReady));
+
+        let next_index = {
+            ptr.read().unwrap().get_range().1
+        };
+        for idx in 0..next_index {
+            sync_assert_eq!(ptr.read().unwrap().pull(idx, Some(0)), Ok(Vec::from(b"A" as &[u8])));
+        }
+
+        let fut = ptr.write().unwrap().push(b"B");
+        sync_assert_eq!(ptr.read().unwrap().pull(next_index, Some(0)),
+                        Ok(Vec::from(b"B" as &[u8])));
+        sync_assert_eq!(fut, Ok(next_index));
     }
 
     #[test]
@@ -507,7 +548,8 @@ mod tests {
     fn nonblocking() {
         let ptr = Flow::new(Config {
                                 length: None,
-                                capacity: (MAX_SIZE * 16) as u64,
+                                meta_capacity: (MAX_SIZE * 16) as u64,
+                                data_capacity: (MAX_SIZE * 16) as u64,
                                 keepcount: None,
                             });
         let payload = vec![0u8; MAX_SIZE];

@@ -201,7 +201,8 @@ mod tests {
 
     const FLOW_CONFIG: flow::Config = flow::Config {
         length: None,
-        capacity: 16777216,
+        meta_capacity: 16777216,
+        data_capacity: 16777216,
         keepcount: Some(1),
     };
 
