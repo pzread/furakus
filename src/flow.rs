@@ -305,10 +305,8 @@ impl Flow {
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
         // Clone the chunk if exists.
-        let chunk = match self.bucket.get(&chunk_index) {
-            Some(chunk) => Some(chunk.clone()),
-            None => None,
-        };
+        let chunk = self.bucket.get(&chunk_index).map(|chunk| chunk.clone());
+
         // Try to get the chunk.
         let fut = if let Some(chunk) = chunk {
             future::ok(chunk).boxed()
