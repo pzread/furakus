@@ -6,6 +6,7 @@ extern crate dotenv;
 extern crate futures;
 extern crate hyper;
 extern crate regex;
+extern crate ring;
 extern crate serde;
 extern crate serde_json;
 extern crate tokio_core as tokio;
@@ -13,6 +14,7 @@ extern crate url;
 extern crate uuid;
 mod flow;
 mod pool;
+mod utils;
 
 use dotenv::dotenv;
 use flow::Flow;
@@ -22,6 +24,8 @@ use hyper::header::{ContentLength, ContentType, Host};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
+use ring::{digest, hmac, rand};
+use ring::rand::SecureRandom;
 use std::{env, thread};
 use std::sync::{Arc, Barrier, RwLock};
 use std::time::Duration;
@@ -35,12 +39,12 @@ pub enum Error {
     Internal(hyper::Error),
 }
 
-#[derive(Clone)]
 struct FluxService {
     remote: reactor::Remote,
     pool: Arc<RwLock<Pool>>,
     meta_capacity: u64,
     data_capacity: u64,
+    seckey: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,13 +58,15 @@ impl FluxService {
     fn new(pool: Arc<RwLock<Pool>>,
            remote: reactor::Remote,
            meta_capacity: u64,
-           data_capacity: u64)
+           data_capacity: u64,
+           seckey: &[u8])
            -> Self {
         FluxService {
             remote,
             pool,
             meta_capacity,
             data_capacity,
+            seckey: seckey.to_vec(),
         }
     }
 
@@ -76,6 +82,7 @@ impl FluxService {
         let pool_ptr = self.pool.clone();
         let meta_capacity = self.meta_capacity;
         let data_capacity = self.data_capacity;
+        let seckey = self.seckey.clone();
         req.body()
             .concat()
             .map_err(|err| Error::Internal(err))
@@ -92,11 +99,15 @@ impl FluxService {
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
                     let mut pool = pool_ptr.write().unwrap();
-                    pool.insert(flow_ptr).map(|_| flow_id).map_err(|_| Error::NotReady)
+                    pool.insert(flow_ptr).map(|_| flow_id.clone()).map_err(|_| Error::NotReady)
                 }
             })
-            .and_then(|flow_id| {
-                let body = flow_id.into_bytes();
+            .and_then(move |flow_id| {
+                let signature = {
+                    let signkey = hmac::SigningKey::new(&digest::SHA256, &seckey);
+                    hmac::sign(&signkey, &flow_id.as_bytes())
+                };
+                let body = format!("{},{}", flow_id, utils::hex(signature.as_ref())).into_bytes();
                 future::ok(Response::new()
                                .with_header(ContentType::plaintext())
                                .with_header(ContentLength(body.len() as u64))
@@ -360,11 +371,19 @@ fn start_service(addr: std::net::SocketAddr,
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
+    let seckey = {
+        let rng = rand::SystemRandom::new();
+        let mut seckey = vec![0u8; hmac::recommended_key_len(&digest::SHA256)];
+        rng.fill(&mut seckey).unwrap();
+        seckey
+    };
+
     for idx in 0..num_worker {
         let addr = addr.clone();
         let listener = upstream_listener.try_clone().unwrap();
         let barrier = barrier.clone();
         let pool_ptr = pool_ptr.clone();
+        let seckey = seckey.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
@@ -377,7 +396,8 @@ fn start_service(addr: std::net::SocketAddr,
                     let service = FluxService::new(pool_ptr.clone(),
                                                    remote.clone(),
                                                    meta_capacity,
-                                                   data_capacity);
+                                                   data_capacity,
+                                                   &seckey);
                     http.bind_connection(&handle, io, addr, service);
                     Ok(())
                 });
@@ -466,7 +486,9 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        flow_id = str::from_utf8(&body).unwrap().to_owned();
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        let data: Vec<&str> = body.split(',').collect();
+                        flow_id = data[0].to_owned();
                         Ok(())
                     })
             }))
@@ -714,8 +736,12 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        let flow_id = str::from_utf8(&body).unwrap();
-                        assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        let data: Vec<&str> = body.split(',').collect();
+                        let flow_id = data[0];
+                        let flow_sig = data[1];
+                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(flow_id).is_some());
+                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(flow_sig).is_some());
                         Ok(())
                     })
             }))
@@ -731,8 +757,12 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        let flow_id = str::from_utf8(&body).unwrap();
-                        assert!(Regex::new("[a-f0-9]{32}").unwrap().find(flow_id).is_some());
+                        let body = String::from_utf8(body.to_vec()).unwrap();
+                        let data: Vec<&str> = body.split(',').collect();
+                        let flow_id = data[0];
+                        let flow_sig = data[1];
+                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(flow_id).is_some());
+                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(flow_sig).is_some());
                         Ok(())
                     })
             }))
