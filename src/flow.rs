@@ -14,7 +14,7 @@ pub enum Error {
     Other,
 }
 
-pub const MAX_SIZE: usize = 1048576;
+pub const MAX_SIZE: usize = 16384;
 
 #[derive(Debug)]
 pub enum Chunk {
@@ -143,7 +143,7 @@ impl Flow {
     }
 
     fn check_overflow(&self) -> bool {
-        lazy_static! {   
+        lazy_static! {
             static ref META_SIZE: u64 = (mem::size_of::<Mutex<Chunk>>() +
                                          mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
         }
@@ -220,10 +220,8 @@ impl Flow {
             observer.on_active(&self);
         }
 
-        if self.config.keepcount == None {
-            // TODO Build a fast path for non-blocking flow.
-            self.sanitize_buffer();
-        }
+        // Try to sanitize the buffer.
+        self.sanitize_buffer();
 
         fut.map(move |_| chunk_index).boxed()
     }
@@ -291,11 +289,8 @@ impl Flow {
         self.tail_index = tail_index;
     }
 
-    pub fn push(&mut self, data: &[u8]) -> FlowFuture<u64> {
-        if data.len() > MAX_SIZE {
-            return future::err(Error::Invalid).boxed();
-        }
-        self.acquire_chunk(Chunk::data(data.to_vec()))
+    pub fn push(&mut self, data: Vec<u8>) -> FlowFuture<u64> {
+        self.acquire_chunk(Chunk::data(data))
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
@@ -378,10 +373,9 @@ mod tests {
     #[test]
     fn basic_operations() {
         let ptr = Flow::new(FLOW_CONFIG);
-        sync_assert_eq!(ptr.write().unwrap().push(&[1u8; 1234]), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(&[2u8; MAX_SIZE]), Ok(1));
-        sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(2));
-        sync_assert_eq!(ptr.write().unwrap().push(&[2u8; MAX_SIZE + 1]), Err(Error::Invalid));
+        sync_assert_eq!(ptr.write().unwrap().push(vec![1u8; 1234]), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(vec![2u8; MAX_SIZE]), Ok(1));
+        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(&[1u8; 1234] as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(100, Some(0)), Err(Error::NotReady));
@@ -395,19 +389,19 @@ mod tests {
                                 data_capacity: 16777216,
                                 keepcount: Some(1),
                             });
-        sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(b"world"), Ok(1));
-        sync_assert_eq!(ptr.write().unwrap().push(b"!"), Err(Error::Invalid));
+        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(b"world".to_vec()), Ok(1));
+        sync_assert_eq!(ptr.write().unwrap().push(b"!".to_vec()), Err(Error::Invalid));
     }
 
     #[test]
     fn close_flow() {
         let ptr = Flow::new(FLOW_CONFIG);
-        sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(0));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::NotReady));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
-        sync_assert_eq!(ptr.write().unwrap().push(b"hello"), Err(Error::Invalid));
+        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Err(Error::Invalid));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
@@ -425,15 +419,15 @@ mod tests {
         let payload2 = vec![1u8; MAX_SIZE];
         let payload3 = vec![2u8; MAX_SIZE];
 
-        sync_assert_eq!(ptr.write().unwrap().push(&payload1), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(&payload2), Ok(1));
-        let fut = ptr.write().unwrap().push(&payload3);
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.to_owned()));
+        sync_assert_eq!(ptr.write().unwrap().push(payload1.clone()), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(payload2.clone()), Ok(1));
+        let fut = ptr.write().unwrap().push(payload3.clone());
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone()));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1));
         sync_assert_eq!(fut, Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-        let fut = ptr.write().unwrap().push(&payload3);
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.to_owned()));
+        let fut = ptr.write().unwrap().push(payload3.clone());
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone()));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2));
         sync_assert_eq!(fut, Ok(3));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Dropped));
@@ -445,8 +439,8 @@ mod tests {
         let ptr = Flow::new(FLOW_CONFIG);
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::NotReady));
         let fut = ptr.read().unwrap().pull(1, None);
-        let fut1 = ptr.write().unwrap().push(b"ello");
-        let fut2 = ptr.write().unwrap().push(b"hello");
+        let fut1 = ptr.write().unwrap().push(b"ello".to_vec());
+        let fut2 = ptr.write().unwrap().push(b"hello".to_vec());
         sync_assert_eq!(fut.join3(fut1, fut2), Ok((Vec::from(b"hello" as &[u8]), 0, 1)));
     }
 
@@ -455,15 +449,15 @@ mod tests {
         let ptr = Flow::new(FLOW_CONFIG);
         let payload = vec![0u8; MAX_SIZE];
 
-        sync_assert_eq!(ptr.write().unwrap().push(b"A"), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(b"A".to_vec()), Ok(0));
         for idx in 1..(FLOW_CONFIG.data_capacity / MAX_SIZE as u64) {
-            sync_assert_eq!(ptr.write().unwrap().push(&payload), Ok(idx));
+            sync_assert_eq!(ptr.write().unwrap().push(payload.clone()), Ok(idx));
         }
         let base_idx = FLOW_CONFIG.data_capacity / MAX_SIZE as u64;
-        sync_assert_eq!(ptr.write().unwrap().push(b"D"), Ok(base_idx));
+        sync_assert_eq!(ptr.write().unwrap().push(b"D".to_vec()), Ok(base_idx));
 
-        let fut = ptr.write().unwrap().push(&[0u8; MAX_SIZE]);
-        sync_assert_eq!(ptr.write().unwrap().push(b"C"), Err(Error::NotReady));
+        let fut = ptr.write().unwrap().push(vec![0u8; MAX_SIZE]);
+        sync_assert_eq!(ptr.write().unwrap().push(b"C".to_vec()), Err(Error::NotReady));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload));
         sync_assert_eq!(fut, Ok(base_idx + 1));
@@ -479,10 +473,10 @@ mod tests {
                             });
 
         for _ in 0..4096 {
-            ptr.write().unwrap().push(b"A");
+            ptr.write().unwrap().push(b"A".to_vec());
         }
 
-        sync_assert_eq!(ptr.write().unwrap().push(b"B"), Err(Error::NotReady));
+        sync_assert_eq!(ptr.write().unwrap().push(b"B".to_vec()), Err(Error::NotReady));
 
         let next_index = {
             ptr.read().unwrap().get_range().1
@@ -491,7 +485,7 @@ mod tests {
             sync_assert_eq!(ptr.read().unwrap().pull(idx, Some(0)), Ok(Vec::from(b"A" as &[u8])));
         }
 
-        let fut = ptr.write().unwrap().push(b"B");
+        let fut = ptr.write().unwrap().push(b"B".to_vec());
         sync_assert_eq!(ptr.read().unwrap().pull(next_index, Some(0)),
                         Ok(Vec::from(b"B" as &[u8])));
         sync_assert_eq!(fut, Ok(next_index));
@@ -501,7 +495,7 @@ mod tests {
     fn outlive() {
         let fut = {
             let ptr = Flow::new(FLOW_CONFIG);
-            sync_assert_eq!(ptr.write().unwrap().push(b"A"), Ok(0));
+            sync_assert_eq!(ptr.write().unwrap().push(b"A".to_vec()), Ok(0));
             let flow = ptr.read().unwrap();
             flow.pull(0, Some(0))
         };
@@ -552,12 +546,12 @@ mod tests {
         let payload = vec![0u8; MAX_SIZE];
 
         for idx in 0..16 {
-            sync_assert_eq!(ptr.write().unwrap().push(&payload), Ok(idx));
+            sync_assert_eq!(ptr.write().unwrap().push(payload.clone()), Ok(idx));
         }
-        sync_assert_eq!(ptr.write().unwrap().push(b"world"), Ok(16));
+        sync_assert_eq!(ptr.write().unwrap().push(b"world".to_vec()), Ok(16));
 
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.to_owned()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.to_owned()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone()));
     }
 }

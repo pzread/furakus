@@ -331,7 +331,7 @@ mod tests {
         }
         thread::sleep(Duration::from_secs(4));
         {
-            let fut = flow_a.write().unwrap().push(b"Hello");
+            let fut = flow_a.write().unwrap().push(b"Hello".to_vec());
             core.run(fut).unwrap();
         }
         thread::sleep(Duration::from_secs(4));

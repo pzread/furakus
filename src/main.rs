@@ -26,7 +26,7 @@ use hyper::header::{ContentLength, ContentType, Host};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
-use std::{env, thread};
+use std::{env, mem, thread};
 use std::sync::{Arc, Barrier, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -140,39 +140,34 @@ impl FluxService {
             Some(flow) => flow.clone(),
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
-
-        // Chain a EOF on the stream to flush the remaining chunk.
-        let body_stream = req.body().map(|chunk| Some(chunk)).chain(stream::once(Ok(None)));
-        // Read the body and push chunks.
-        let init_chunk = Vec::<u8>::with_capacity(flow::MAX_SIZE);
-        body_stream
-            .fold(init_chunk, move |mut rem_chunk, chunk| {
-                let (flush_chunk, ret_chunk) = if let Some(chunk) = chunk {
-                    if rem_chunk.len() + chunk.len() >= flow::MAX_SIZE {
-                        let caplen = flow::MAX_SIZE - rem_chunk.len();
-                        rem_chunk.extend_from_slice(&chunk[..caplen]);
-                        (Some(rem_chunk), chunk[caplen..].to_vec())
-                    } else {
-                        rem_chunk.extend_from_slice(&chunk);
-                        (None, rem_chunk)
-                    }
-                } else {
-                    // EOF, flush the remaining chunk.
-                    if rem_chunk.len() > 0 {
-                        (Some(rem_chunk), Vec::new())
-                    } else {
-                        (None, Vec::new())
-                    }
-                };
-                match flush_chunk {
-                    Some(flush_chunk) => {
-                        let mut flow = flow.write().unwrap();
-                        flow.push(&flush_chunk)
-                            .map(|_| ret_chunk)
+        req.body()
+            .fold(Vec::<u8>::with_capacity(flow::MAX_SIZE * 2), {
+                let flow = flow.clone();
+                move |mut buf_chunk, chunk| {
+                    let mut flow = flow.write().unwrap();
+                    buf_chunk.extend_from_slice(&chunk);
+                    if buf_chunk.len() > flow::MAX_SIZE {
+                        let chunk = mem::replace(&mut buf_chunk,
+                                                 Vec::<u8>::with_capacity(flow::MAX_SIZE * 2));
+                        flow.push(chunk)
+                            .map(|_| buf_chunk)
                             .map_err(|_| hyper::error::Error::Incomplete)
                             .boxed()
+                    } else {
+                        future::ok(buf_chunk).boxed()
                     }
-                    None => future::ok(ret_chunk).boxed(),
+                }
+            })
+            .and_then(move |chunk| {
+                // Flush remaining chunk.
+                if chunk.len() > 0 {
+                    let mut flow = flow.write().unwrap();
+                    flow.push(chunk)
+                        .map(|_| ())
+                        .map_err(|_| hyper::error::Error::Incomplete)
+                        .boxed()
+                } else {
+                    future::ok(()).boxed()
                 }
             })
             .and_then(|_| Ok("Ok"))
@@ -463,7 +458,7 @@ mod tests {
     use std::time::Duration;
     use tokio::reactor::Core;
 
-    const MAX_CAPACITY: u64 = 16777216;
+    const MAX_CAPACITY: u64 = 1048576;
 
     fn spawn_server() -> (String, String) {
         let port = start_service("127.0.0.1:0".parse().unwrap(),
