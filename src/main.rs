@@ -943,6 +943,7 @@ mod tests {
         assert_eq!(req_close(prefix, flow_id, token),
                    (StatusCode::Ok, Some(String::from("Closed"))));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::NotFound, None));
     }
 
     #[test]
