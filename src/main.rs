@@ -144,12 +144,13 @@ impl FluxService {
             .fold(Vec::<u8>::with_capacity(flow::REF_SIZE * 2), {
                 let flow = flow.clone();
                 move |mut buf_chunk, chunk| {
-                    let mut flow = flow.write().unwrap();
                     buf_chunk.extend_from_slice(&chunk);
                     if buf_chunk.len() > flow::REF_SIZE {
                         let chunk = mem::replace(&mut buf_chunk,
                                                  Vec::<u8>::with_capacity(flow::REF_SIZE * 2));
-                        flow.push(chunk)
+                        flow.write()
+                            .unwrap()
+                            .push(chunk)
                             .map(|_| buf_chunk)
                             .map_err(|_| hyper::error::Error::Incomplete)
                             .boxed()
@@ -161,8 +162,9 @@ impl FluxService {
             .and_then(move |chunk| {
                 // Flush remaining chunk.
                 if chunk.len() > 0 {
-                    let mut flow = flow.write().unwrap();
-                    flow.push(chunk)
+                    flow.write()
+                        .unwrap()
+                        .push(chunk)
                         .map(|_| ())
                         .map_err(|_| hyper::error::Error::Incomplete)
                         .boxed()
