@@ -5,6 +5,8 @@ use std::mem;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use uuid::Uuid;
 
+pub const REF_SIZE: usize = 16384;
+
 #[derive(Debug, PartialEq)]
 pub enum Error {
     Invalid,
@@ -13,8 +15,6 @@ pub enum Error {
     Eof,
     Other,
 }
-
-pub const MAX_SIZE: usize = 16384;
 
 #[derive(Debug)]
 pub enum Chunk {
@@ -374,7 +374,6 @@ mod tests {
     fn basic_operations() {
         let ptr = Flow::new(FLOW_CONFIG);
         sync_assert_eq!(ptr.write().unwrap().push(vec![1u8; 1234]), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(vec![2u8; MAX_SIZE]), Ok(1));
         sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(&[1u8; 1234] as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
@@ -411,13 +410,13 @@ mod tests {
     fn dropped_chunk() {
         let ptr = Flow::new(Config {
                                 length: None,
-                                meta_capacity: (MAX_SIZE * 2) as u64,
-                                data_capacity: (MAX_SIZE * 2) as u64,
+                                meta_capacity: (REF_SIZE * 2) as u64,
+                                data_capacity: (REF_SIZE * 2) as u64,
                                 keepcount: Some(2),
                             });
-        let payload1 = vec![0u8; MAX_SIZE];
-        let payload2 = vec![1u8; MAX_SIZE];
-        let payload3 = vec![2u8; MAX_SIZE];
+        let payload1 = vec![0u8; REF_SIZE];
+        let payload2 = vec![1u8; REF_SIZE];
+        let payload3 = vec![2u8; REF_SIZE];
 
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload2.clone()), Ok(1));
@@ -447,16 +446,16 @@ mod tests {
     #[test]
     fn waiting_push() {
         let ptr = Flow::new(FLOW_CONFIG);
-        let payload = vec![0u8; MAX_SIZE];
+        let payload = vec![0u8; REF_SIZE];
 
         sync_assert_eq!(ptr.write().unwrap().push(b"A".to_vec()), Ok(0));
-        for idx in 1..(FLOW_CONFIG.data_capacity / MAX_SIZE as u64) {
+        for idx in 1..(FLOW_CONFIG.data_capacity / REF_SIZE as u64) {
             sync_assert_eq!(ptr.write().unwrap().push(payload.clone()), Ok(idx));
         }
-        let base_idx = FLOW_CONFIG.data_capacity / MAX_SIZE as u64;
+        let base_idx = FLOW_CONFIG.data_capacity / REF_SIZE as u64;
         sync_assert_eq!(ptr.write().unwrap().push(b"D".to_vec()), Ok(base_idx));
 
-        let fut = ptr.write().unwrap().push(vec![0u8; MAX_SIZE]);
+        let fut = ptr.write().unwrap().push(vec![0u8; REF_SIZE]);
         sync_assert_eq!(ptr.write().unwrap().push(b"C".to_vec()), Err(Error::NotReady));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload));
@@ -539,11 +538,11 @@ mod tests {
     fn nonblocking() {
         let ptr = Flow::new(Config {
                                 length: None,
-                                meta_capacity: (MAX_SIZE * 16) as u64,
-                                data_capacity: (MAX_SIZE * 16) as u64,
+                                meta_capacity: (REF_SIZE * 16) as u64,
+                                data_capacity: (REF_SIZE * 16) as u64,
                                 keepcount: None,
                             });
-        let payload = vec![0u8; MAX_SIZE];
+        let payload = vec![0u8; REF_SIZE];
 
         for idx in 0..16 {
             sync_assert_eq!(ptr.write().unwrap().push(payload.clone()), Ok(idx));

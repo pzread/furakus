@@ -141,14 +141,14 @@ impl FluxService {
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         req.body()
-            .fold(Vec::<u8>::with_capacity(flow::MAX_SIZE * 2), {
+            .fold(Vec::<u8>::with_capacity(flow::REF_SIZE * 2), {
                 let flow = flow.clone();
                 move |mut buf_chunk, chunk| {
                     let mut flow = flow.write().unwrap();
                     buf_chunk.extend_from_slice(&chunk);
-                    if buf_chunk.len() > flow::MAX_SIZE {
+                    if buf_chunk.len() > flow::REF_SIZE {
                         let chunk = mem::replace(&mut buf_chunk,
-                                                 Vec::<u8>::with_capacity(flow::MAX_SIZE * 2));
+                                                 Vec::<u8>::with_capacity(flow::REF_SIZE * 2));
                         flow.push(chunk)
                             .map(|_| buf_chunk)
                             .map_err(|_| hyper::error::Error::Incomplete)
@@ -883,7 +883,7 @@ mod tests {
     #[test]
     fn handle_push_pull() {
         let prefix = &spawn_server().0;
-        let payload = vec![1u8; flow::MAX_SIZE * 10];
+        let payload = vec![1u8; flow::REF_SIZE * 10];
         let (ref flow_id, ref token) = create_flow(prefix,
                                                    &format!(r#"{{"size": {}}}"#, payload.len()));
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
@@ -897,7 +897,7 @@ mod tests {
                 let prefix = &prefix;
                 let flow_id = &flow_id;
                 let token = &token;
-                for chunk in payload.chunks(flow::MAX_SIZE * 2 + 13) {
+                for chunk in payload.chunks(flow::REF_SIZE * 2 + 13) {
                     assert_eq!(req_push(prefix, flow_id, token, chunk),
                                (StatusCode::Ok, Some(String::from("Ok"))));
                 }
@@ -1056,7 +1056,7 @@ mod tests {
                 // Infinite flow.
                 let body_stream = stream::unfold((), move |_| {
                     send_tx.send(()).unwrap();
-                    Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; flow::MAX_SIZE])), ())))
+                    Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; flow::REF_SIZE])), ())))
                 });
 
                 let mut req = Request::new(Post,
@@ -1107,7 +1107,7 @@ mod tests {
 
         for idx in 0.. {
             if req_fetch(prefix, flow_id, idx).0 == StatusCode::Ok {
-                for succ_idx in (idx + 1)..(idx + MAX_CAPACITY / flow::MAX_SIZE as u64) {
+                for succ_idx in (idx + 1)..(idx + MAX_CAPACITY / flow::REF_SIZE as u64) {
                     assert_eq!(req_fetch(prefix, flow_id, succ_idx).0, StatusCode::Ok);
                 }
                 break;
