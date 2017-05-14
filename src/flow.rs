@@ -374,9 +374,9 @@ mod tests {
     fn basic_operations() {
         let ptr = Flow::new(FLOW_CONFIG);
         sync_assert_eq!(ptr.write().unwrap().push(vec![1u8; 1234]), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(2));
+        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(1));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(&[1u8; 1234] as &[u8])));
-        sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
         sync_assert_eq!(ptr.read().unwrap().pull(100, Some(0)), Err(Error::NotReady));
     }
 
