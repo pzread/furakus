@@ -52,7 +52,7 @@ struct FlowReqParam {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
-struct FlowResStatus {
+struct StatusResponse {
     pub tail: u64,
     pub next: u64,
 }
@@ -239,7 +239,7 @@ impl FluxService {
         let body = {
                 let flow = flow_ptr.read().unwrap();
                 let (tail, next) = flow.get_range();
-                serde_json::to_string(&FlowResStatus { tail, next }).unwrap()
+                serde_json::to_string(&StatusResponse { tail, next }).unwrap()
             }
             .into_bytes();
         future::ok(Response::new()
@@ -273,15 +273,13 @@ impl FluxService {
                                    .with_header(ContentLength(chunk.len() as u64))
                                    .with_body(chunk))
                 })
-                .or_else(|err| match err {
-                             flow::Error::Eof | flow::Error::Dropped => {
-                                 future::ok(Response::new().with_status(StatusCode::NotFound))
-                             }
-                             _ => {
-                                 future::ok(Response::new()
-                                                .with_status(StatusCode::InternalServerError))
-                             }
-                         })
+                .or_else(|err| {
+                    let status = match err {
+                        flow::Error::Eof | flow::Error::Dropped => StatusCode::NotFound,
+                        _ => StatusCode::InternalServerError,
+                    };
+                    future::ok(Response::new().with_status(status))
+                })
                 .boxed()
         }
     }
@@ -605,7 +603,7 @@ mod tests {
         (status_code, response)
     }
 
-    fn req_status(prefix: &str, flow_id: &str) -> (StatusCode, Option<FlowResStatus>) {
+    fn req_status(prefix: &str, flow_id: &str) -> (StatusCode, Option<StatusResponse>) {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -624,7 +622,7 @@ mod tests {
                 };
                 fut.and_then(|body| {
                     response =
-                        body.map(|data| serde_json::from_slice::<FlowResStatus>(&data).unwrap());
+                        body.map(|data| serde_json::from_slice::<StatusResponse>(&data).unwrap());
                     Ok(())
                 })
             }))
@@ -1232,6 +1230,6 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
                    (StatusCode::Ok, Some(String::from("Ok"))));
         assert_eq!(req_status(prefix, flow_id),
-                   (StatusCode::Ok, Some(FlowResStatus { tail: 0, next: 2 })));
+                   (StatusCode::Ok, Some(StatusResponse { tail: 0, next: 2 })));
     }
 }
