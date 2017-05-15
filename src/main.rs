@@ -51,6 +51,12 @@ struct FlowReqParam {
     pub size: Option<u64>,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct FlowResStatus {
+    pub tail: u64,
+    pub next: u64,
+}
+
 type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
 impl FluxService {
@@ -220,6 +226,29 @@ impl FluxService {
         }
     }
 
+    fn handle_status(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
+        let flow_id = route.get(1).unwrap().as_str();
+        let flow_ptr = {
+            let pool = self.pool.read().unwrap();
+            if let Some(flow) = pool.get(flow_id) {
+                flow.clone()
+            } else {
+                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            }
+        };
+        let body = {
+                let flow = flow_ptr.read().unwrap();
+                let (tail, next) = flow.get_range();
+                serde_json::to_string(&FlowResStatus { tail, next }).unwrap()
+            }
+            .into_bytes();
+        future::ok(Response::new()
+                       .with_header(ContentType::plaintext())
+                       .with_header(ContentLength(body.len() as u64))
+                       .with_body(body))
+                .boxed()
+    }
+
     fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
         let chunk_index: u64 = if let Ok(index) = route.get(2).unwrap().as_str().parse() {
@@ -314,6 +343,7 @@ impl Service for FluxService {
             static ref PATTERN_NEW: Regex = Regex::new(r"^/new$").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"^/([a-f0-9]{32})/push$").unwrap();
             static ref PATTERN_EOF: Regex = Regex::new(r"^/([a-f0-9]{32})/eof$").unwrap();
+            static ref PATTERN_STATUS: Regex = Regex::new(r"^/([a-f0-9]{32})/status$").unwrap();
             static ref PATTERN_FETCH: Regex = Regex::new(r"^/([a-f0-9]{32})/fetch/(\d+)$").unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"^/([a-f0-9]{32})/pull$").unwrap();
         }
@@ -351,6 +381,8 @@ impl Service for FluxService {
                     self.handle_push(req, route, url.query_pairs())
                 } else if let Some(route) = PATTERN_EOF.captures(path) {
                     self.handle_eof(req, route, url.query_pairs())
+                } else if let Some(route) = PATTERN_STATUS.captures(path) {
+                    self.handle_status(req, route)
                 } else {
                     future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
                 }
@@ -444,7 +476,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::start_service;
+    use super::*;
     use flow;
     use futures::{Future, Sink, Stream, future, stream};
     use hyper;
@@ -453,6 +485,7 @@ mod tests {
     use hyper::header::ContentLength;
     use hyper::status::StatusCode;
     use regex::Regex;
+    use serde_json;
     use std::{str, thread};
     use std::io::prelude::*;
     use std::net::TcpStream;
@@ -564,6 +597,34 @@ mod tests {
                 };
                 fut.and_then(|body| {
                     response = body;
+                    Ok(())
+                })
+            }))
+            .unwrap();
+
+        (status_code, response)
+    }
+
+    fn req_status(prefix: &str, flow_id: &str) -> (StatusCode, Option<FlowResStatus>) {
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let req = Request::new(Post, format!("{}/{}/status", prefix, flow_id).parse().unwrap());
+
+        let mut status_code = StatusCode::ImATeapot;
+        let mut response = None;
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                status_code = res.status();
+                let fut = if status_code == StatusCode::Ok {
+                    res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                } else {
+                    future::ok(None).boxed()
+                };
+                fut.and_then(|body| {
+                    response =
+                        body.map(|data| serde_json::from_slice::<FlowResStatus>(&data).unwrap());
                     Ok(())
                 })
             }))
@@ -1160,5 +1221,17 @@ mod tests {
                 Ok(())
             }))
             .unwrap();
+    }
+
+    #[test]
+    fn status() {
+        let prefix = &spawn_server().0;
+        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
+                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
+                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_status(prefix, flow_id),
+                   (StatusCode::Ok, Some(FlowResStatus { tail: 0, next: 2 })));
     }
 }
