@@ -4,7 +4,7 @@ use std::iter;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-type SharedFlow = Arc<RwLock<Flow>>;
+pub type SharedFlow = Arc<RwLock<Flow>>;
 
 type LinkPointer<T> = Weak<Mutex<T>>;
 

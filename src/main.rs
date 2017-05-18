@@ -38,7 +38,7 @@ pub enum Error {
     NotReady,
     Internal(hyper::Error),
 }
-struct FluxService {
+struct FlowService {
     pool: Arc<RwLock<Pool>>,
     remote: reactor::Remote,
     meta_capacity: u64,
@@ -47,8 +47,14 @@ struct FluxService {
 }
 
 #[derive(Serialize, Deserialize)]
-struct FlowReqParam {
+struct NewRequest {
     pub size: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct NewResponse {
+    pub id: String,
+    pub token: String,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -57,16 +63,21 @@ struct StatusResponse {
     pub next: u64,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct ErrorResponse {
+    pub message: String,
+}
+
 type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
 
-impl FluxService {
+impl FlowService {
     fn new(pool: Arc<RwLock<Pool>>,
            remote: reactor::Remote,
            meta_capacity: u64,
            data_capacity: u64,
            authorizer: Arc<Authorizer + Send + Sync>)
            -> Self {
-        FluxService {
+        FlowService {
             pool,
             remote,
             meta_capacity,
@@ -79,15 +90,24 @@ impl FluxService {
         self.authorizer.verify(flow_id, token).is_ok()
     }
 
-    fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
-        if let Some(&ContentLength(length)) = req.headers().get() {
-            if length == 0 {
-                return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed();
-            }
-        } else {
-            return future::ok(Response::new().with_status(StatusCode::LengthRequired)).boxed();
-        }
+    fn response_ok() -> Response {
+        Response::new().with_header(ContentLength(0))
+    }
 
+    fn response_error(error: &str) -> Response {
+        let body = serde_json::to_string(&ErrorResponse { message: error.to_owned() }).unwrap();
+        Response::new()
+            .with_status(StatusCode::BadRequest)
+            .with_header(ContentLength(body.len() as u64))
+            .with_body(body)
+    }
+
+    fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
+        match req.headers().get() {
+            Some(&ContentLength(0)) |
+            None => return future::ok(Self::response_error("Invalid Parameter")).boxed(),
+            _ => (),
+        };
         let pool_ptr = self.pool.clone();
         let meta_capacity = self.meta_capacity;
         let data_capacity = self.data_capacity;
@@ -96,7 +116,7 @@ impl FluxService {
             .concat()
             .map_err(|err| Error::Internal(err))
             .and_then(|body| {
-                serde_json::from_slice::<FlowReqParam>(&body).map_err(|_| Error::Invalid)
+                serde_json::from_slice::<NewRequest>(&body).map_err(|_| Error::Invalid)
             })
             .and_then(move |param| {
                 let flow_ptr = Flow::new(flow::Config {
@@ -111,16 +131,18 @@ impl FluxService {
                     pool.insert(flow_ptr).map(|_| flow_id.clone()).map_err(|_| Error::NotReady)
                 }
             })
-            .and_then(move |flow_id| {
-                let sig = authorizer.sign(&flow_id);
-                let body = format!("{},{}", flow_id, sig).into_bytes();
+            .and_then(move |flow_id: String| {
+                let token = authorizer.sign(&flow_id);
+                let body = serde_json::to_string(&NewResponse { id: flow_id, token })
+                    .unwrap()
+                    .into_bytes();
                 future::ok(Response::new()
-                               .with_header(ContentType::plaintext())
+                               .with_header(ContentType::json())
                                .with_header(ContentLength(body.len() as u64))
                                .with_body(body))
             })
             .or_else(|err| match err {
-                         Error::Invalid => Ok(Response::new().with_status(StatusCode::BadRequest)),
+                         Error::Invalid => Ok(Self::response_error("Invalid Parameter")),
                          Error::NotReady => {
                              Ok(Response::new().with_status(StatusCode::ServiceUnavailable))
                          }
@@ -136,27 +158,26 @@ impl FluxService {
                    -> ResponseFuture {
         let token = match query.find(|&(ref key, _)| key == "token") {
             Some((_, token)) => token.to_owned(),
-            None => return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed(),
+            None => return future::ok(Self::response_error("Missing Token")).boxed(),
         };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
             return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
         }
-        let flow = match self.pool.read().unwrap().get(flow_id) {
+        let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         req.body()
             .fold(Vec::<u8>::with_capacity(flow::REF_SIZE * 2), {
-                let flow = flow.clone();
+                let flow_ptr = flow_ptr.clone();
                 move |mut buf_chunk, chunk| {
                     buf_chunk.extend_from_slice(&chunk);
                     if buf_chunk.len() > flow::REF_SIZE {
                         let chunk = mem::replace(&mut buf_chunk,
                                                  Vec::<u8>::with_capacity(flow::REF_SIZE * 2));
-                        flow.write()
-                            .unwrap()
-                            .push(chunk)
+                        let mut flow = flow_ptr.write().unwrap();
+                        flow.push(chunk)
                             .map(|_| buf_chunk)
                             .map_err(|_| hyper::error::Error::Incomplete)
                             .boxed()
@@ -168,9 +189,8 @@ impl FluxService {
             .and_then(move |chunk| {
                 // Flush remaining chunk.
                 if chunk.len() > 0 {
-                    flow.write()
-                        .unwrap()
-                        .push(chunk)
+                    let mut flow = flow_ptr.write().unwrap();
+                    flow.push(chunk)
                         .map(|_| ())
                         .map_err(|_| hyper::error::Error::Incomplete)
                         .boxed()
@@ -178,14 +198,8 @@ impl FluxService {
                     future::ok(()).boxed()
                 }
             })
-            .and_then(|_| Ok("Ok"))
-            .or_else(|_| Ok("NotReady"))
-            .and_then(|body| {
-                Ok(Response::new()
-                       .with_header(ContentType::plaintext())
-                       .with_header(ContentLength(body.len() as u64))
-                       .with_body(body))
-            })
+            .and_then(|_| Ok(Self::response_ok()))
+            .or_else(|_| Ok(Self::response_error("Not Ready")))
             .boxed()
     }
 
@@ -196,31 +210,25 @@ impl FluxService {
                   -> ResponseFuture {
         let token = match query.find(|&(ref key, _)| key == "token") {
             Some((_, token)) => token.to_owned(),
-            None => return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed(),
+            None => return future::ok(Self::response_error("Missing Token")).boxed(),
         };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
             return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
         }
-        let flow = match self.pool.read().unwrap().get(flow_id) {
+        let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         {
-            let mut flow = flow.write().unwrap();
+            let mut flow = flow_ptr.write().unwrap();
             flow.close()
                 .then(|result| match result {
-                          Ok(_) => Ok("Ok"),
-                          Err(flow::Error::Invalid) => Ok("Closed"),
-                          Err(flow::Error::NotReady) => Ok("NotReady"),
+                          Ok(_) => Ok(Self::response_ok()),
+                          Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
+                          Err(flow::Error::NotReady) => Ok(Self::response_error("Not Ready")),
                           Err(err) => Err(err),
                       })
-                .and_then(|body| {
-                    Ok(Response::new()
-                           .with_header(ContentType::plaintext())
-                           .with_header(ContentLength(body.len() as u64))
-                           .with_body(body))
-                })
                 .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
                 .boxed()
         }
@@ -228,13 +236,9 @@ impl FluxService {
 
     fn handle_status(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
-        let flow_ptr = {
-            let pool = self.pool.read().unwrap();
-            if let Some(flow) = pool.get(flow_id) {
-                flow.clone()
-            } else {
-                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
-            }
+        let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
+            Some(flow) => flow.clone(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         let body = {
                 let flow = flow_ptr.read().unwrap();
@@ -243,7 +247,7 @@ impl FluxService {
             }
             .into_bytes();
         future::ok(Response::new()
-                       .with_header(ContentType::plaintext())
+                       .with_header(ContentType::json())
                        .with_header(ContentLength(body.len() as u64))
                        .with_body(body))
                 .boxed()
@@ -251,21 +255,16 @@ impl FluxService {
 
     fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
-        let chunk_index: u64 = if let Ok(index) = route.get(2).unwrap().as_str().parse() {
-            index
-        } else {
-            return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed();
+        let chunk_index: u64 = match route.get(2).unwrap().as_str().parse() {
+            Ok(index) => index,
+            Err(_) => return future::ok(Self::response_error("Invalid Parameter")).boxed(),
         };
-        let flow = {
-            let pool = self.pool.read().unwrap();
-            if let Some(flow) = pool.get(flow_id) {
-                flow.clone()
-            } else {
-                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
-            }
+        let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
+            Some(flow) => flow.clone(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         {
-            let flow = flow.read().unwrap();
+            let flow = flow_ptr.read().unwrap();
             flow.pull(chunk_index, None)
                 .and_then(|chunk| {
                     future::ok(Response::new()
@@ -286,19 +285,14 @@ impl FluxService {
 
     fn handle_pull(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
-        let flow = {
-            let pool = self.pool.read().unwrap();
-            if let Some(flow) = pool.get(flow_id) {
-                flow.clone()
-            } else {
-                return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
-            }
+        let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
+            Some(flow) => flow.clone(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
-
         let body_stream = stream::unfold(Some(0), move |chunk_index| {
             // Check if the flow is EOF.
             if let Some(chunk_index) = chunk_index {
-                let flow = flow.read().unwrap();
+                let flow = flow_ptr.read().unwrap();
 
                 // Check if we need to get the first chunk index.
                 let chunk_index = if chunk_index == 0 {
@@ -318,19 +312,17 @@ impl FluxService {
                 None
             }
         });
-
         let (tx, body) = hyper::Body::pair();
         // Schedule the sender to the reactor.
         self.remote
             .spawn(move |_| {
                 tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
             });
-
         future::ok(Response::new().with_header(ContentType::octet_stream()).with_body(body)).boxed()
     }
 }
 
-impl Service for FluxService {
+impl Service for FlowService {
     type Request = Request;
     type Response = Response;
     type Error = hyper::Error;
@@ -428,7 +420,7 @@ fn start_service(addr: std::net::SocketAddr,
             let acceptor = listener
                 .incoming()
                 .for_each(|(io, addr)| {
-                    let service = FluxService::new(pool_ptr.clone(),
+                    let service = FlowService::new(pool_ptr.clone(),
                                                    remote.clone(),
                                                    meta_capacity,
                                                    data_capacity,
@@ -523,10 +515,9 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        let body = String::from_utf8(body.to_vec()).unwrap();
-                        let data: Vec<&str> = body.split(',').collect();
-                        id = data[0].to_owned();
-                        token = data[1].to_owned();
+                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                        id = data.id;
+                        token = data.token;
                         Ok(())
                     })
             }))
@@ -553,10 +544,13 @@ mod tests {
                      .request(req)
                      .and_then(|res| {
                 status_code = res.status();
-                let fut = if status_code == StatusCode::Ok {
+                let fut = if status_code == StatusCode::BadRequest {
                     res.body()
                         .concat()
-                        .and_then(|body| Ok(Some(String::from_utf8(body.to_vec()).unwrap())))
+                        .and_then(|body| {
+                            let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
+                            Ok(Some(data.message))
+                        })
                         .boxed()
                 } else {
                     future::ok(None).boxed()
@@ -585,10 +579,13 @@ mod tests {
                      .request(req)
                      .and_then(|res| {
                 status_code = res.status();
-                let fut = if status_code == StatusCode::Ok {
+                let fut = if status_code == StatusCode::BadRequest {
                     res.body()
                         .concat()
-                        .and_then(|body| Ok(Some(String::from_utf8(body.to_vec()).unwrap())))
+                        .and_then(|body| {
+                            let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
+                            Ok(Some(data.message))
+                        })
                         .boxed()
                 } else {
                     future::ok(None).boxed()
@@ -684,6 +681,19 @@ mod tests {
             .unwrap();
 
         (status_code, response)
+    }
+
+    fn check_error_response(res: Response, error: &str) -> future::BoxFuture<(), hyper::Error> {
+        assert_eq!(res.status(), StatusCode::BadRequest);
+        let error = error.to_owned();
+        res.body()
+            .concat()
+            .and_then(move |body| {
+                assert_eq!(serde_json::from_slice::<ErrorResponse>(&body).unwrap(),
+                           ErrorResponse { message: error });
+                Ok(())
+            })
+            .boxed()
     }
 
     #[test]
@@ -812,12 +822,9 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        let body = String::from_utf8(body.to_vec()).unwrap();
-                        let data: Vec<&str> = body.split(',').collect();
-                        let flow_id = data[0];
-                        let flow_sig = data[1];
-                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(flow_id).is_some());
-                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(flow_sig).is_some());
+                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
+                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(&data.token).is_some());
                         Ok(())
                     })
             }))
@@ -833,12 +840,9 @@ mod tests {
                 res.body()
                     .concat()
                     .and_then(|body| {
-                        let body = String::from_utf8(body.to_vec()).unwrap();
-                        let data: Vec<&str> = body.split(',').collect();
-                        let flow_id = data[0];
-                        let flow_sig = data[1];
-                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(flow_id).is_some());
-                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(flow_sig).is_some());
+                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
+                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(&data.token).is_some());
                         Ok(())
                     })
             }))
@@ -849,19 +853,15 @@ mod tests {
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::LengthRequired);
-                Ok(())
+                check_error_response(res, "Invalid Parameter")
             }))
             .unwrap();
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4O96}"#);
         req.headers_mut().set(ContentLength(14));
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::BadRequest);
-                Ok(())
+        core.run(client.request(req).and_then(|res| {
+                check_error_response(res, "Invalid Parameter")
             }))
             .unwrap();
     }
@@ -888,34 +888,25 @@ mod tests {
                      .request(req)
                      .and_then(|res| {
                 assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        assert_eq!(str::from_utf8(&body).unwrap(), "Ok");
-                        Ok(())
-                    })
+                Ok(())
             }))
             .unwrap();
         // With 0 content length.
-        assert_eq!(req_push(prefix, flow_id, token, b""),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, b""), (StatusCode::Ok, None));
 
         let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::BadRequest);
-                Ok(())
+                check_error_response(res, "Missing Token")
             }))
             .unwrap();
 
         assert_eq!(req_push(prefix, fake_id, token, payload1), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, mal_token, payload1), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, fake_token, payload1), (StatusCode::NotFound, None));
-        assert_eq!(req_push(prefix, flow_id, token, payload1),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
-        assert_eq!(req_push(prefix, flow_id, token, payload2),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, payload1), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, payload2), (StatusCode::Ok, None));
 
         assert_eq!(req_fetch(prefix, fake_id, 0), (StatusCode::NotFound, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
@@ -932,8 +923,7 @@ mod tests {
                 let token = &token;
                 thread::park();
                 thread::sleep(Duration::from_millis(1000));
-                assert_eq!(req_push(prefix, flow_id, token, payload1),
-                           (StatusCode::Ok, Some(String::from("Ok"))));
+                assert_eq!(req_push(prefix, flow_id, token, payload1), (StatusCode::Ok, None));
             })
         };
 
@@ -959,11 +949,9 @@ mod tests {
                 let flow_id = &flow_id;
                 let token = &token;
                 for chunk in payload.chunks(flow::REF_SIZE * 2 + 13) {
-                    assert_eq!(req_push(prefix, flow_id, token, chunk),
-                               (StatusCode::Ok, Some(String::from("Ok"))));
+                    assert_eq!(req_push(prefix, flow_id, token, chunk), (StatusCode::Ok, None));
                 }
-                assert_eq!(req_close(prefix, flow_id, token),
-                           (StatusCode::Ok, Some(String::from("Ok"))));
+                assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
             });
         }
 
@@ -985,19 +973,18 @@ mod tests {
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::BadRequest);
-                Ok(())
+                check_error_response(res, "Missing Token")
             }))
             .unwrap();
 
         assert_eq!(req_close(prefix, fake_id, token), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id, mal_token), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id, fake_token), (StatusCode::NotFound, None));
-        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::Ok, Some(String::from("NotReady"))));
+                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
         assert_eq!(req_close(prefix, flow_id, token),
-                   (StatusCode::Ok, Some(String::from("Closed"))));
+                   (StatusCode::BadRequest, Some("Closed".to_string())));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::NotFound, None));
     }
@@ -1020,9 +1007,9 @@ mod tests {
         rx.recv().unwrap();
         thread::sleep(Duration::from_millis(1000));
 
-        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
         assert_eq!(req_close(prefix, flow_id, token),
-                   (StatusCode::Ok, Some(String::from("Closed"))));
+                   (StatusCode::BadRequest, Some("Closed".to_string())));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::NotFound, None));
 
@@ -1036,11 +1023,9 @@ mod tests {
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
 
-        assert_eq!(req_push(prefix, flow_id, token, payload1),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
-        assert_eq!(req_push(prefix, flow_id, token, payload2),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
-        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, payload1), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, payload2), (StatusCode::Ok, None));
+        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
         assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload2.to_vec())));
@@ -1051,8 +1036,7 @@ mod tests {
         let prefix = &spawn_server().0;
         let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
 
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
 
         let (tx, rx) = mpsc::channel();
         {
@@ -1086,9 +1070,9 @@ mod tests {
         rx.recv().unwrap();
 
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::Ok, Some(String::from("NotReady"))));
+                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
         assert_eq!(req_close(prefix, flow_id, token),
-                   (StatusCode::Ok, Some(String::from("NotReady"))));
+                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
 
         req_pull(prefix, flow_id);
         rx.recv().unwrap();
@@ -1202,8 +1186,7 @@ mod tests {
             .unwrap();
 
         thread::sleep(Duration::from_secs(4));
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         thread::sleep(Duration::from_secs(4));
         for _ in 0..31 {
             create_flow(prefix, r#"{}"#);
@@ -1225,10 +1208,8 @@ mod tests {
     fn status() {
         let prefix = &spawn_server().0;
         let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::Ok, Some(String::from("Ok"))));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_status(prefix, flow_id),
                    (StatusCode::Ok, Some(StatusResponse { tail: 0, next: 2 })));
     }
