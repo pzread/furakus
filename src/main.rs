@@ -1209,7 +1209,7 @@ mod tests {
         let prefix = &spawn_server().0;
         let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
-        assert_eq!(req_close(prefix, fake_id, token), (StatusCode::NotFound, None));
+        assert_eq!(req_status(prefix, fake_id), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_status(prefix, flow_id),
