@@ -2,7 +2,7 @@ use ring::{digest, hmac, rand};
 use ring::rand::SecureRandom;
 use utils;
 
-pub trait Authorizer {
+pub trait Authorizer: Send + Sync + 'static {
     fn sign(&self, flow_id: &str) -> String;
     fn verify(&self, flow_id: &str, token: &str) -> Result<(), ()>;
 }

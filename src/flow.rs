@@ -48,7 +48,7 @@ impl Chunk {
 
 type SharedChunk = Arc<Mutex<Chunk>>;
 
-pub trait Observer {
+pub trait Observer: Send + Sync + 'static {
     fn on_active(&self, _flow: &Flow) {}
     fn on_close(&self, _flow: &Flow) {}
 }
@@ -84,7 +84,7 @@ pub struct Flow {
     bucket: HashMap<u64, SharedChunk>,
     waiting_push: VecDeque<(u64, oneshot::Sender<()>)>,
     waiting_pull: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
-    observers: Vec<Box<Observer + Send + Sync + 'static>>,
+    observers: Vec<Box<Observer>>,
 }
 
 type FlowFuture<T> = future::BoxFuture<T, Error>;
@@ -117,7 +117,7 @@ impl Flow {
         (self.tail_index, self.next_index)
     }
 
-    pub fn observe<T: Observer + Sync + Send + 'static>(&mut self, observer: T) {
+    pub fn observe<T: Observer>(&mut self, observer: T) {
         self.observers.push(Box::new(observer));
     }
 

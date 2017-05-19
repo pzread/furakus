@@ -38,12 +38,13 @@ pub enum Error {
     NotReady,
     Internal(hyper::Error),
 }
+
 struct FlowService {
     pool: Arc<RwLock<Pool>>,
     remote: reactor::Remote,
     meta_capacity: u64,
     data_capacity: u64,
-    authorizer: Arc<Authorizer + Send + Sync>,
+    authorizer: Arc<Authorizer>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,7 +76,7 @@ impl FlowService {
            remote: reactor::Remote,
            meta_capacity: u64,
            data_capacity: u64,
-           authorizer: Arc<Authorizer + Send + Sync>)
+           authorizer: Arc<Authorizer>)
            -> Self {
         FlowService {
             pool,
@@ -293,14 +294,12 @@ impl FlowService {
             // Check if the flow is EOF.
             if let Some(chunk_index) = chunk_index {
                 let flow = flow_ptr.read().unwrap();
-
                 // Check if we need to get the first chunk index.
                 let chunk_index = if chunk_index == 0 {
                     flow.get_range().0
                 } else {
                     chunk_index
                 };
-
                 let fut = flow.pull(chunk_index, None)
                     .and_then(move |chunk| {
                         let hyper_chunk = Ok(hyper::Chunk::from(chunk));
