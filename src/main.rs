@@ -10,6 +10,8 @@ extern crate ring;
 extern crate serde;
 extern crate serde_json;
 extern crate tokio_core as tokio;
+extern crate tokio_rustls;
+extern crate rustls;
 extern crate url;
 extern crate uuid;
 mod auth;
@@ -27,10 +29,13 @@ use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
 use std::{env, mem, thread};
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::{Arc, Barrier, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
+use tokio_rustls::ServerConfigExt;
 
 #[derive(Debug)]
 pub enum Error {
@@ -390,6 +395,22 @@ impl Service for FlowService {
     }
 }
 
+fn config_tls() -> rustls::ServerConfig {
+    let cert = {
+        let cert_file = File::open("./tests/cert.pem").unwrap();
+        rustls::internal::pemfile::certs(&mut BufReader::new(cert_file)).unwrap()
+    };
+    let priv_key = {
+        let priv_file = File::open("./tests/private.pem").unwrap();
+        rustls::internal::pemfile::pkcs8_private_keys(&mut BufReader::new(priv_file))
+            .unwrap()
+            .remove(0)
+    };
+    let mut tls_config = rustls::ServerConfig::new();
+    tls_config.set_single_cert(cert, priv_key);
+    tls_config
+}
+
 fn start_service(addr: std::net::SocketAddr,
                  num_worker: usize,
                  pool_size: Option<usize>,
@@ -403,6 +424,7 @@ fn start_service(addr: std::net::SocketAddr,
     let auth_ptr = Arc::new(HMACAuthorizer::new());
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
+    let tls_ptr = Arc::new(config_tls());
 
     for idx in 0..num_worker {
         let addr = addr.clone();
@@ -410,22 +432,31 @@ fn start_service(addr: std::net::SocketAddr,
         let barrier = barrier.clone();
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
+        let tls_ptr = tls_ptr.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
             let listener = TcpListener::from_listener(listener, &addr, &handle).unwrap();
-            let http = Http::new();
             let acceptor = listener
                 .incoming()
                 .for_each(|(io, addr)| {
-                    let service = FlowService::new(pool_ptr.clone(),
-                                                   remote.clone(),
-                                                   meta_capacity,
-                                                   data_capacity,
-                                                   auth_ptr.clone());
-                    http.bind_connection(&handle, io, addr, service);
-                    Ok(())
+                    let handle = handle.clone();
+                    let remote = remote.clone();
+                    let pool_ptr = pool_ptr.clone();
+                    let auth_ptr = auth_ptr.clone();
+                    tls_ptr
+                        .accept_async(io)
+                        .and_then(move |io| {
+                            let service = FlowService::new(pool_ptr,
+                                                           remote,
+                                                           meta_capacity,
+                                                           data_capacity,
+                                                           auth_ptr);
+                            Http::new().bind_connection(&handle, io, addr, service);
+                            Ok(())
+                        })
+                        .or_else(|_| Ok(()))
                 });
             println!("Worker #{} is started.", idx);
             barrier.wait();
@@ -849,9 +880,7 @@ mod tests {
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
+        core.run(client.request(req).and_then(|res| {
                 check_error_response(res, "Invalid Parameter")
             }))
             .unwrap();
@@ -894,11 +923,7 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, b""), (StatusCode::Ok, None));
 
         let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                check_error_response(res, "Missing Token")
-            }))
+        core.run(client.request(req).and_then(|res| check_error_response(res, "Missing Token")))
             .unwrap();
 
         assert_eq!(req_push(prefix, fake_id, token, payload1), (StatusCode::NotFound, None));
@@ -969,11 +994,7 @@ mod tests {
         let fake_token = "bdc62e9323003d0f5cb44c8c745a0470bdc62e9323003d0f5cb44c8c745a0470";
 
         let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                check_error_response(res, "Missing Token")
-            }))
+        core.run(client.request(req).and_then(|res| check_error_response(res, "Missing Token")))
             .unwrap();
 
         assert_eq!(req_close(prefix, fake_id, token), (StatusCode::NotFound, None));
