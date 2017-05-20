@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use futures::{Future, future};
 use futures::sync::oneshot;
 use std::collections::{HashMap, VecDeque};
@@ -18,13 +19,13 @@ pub enum Error {
 
 #[derive(Debug)]
 pub enum Chunk {
-    Data(u64, Vec<u8>),
+    Data(u64, Bytes),
     Eof(u64),
 }
 
 impl Chunk {
     fn data(data: Vec<u8>) -> Self {
-        Chunk::Data(0, data)
+        Chunk::Data(0, Bytes::from(data))
     }
 
     fn eof() -> Self {
@@ -297,7 +298,7 @@ impl Flow {
         self.acquire_chunk(Chunk::eof()).map(|_| ()).boxed()
     }
 
-    pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Vec<u8>> {
+    pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Bytes> {
         // Clone the chunk if exists.
         let chunk = self.bucket.get(&chunk_index).map(|chunk| chunk.clone());
 
@@ -331,7 +332,7 @@ impl Flow {
                 let (count, result) = {
                     let mut chunk = chunk.lock().unwrap();
                     let (count, result) = match *chunk {
-                        Chunk::Data(ref mut count, ref data) => (count, Ok(data.to_vec())),
+                        Chunk::Data(ref mut count, ref data) => (count, Ok(data.clone())),
                         Chunk::Eof(ref mut count) => (count, Err(Error::Eof)),
                     };
                     *count += 1;
@@ -374,9 +375,9 @@ mod tests {
     fn basic_operations() {
         let ptr = Flow::new(FLOW_CONFIG);
         sync_assert_eq!(ptr.write().unwrap().push(vec![1u8; 1234]), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(1));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(&[1u8; 1234] as &[u8])));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
+        sync_assert_eq!(ptr.write().unwrap().push((b"hello" as &[u8]).into()), Ok(1));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok((&[1u8; 1234] as &[u8]).into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok((b"hello" as &[u8]).into()));
         sync_assert_eq!(ptr.read().unwrap().pull(100, Some(0)), Err(Error::NotReady));
     }
 
@@ -397,7 +398,7 @@ mod tests {
     fn close_flow() {
         let ptr = Flow::new(FLOW_CONFIG);
         sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Ok(0));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"hello" as &[u8])));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok((b"hello" as &[u8]).into()));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::NotReady));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
         sync_assert_eq!(ptr.write().unwrap().push(b"hello".to_vec()), Err(Error::Invalid));
@@ -421,13 +422,13 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload2.clone()), Ok(1));
         let fut = ptr.write().unwrap().push(payload3.clone());
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.into()));
         sync_assert_eq!(fut, Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
         let fut = ptr.write().unwrap().push(payload3.clone());
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.into()));
         sync_assert_eq!(fut, Ok(3));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Dropped));
         assert_eq!(ptr.read().unwrap().get_range(), (2, 4));
@@ -440,7 +441,7 @@ mod tests {
         let fut = ptr.read().unwrap().pull(1, None);
         let fut1 = ptr.write().unwrap().push(b"ello".to_vec());
         let fut2 = ptr.write().unwrap().push(b"hello".to_vec());
-        sync_assert_eq!(fut.join3(fut1, fut2), Ok((Vec::from(b"hello" as &[u8]), 0, 1)));
+        sync_assert_eq!(fut.join3(fut1, fut2), Ok(((b"hello" as &[u8]).into(), 0, 1)));
     }
 
     #[test]
@@ -457,8 +458,8 @@ mod tests {
 
         let fut = ptr.write().unwrap().push(vec![0u8; REF_SIZE]);
         sync_assert_eq!(ptr.write().unwrap().push(b"C".to_vec()), Err(Error::NotReady));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(Vec::from(b"A" as &[u8])));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok((b"A" as &[u8]).into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.into()));
         sync_assert_eq!(fut, Ok(base_idx + 1));
     }
 
@@ -481,12 +482,11 @@ mod tests {
             ptr.read().unwrap().get_range().1
         };
         for idx in 0..next_index {
-            sync_assert_eq!(ptr.read().unwrap().pull(idx, Some(0)), Ok(Vec::from(b"A" as &[u8])));
+            sync_assert_eq!(ptr.read().unwrap().pull(idx, Some(0)), Ok((b"A" as &[u8]).into()));
         }
 
         let fut = ptr.write().unwrap().push(b"B".to_vec());
-        sync_assert_eq!(ptr.read().unwrap().pull(next_index, Some(0)),
-                        Ok(Vec::from(b"B" as &[u8])));
+        sync_assert_eq!(ptr.read().unwrap().pull(next_index, Some(0)), Ok((b"B" as &[u8]).into()));
         sync_assert_eq!(fut, Ok(next_index));
     }
 
@@ -550,7 +550,7 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(b"world".to_vec()), Ok(16));
 
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.into()));
     }
 }

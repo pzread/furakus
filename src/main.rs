@@ -2,6 +2,7 @@
 extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
+extern crate bytes;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
@@ -849,9 +850,7 @@ mod tests {
 
         let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
+        core.run(client.request(req).and_then(|res| {
                 check_error_response(res, "Invalid Parameter")
             }))
             .unwrap();
@@ -894,11 +893,7 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, b""), (StatusCode::Ok, None));
 
         let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                check_error_response(res, "Missing Token")
-            }))
+        core.run(client.request(req).and_then(|res| check_error_response(res, "Missing Token")))
             .unwrap();
 
         assert_eq!(req_push(prefix, fake_id, token, payload1), (StatusCode::NotFound, None));
@@ -969,11 +964,7 @@ mod tests {
         let fake_token = "bdc62e9323003d0f5cb44c8c745a0470bdc62e9323003d0f5cb44c8c745a0470";
 
         let req = Request::new(Post, format!("{}/{}/eof", prefix, flow_id).parse().unwrap());
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                check_error_response(res, "Missing Token")
-            }))
+        core.run(client.request(req).and_then(|res| check_error_response(res, "Missing Token")))
             .unwrap();
 
         assert_eq!(req_close(prefix, fake_id, token), (StatusCode::NotFound, None));
