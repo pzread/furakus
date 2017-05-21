@@ -395,13 +395,13 @@ impl Service for FlowService {
     }
 }
 
-fn config_tls() -> rustls::ServerConfig {
+fn config_tls(cert_path: &str, priv_path: &str) -> rustls::ServerConfig {
     let cert = {
-        let cert_file = File::open("./tests/cert.pem").unwrap();
+        let cert_file = File::open(cert_path).unwrap();
         rustls::internal::pemfile::certs(&mut BufReader::new(cert_file)).unwrap()
     };
     let priv_key = {
-        let priv_file = File::open("./tests/private.pem").unwrap();
+        let priv_file = File::open(priv_path).unwrap();
         rustls::internal::pemfile::pkcs8_private_keys(&mut BufReader::new(priv_file))
             .unwrap()
             .remove(0)
@@ -417,6 +417,7 @@ fn start_service(addr: std::net::SocketAddr,
                  deactive_timeout: Option<Duration>,
                  meta_capacity: u64,
                  data_capacity: u64,
+                 tls_config: Option<rustls::ServerConfig>,
                  blocking: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
@@ -424,7 +425,7 @@ fn start_service(addr: std::net::SocketAddr,
     let auth_ptr = Arc::new(HMACAuthorizer::new());
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
-    let tls_ptr = Arc::new(config_tls());
+    let tls_ptr = tls_config.map(|tls_config| Arc::new(tls_config));
 
     for idx in 0..num_worker {
         let addr = addr.clone();
@@ -438,9 +439,10 @@ fn start_service(addr: std::net::SocketAddr,
             let handle = core.handle();
             let remote = core.remote();
             let listener = TcpListener::from_listener(listener, &addr, &handle).unwrap();
-            let acceptor = listener
-                .incoming()
-                .for_each(|(io, addr)| {
+            let acceptor: Box<Future<Item = _, Error = _>> = if let Some(tls_ptr) = tls_ptr {
+                Box::new(listener
+                             .incoming()
+                             .for_each(move |(io, addr)| {
                     let handle = handle.clone();
                     let remote = remote.clone();
                     let pool_ptr = pool_ptr.clone();
@@ -457,9 +459,22 @@ fn start_service(addr: std::net::SocketAddr,
                             Ok(())
                         })
                         .or_else(|_| Ok(()))
-                });
-            println!("Worker #{} is started.", idx);
+                }))
+            } else {
+                Box::new(listener
+                             .incoming()
+                             .for_each(|(io, addr)| {
+                    let service = FlowService::new(pool_ptr.clone(),
+                                                   remote.clone(),
+                                                   meta_capacity,
+                                                   data_capacity,
+                                                   auth_ptr.clone());
+                    Http::new().bind_connection(&handle, io, addr, service);
+                    Ok(())
+                }))
+            };
             barrier.wait();
+            println!("Worker #{} is started.", idx);
             core.run(acceptor).unwrap();
         });
         workers.push(worker);
@@ -485,12 +500,14 @@ fn main() {
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
+    let tls_config = config_tls(&env::var("TLS_CERT").unwrap(), &env::var("TLS_PRIVATE").unwrap());
     start_service(addr,
                   num_worker,
                   Some(pool_size),
                   Some(Duration::from_secs(deactive_timeout)),
                   meta_capacity,
                   data_capacity,
+                  Some(tls_config),
                   true);
 }
 
@@ -522,6 +539,7 @@ mod tests {
                                  Some(Duration::from_secs(6)),
                                  MAX_CAPACITY,
                                  MAX_CAPACITY,
+                                 None,
                                  false)
                 .unwrap()
                 .port();
@@ -724,6 +742,21 @@ mod tests {
                 Ok(())
             })
             .boxed()
+    }
+
+    #[test]
+    fn tls_service() {
+        let tls_config = config_tls("./tests/cert.pem", "./tests/private.pem");
+        start_service("127.0.0.1:0".parse().unwrap(),
+                      1,
+                      Some(32),
+                      Some(Duration::from_secs(6)),
+                      MAX_CAPACITY,
+                      MAX_CAPACITY,
+                      Some(tls_config),
+                      false)
+                .unwrap()
+                .port();
     }
 
     #[test]
