@@ -229,9 +229,10 @@ impl FlowService {
                           Ok(_) => Ok(Self::response_ok()),
                           Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
                           Err(flow::Error::NotReady) => Ok(Self::response_error("Not Ready")),
-                          Err(err) => Err(err),
+                          Err(_) => {
+                              Ok(Response::new().with_status(StatusCode::InternalServerError))
+                          }
                       })
-                .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
                 .boxed()
         }
     }
