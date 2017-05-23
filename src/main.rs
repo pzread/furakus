@@ -1181,13 +1181,10 @@ mod tests {
 
         while !send_rx.recv_timeout(Duration::from_millis(5000)).is_err() {}
 
-        for idx in 0.. {
-            if req_fetch(prefix, flow_id, idx).0 == StatusCode::Ok {
-                for succ_idx in (idx + 1)..(idx + MAX_CAPACITY / flow::REF_SIZE as u64) {
-                    assert_eq!(req_fetch(prefix, flow_id, succ_idx).0, StatusCode::Ok);
-                }
-                break;
-            }
+        let status = req_status(prefix, flow_id).1.unwrap();
+
+        for idx in status.tail..status.next {
+            assert_eq!(req_fetch(prefix, flow_id, idx).0, StatusCode::Ok);
         }
 
         thd.thread().unpark();
