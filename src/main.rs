@@ -29,7 +29,7 @@ use hyper::header::{ContentLength, ContentType, Host};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
-use std::{env, mem, thread};
+use std::{env, thread};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::{Arc, Barrier, RwLock};
@@ -178,9 +178,9 @@ impl FlowService {
         req.body()
             .for_each(move |chunk| {
                 let mut flow = flow_ptr.write().unwrap();
-                flow.push(chunk.into_bytes())
-                    .map(|_| ())
-                    .map_err(|_| hyper::error::Error::Incomplete)
+                flow.push(chunk.into_bytes()).map(|_| ()).map_err(|_| {
+                    hyper::error::Error::Incomplete
+                })
             })
             .and_then(|_| Ok(Self::response_ok()))
             .or_else(|_| Ok(Self::response_error("Not Ready")))
