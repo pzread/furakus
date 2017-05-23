@@ -24,8 +24,8 @@ pub enum Chunk {
 }
 
 impl Chunk {
-    fn data(data: Vec<u8>) -> Self {
-        Chunk::Data(0, Bytes::from(data))
+    fn data(data: Bytes) -> Self {
+        Chunk::Data(0, data)
     }
 
     fn eof() -> Self {
@@ -290,7 +290,7 @@ impl Flow {
         self.tail_index = tail_index;
     }
 
-    pub fn push(&mut self, data: Vec<u8>) -> FlowFuture<u64> {
+    pub fn push(&mut self, data: Bytes) -> FlowFuture<u64> {
         self.acquire_chunk(Chunk::data(data))
     }
 

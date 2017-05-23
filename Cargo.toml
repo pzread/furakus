@@ -13,7 +13,7 @@ appveyor = { repository = "pzread/furakus" }
 bytes = "0.4"
 dotenv = "0.10"
 futures = "0.1"
-hyper = { git = "https://github.com/pzread/hyper", branch = "expect" }
+hyper = { git = "https://github.com/pzread/hyper", branch = "aggressive" }
 lazy_static = "0.2"
 mime = "0.2"
 regex = "0.2"

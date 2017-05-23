@@ -171,34 +171,11 @@ impl FlowService {
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         req.body()
-            .fold(Vec::<u8>::with_capacity(flow::REF_SIZE * 2), {
-                let flow_ptr = flow_ptr.clone();
-                move |mut buf_chunk, chunk| {
-                    buf_chunk.extend_from_slice(&chunk);
-                    if buf_chunk.len() > flow::REF_SIZE {
-                        let chunk = mem::replace(&mut buf_chunk,
-                                                 Vec::<u8>::with_capacity(flow::REF_SIZE * 2));
-                        let mut flow = flow_ptr.write().unwrap();
-                        flow.push(chunk)
-                            .map(|_| buf_chunk)
-                            .map_err(|_| hyper::error::Error::Incomplete)
-                            .boxed()
-                    } else {
-                        future::ok(buf_chunk).boxed()
-                    }
-                }
-            })
-            .and_then(move |chunk| {
-                // Flush remaining chunk.
-                if chunk.len() > 0 {
-                    let mut flow = flow_ptr.write().unwrap();
-                    flow.push(chunk)
-                        .map(|_| ())
-                        .map_err(|_| hyper::error::Error::Incomplete)
-                        .boxed()
-                } else {
-                    future::ok(()).boxed()
-                }
+            .for_each(move |chunk| {
+                let mut flow = flow_ptr.write().unwrap();
+                flow.push(chunk.into_bytes())
+                    .map(|_| ())
+                    .map_err(|_| hyper::error::Error::Incomplete)
             })
             .and_then(|_| Ok(Self::response_ok()))
             .or_else(|_| Ok(Self::response_error("Not Ready")))
