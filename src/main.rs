@@ -387,7 +387,9 @@ fn config_tls(cert_path: &str, priv_path: &str) -> TlsAcceptor {
         BufReader::new(priv_file).read_to_end(&mut buf).unwrap();
         buf
     };
-    TlsAcceptor::builder_from_pem(&cert_pem, &priv_key_pem).unwrap().build().unwrap()
+    let mut builder = TlsAcceptor::builder_from_pem(&cert_pem, &priv_key_pem).unwrap();
+    builder.supported_protocols(&[native_tls::Protocol::Tlsv12]).unwrap();
+    builder.build().unwrap()
 }
 
 fn start_service(addr: std::net::SocketAddr,
