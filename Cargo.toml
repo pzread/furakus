@@ -10,9 +10,10 @@ travis-ci = { repository = "pzread/furakus" }
 appveyor = { repository = "pzread/furakus" }
 
 [dependencies]
+bytes = "0.4"
 dotenv = "0.10"
 futures = "0.1"
-hyper = { git = "https://github.com/pzread/hyper", branch = "expect" }
+hyper = { git = "https://github.com/pzread/hyper", branch = "aggressive" }
 lazy_static = "0.2"
 mime = "0.2"
 native-tls = "0.1"

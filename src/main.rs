@@ -2,6 +2,7 @@
 extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
+extern crate bytes;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
@@ -32,7 +33,7 @@ use hyper::header::{ContentLength, ContentType, Host};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
-use std::{env, mem, thread};
+use std::{env, thread};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::sync::{Arc, Barrier, RwLock};
@@ -180,34 +181,11 @@ impl FlowService {
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         req.body()
-            .fold(Vec::<u8>::with_capacity(flow::REF_SIZE * 2), {
-                let flow_ptr = flow_ptr.clone();
-                move |mut buf_chunk, chunk| {
-                    buf_chunk.extend_from_slice(&chunk);
-                    if buf_chunk.len() > flow::REF_SIZE {
-                        let chunk = mem::replace(&mut buf_chunk,
-                                                 Vec::<u8>::with_capacity(flow::REF_SIZE * 2));
-                        let mut flow = flow_ptr.write().unwrap();
-                        flow.push(chunk)
-                            .map(|_| buf_chunk)
-                            .map_err(|_| hyper::error::Error::Incomplete)
-                            .boxed()
-                    } else {
-                        future::ok(buf_chunk).boxed()
-                    }
-                }
-            })
-            .and_then(move |chunk| {
-                // Flush remaining chunk.
-                if chunk.len() > 0 {
-                    let mut flow = flow_ptr.write().unwrap();
-                    flow.push(chunk)
-                        .map(|_| ())
-                        .map_err(|_| hyper::error::Error::Incomplete)
-                        .boxed()
-                } else {
-                    future::ok(()).boxed()
-                }
+            .for_each(move |chunk| {
+                let mut flow = flow_ptr.write().unwrap();
+                flow.push(chunk.into_bytes()).map(|_| ()).map_err(|_| {
+                    hyper::error::Error::Incomplete
+                })
             })
             .and_then(|_| Ok(Self::response_ok()))
             .or_else(|_| Ok(Self::response_error("Not Ready")))
@@ -1220,13 +1198,10 @@ mod tests {
 
         while !send_rx.recv_timeout(Duration::from_millis(5000)).is_err() {}
 
-        for idx in 0.. {
-            if req_fetch(prefix, flow_id, idx).0 == StatusCode::Ok {
-                for succ_idx in (idx + 1)..(idx + MAX_CAPACITY / flow::REF_SIZE as u64) {
-                    assert_eq!(req_fetch(prefix, flow_id, succ_idx).0, StatusCode::Ok);
-                }
-                break;
-            }
+        let status = req_status(prefix, flow_id).1.unwrap();
+
+        for idx in status.tail..status.next {
+            assert_eq!(req_fetch(prefix, flow_id, idx).0, StatusCode::Ok);
         }
 
         thd.thread().unpark();
