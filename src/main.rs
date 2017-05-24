@@ -11,8 +11,6 @@ extern crate ring;
 extern crate serde;
 extern crate serde_json;
 extern crate tokio_core as tokio;
-// extern crate tokio_rustls;
-// extern crate rustls;
 extern crate url;
 extern crate uuid;
 extern crate native_tls;
@@ -22,8 +20,6 @@ mod flow;
 mod pool;
 mod utils;
 
-use native_tls::{Pkcs12, TlsAcceptor, TlsStream};
-
 use auth::{Authorizer, HMACAuthorizer};
 use dotenv::dotenv;
 use flow::Flow;
@@ -31,6 +27,7 @@ use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
 use hyper::header::{ContentLength, ContentType, Host};
 use hyper::server::{Http, Request, Response, Service};
+use native_tls::TlsAcceptor;
 use pool::Pool;
 use regex::Regex;
 use std::{env, thread};
@@ -40,7 +37,6 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
-// use tokio_rustls::ServerConfigExt;
 use tokio_tls::TlsAcceptorExt;
 
 #[derive(Debug)]
@@ -378,23 +374,21 @@ impl Service for FlowService {
     }
 }
 
-/*
-fn config_tls(cert_path: &str, priv_path: &str) -> rustls::ServerConfig {
-    let cert = {
+fn config_tls(cert_path: &str, priv_path: &str) -> TlsAcceptor {
+    let cert_pem = {
         let cert_file = File::open(cert_path).unwrap();
-        rustls::internal::pemfile::certs(&mut BufReader::new(cert_file)).unwrap()
+        let mut buf = Vec::new();
+        BufReader::new(cert_file).read_to_end(&mut buf).unwrap();
+        buf
     };
-    let priv_key = {
+    let priv_key_pem = {
         let priv_file = File::open(priv_path).unwrap();
-        rustls::internal::pemfile::pkcs8_private_keys(&mut BufReader::new(priv_file))
-            .unwrap()
-            .remove(0)
+        let mut buf = Vec::new();
+        BufReader::new(priv_file).read_to_end(&mut buf).unwrap();
+        buf
     };
-    let mut tls_config = rustls::ServerConfig::new();
-    tls_config.set_single_cert(cert, priv_key);
-    tls_config
+    TlsAcceptor::builder_from_pem(&cert_pem, &priv_key_pem).unwrap().build().unwrap()
 }
-*/
 
 fn start_service(addr: std::net::SocketAddr,
                  num_worker: usize,
@@ -402,7 +396,7 @@ fn start_service(addr: std::net::SocketAddr,
                  deactive_timeout: Option<Duration>,
                  meta_capacity: u64,
                  data_capacity: u64,
-                 // tls_config: Option<rustls::ServerConfig>,
+                 tls_config: Option<TlsAcceptor>,
                  blocking: bool)
                  -> Option<std::net::SocketAddr> {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
@@ -410,16 +404,7 @@ fn start_service(addr: std::net::SocketAddr,
     let auth_ptr = Arc::new(HMACAuthorizer::new());
     let mut workers = Vec::with_capacity(num_worker);
     let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
-    // let tls_ptr = tls_config.map(|tls_config| Arc::new(tls_config));
-
-    let pkcs12 = {
-        let mut file = File::open("./tests/identity.pfx").unwrap();
-        let mut pkcs12 = vec![];
-        file.read_to_end(&mut pkcs12).unwrap();
-        Pkcs12::from_der(&pkcs12, "").unwrap()
-    };
-
-    let tls_acceptor = Some(Arc::new(TlsAcceptor::builder(pkcs12).unwrap().build().unwrap()));
+    let tls_ptr = tls_config.map(|tls_config| Arc::new(tls_config));
 
     for idx in 0..num_worker {
         let addr = addr.clone();
@@ -427,14 +412,14 @@ fn start_service(addr: std::net::SocketAddr,
         let barrier = barrier.clone();
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
-        // let tls_ptr = tls_ptr.clone();
-        let tls_acceptor = tls_acceptor.clone();
+        let tls_acceptor = tls_ptr.clone();
         let worker = thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
             let listener = TcpListener::from_listener(listener, &addr, &handle).unwrap();
-            let acceptor: Box<Future<Item = _, Error = _>> = if let Some(tls_acceptor) = tls_acceptor {
+            let acceptor: Box<Future<Item = _, Error = _>> = if let Some(tls_acceptor) =
+                tls_acceptor {
                 Box::new(listener
                              .incoming()
                              .for_each(move |(io, addr)| {
@@ -495,14 +480,14 @@ fn main() {
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
-    // let tls_config = config_tls(&env::var("TLS_CERT").unwrap(), &env::var("TLS_PRIVATE").unwrap());
+    let tls_config = config_tls(&env::var("TLS_CERT").unwrap(), &env::var("TLS_PRIVATE").unwrap());
     start_service(addr,
                   num_worker,
                   Some(pool_size),
                   Some(Duration::from_secs(deactive_timeout)),
                   meta_capacity,
                   data_capacity,
-                  // Some(tls_config),
+                  Some(tls_config),
                   true);
 }
 
