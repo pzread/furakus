@@ -175,7 +175,7 @@ impl FlowService {
                 let flow_ptr = flow_ptr.clone();
                 move |mut buf_chunk, chunk| {
                     buf_chunk.extend_from_slice(&chunk);
-                    if buf_chunk.len() > flow::REF_SIZE {
+                    if buf_chunk.len() >= flow::REF_SIZE {
                         let chunk = mem::replace(&mut buf_chunk,
                                                  Vec::<u8>::with_capacity(flow::REF_SIZE * 2));
                         let mut flow = flow_ptr.write().unwrap();
