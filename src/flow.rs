@@ -154,32 +154,40 @@ impl Flow {
 
     fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
         let chunk_len = chunk.len() as u64;
+        let is_eof_chunk = match chunk {
+            Chunk::Eof(..) => true,
+            _ => false,
+        };
 
         // The order of following code is important. We first check and return immediately if
         // failed, then update consistently.
 
         // Check if the flow is already overflow. Return if failed.
-        if self.check_overflow() {
-            return future::err(Error::NotReady).boxed();
-        }
-        // Check statistic. Return if failed.
-        let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
-            Some(new_pushed) => {
-                if let Some(length) = self.config.length {
-                    // Check if the length is over.
-                    if new_pushed > length {
-                        return future::err(Error::Invalid).boxed();
-                    }
-                }
-                new_pushed
+        let (new_pushed, new_buffered) = if is_eof_chunk {
+            (self.statistic.pushed, self.statistic.buffered)
+        } else {
+            if self.check_overflow() {
+                return future::err(Error::NotReady).boxed();
             }
-            None => return future::err(Error::Invalid).boxed(),
+            // Check statistic. Return if failed.
+            let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
+                Some(new_pushed) => {
+                    if let Some(length) = self.config.length {
+                        // Check if the length is over.
+                        if new_pushed > length {
+                            return future::err(Error::Invalid).boxed();
+                        }
+                    }
+                    new_pushed
+                }
+                None => return future::err(Error::Invalid).boxed(),
+            };
+            let new_buffered = match self.statistic.buffered.checked_add(chunk_len) {
+                Some(new_buffered) => new_buffered,
+                None => return future::err(Error::Invalid).boxed(),
+            };
+            (new_pushed, new_buffered)
         };
-        let new_buffered = match self.statistic.buffered.checked_add(chunk_len) {
-            Some(new_buffered) => new_buffered,
-            None => return future::err(Error::Invalid).boxed(),
-        };
-
         // Check and update state. Return if failed.
         if self.update_state(match chunk {
                                  Chunk::Data(..) => State::Streaming,
@@ -201,7 +209,7 @@ impl Flow {
         self.bucket.insert(chunk_index, shared_chunk.clone());
 
         // Check if we need to block for overflow.
-        let fut = if self.check_overflow() {
+        let fut = if !is_eof_chunk && self.check_overflow() {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_len, tx));
             rx.map_err(|_| Error::Other).boxed()
@@ -291,7 +299,24 @@ impl Flow {
     }
 
     pub fn push(&mut self, data: Vec<u8>) -> FlowFuture<u64> {
-        self.acquire_chunk(Chunk::data(data))
+        let fut = self.acquire_chunk(Chunk::data(data));
+        match self.config.length {
+            Some(length) if self.statistic.pushed >= length => {
+                // Close the flow automatically if it reached the end.
+                let flow_ref = self.weakref.clone();
+                fut.and_then(move |chunk_index| {
+                        // The close may fail, ignore the error.
+                        let flow_ptr = match flow_ref.upgrade() {
+                            Some(ptr) => ptr.clone(),
+                            None => return future::ok(chunk_index).boxed(),
+                        };
+                        let mut flow = flow_ptr.write().unwrap();
+                        flow.close().then(move |_| Ok(chunk_index)).boxed()
+                    })
+                    .boxed()
+            }
+            _ => fut,
+        }
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
@@ -392,6 +417,7 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(1));
         sync_assert_eq!(ptr.write().unwrap().push("!".into()), Err(Error::Invalid));
+        sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::Eof));
     }
 
     #[test]
