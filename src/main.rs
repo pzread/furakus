@@ -228,10 +228,7 @@ impl FlowService {
                 .then(|result| match result {
                           Ok(_) => Ok(Self::response_ok()),
                           Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
-                          Err(flow::Error::NotReady) => Ok(Self::response_error("Not Ready")),
-                          Err(_) => {
-                              Ok(Response::new().with_status(StatusCode::InternalServerError))
-                          }
+                          _ => Ok(Response::new().with_status(StatusCode::InternalServerError)),
                       })
                 .boxed()
         }
