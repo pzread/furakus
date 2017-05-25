@@ -211,10 +211,8 @@ impl FlowService {
                 .then(|result| match result {
                           Ok(_) => Ok(Self::response_ok()),
                           Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
-                          Err(flow::Error::NotReady) => Ok(Self::response_error("Not Ready")),
-                          Err(err) => Err(err),
+                          _ => Ok(Response::new().with_status(StatusCode::InternalServerError)),
                       })
-                .or_else(|_| Ok(Response::new().with_status(StatusCode::InternalServerError)))
                 .boxed()
         }
     }
@@ -536,23 +534,17 @@ mod tests {
         req.set_body(param.to_owned());
         req.headers_mut().set(ContentLength(param.len() as u64));
 
-        let mut id = String::new();
-        let mut token = String::new();
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
+        let data = core.run(client
+                                .request(req)
+                                .and_then(|res| {
                 assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
-                        id = data.id;
-                        token = data.token;
-                        Ok(())
-                    })
+                res.body().concat().and_then(|body| {
+                    Ok(serde_json::from_slice::<NewResponse>(&body).unwrap())
+                })
             }))
             .unwrap();
-        (id, token)
+
+        (data.id, data.token)
     }
 
     fn req_push(prefix: &str,
@@ -568,12 +560,10 @@ mod tests {
                          format!("{}/{}/push?token={}", prefix, flow_id, token).parse().unwrap());
         req.set_body(payload.to_vec());
 
-        let mut status_code = StatusCode::ImATeapot;
-        let mut response = None;
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                status_code = res.status();
+        let (status_code, response) = core.run(client
+                                                   .request(req)
+                                                   .and_then(|res| {
+                let status_code = res.status();
                 let fut = if status_code == StatusCode::BadRequest {
                     res.body()
                         .concat()
@@ -585,10 +575,7 @@ mod tests {
                 } else {
                     future::ok(None).boxed()
                 };
-                fut.and_then(|body| {
-                    response = body;
-                    Ok(())
-                })
+                fut.and_then(move |body| Ok((status_code, body)))
             }))
             .unwrap();
 
@@ -603,12 +590,10 @@ mod tests {
             Request::new(Post,
                          format!("{}/{}/eof?token={}", prefix, flow_id, token).parse().unwrap());
 
-        let mut status_code = StatusCode::ImATeapot;
-        let mut response = None;
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                status_code = res.status();
+        let (status_code, response) = core.run(client
+                                                   .request(req)
+                                                   .and_then(|res| {
+                let status_code = res.status();
                 let fut = if status_code == StatusCode::BadRequest {
                     res.body()
                         .concat()
@@ -620,10 +605,7 @@ mod tests {
                 } else {
                     future::ok(None).boxed()
                 };
-                fut.and_then(|body| {
-                    response = body;
-                    Ok(())
-                })
+                fut.and_then(move |body| Ok((status_code, body)))
             }))
             .unwrap();
 
@@ -636,21 +618,19 @@ mod tests {
 
         let req = Request::new(Post, format!("{}/{}/status", prefix, flow_id).parse().unwrap());
 
-        let mut status_code = StatusCode::ImATeapot;
-        let mut response = None;
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                status_code = res.status();
+        let (status_code, response) = core.run(client
+                                                   .request(req)
+                                                   .and_then(|res| {
+                let status_code = res.status();
                 let fut = if status_code == StatusCode::Ok {
                     res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
                 } else {
                     future::ok(None).boxed()
                 };
-                fut.and_then(|body| {
-                    response =
+                fut.and_then(move |body| {
+                    let response =
                         body.map(|data| serde_json::from_slice::<StatusResponse>(&data).unwrap());
-                    Ok(())
+                    Ok((status_code, response))
                 })
             }))
             .unwrap();
@@ -665,21 +645,16 @@ mod tests {
         let req = Request::new(Get,
                                format!("{}/{}/fetch/{}", prefix, flow_id, index).parse().unwrap());
 
-        let mut status_code = StatusCode::ImATeapot;
-        let mut response = None;
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                status_code = res.status();
+        let (status_code, response) = core.run(client
+                                                   .request(req)
+                                                   .and_then(|res| {
+                let status_code = res.status();
                 let fut = if status_code == StatusCode::Ok {
                     res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
                 } else {
                     future::ok(None).boxed()
                 };
-                fut.and_then(|body| {
-                    response = body;
-                    Ok(())
-                })
+                fut.and_then(move |body| Ok((status_code, body)))
             }))
             .unwrap();
 
@@ -692,21 +667,16 @@ mod tests {
 
         let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
 
-        let mut status_code = StatusCode::ImATeapot;
-        let mut response = None;
-        core.run(client
-                     .request(req)
-                     .and_then(|res| {
-                status_code = res.status();
+        let (status_code, response) = core.run(client
+                                                   .request(req)
+                                                   .and_then(|res| {
+                let status_code = res.status();
                 let fut = if status_code == StatusCode::Ok {
                     res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
                 } else {
                     future::ok(None).boxed()
                 };
-                fut.and_then(|body| {
-                    response = body;
-                    Ok(())
-                })
+                fut.and_then(move |body| Ok((status_code, body)))
             }))
             .unwrap();
 
@@ -974,11 +944,10 @@ mod tests {
     fn handle_push_pull() {
         let prefix = &spawn_server().0;
         let payload = vec![1u8; flow::REF_SIZE * 10];
-        let (ref flow_id, ref token) = create_flow(prefix,
-                                                   &format!(r#"{{"size": {}}}"#, payload.len()));
+        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
-        {
+        let thd = {
             let prefix = prefix.clone();
             let flow_id = flow_id.clone();
             let token = token.clone();
@@ -991,11 +960,12 @@ mod tests {
                     assert_eq!(req_push(prefix, flow_id, token, chunk), (StatusCode::Ok, None));
                 }
                 assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
-            });
-        }
+            })
+        };
 
         assert_eq!(req_pull(prefix, fake_id), (StatusCode::NotFound, None));
         assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload)));
+        thd.join().unwrap();
     }
 
     #[test]
@@ -1105,8 +1075,6 @@ mod tests {
         rx.recv().unwrap();
 
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"),
-                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
-        assert_eq!(req_close(prefix, flow_id, token),
                    (StatusCode::BadRequest, Some("Not Ready".to_string())));
 
         req_pull(prefix, flow_id);
@@ -1246,5 +1214,35 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_status(prefix, flow_id),
                    (StatusCode::Ok, Some(StatusResponse { tail: 0, next: 2 })));
+    }
+
+    #[test]
+    fn fixed_length() {
+        let prefix = &spawn_server().0;
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let body: Vec<u8> = serde_json::to_vec(&NewRequest { size: Some(5) }).unwrap();
+        req.headers_mut().set(ContentLength(body.len() as u64));
+        req.set_body(body);
+        let (ref flow_id, ref token) = core.run(client
+                                                    .request(req)
+                                                    .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                        Ok((data.id, data.token))
+                    })
+            }))
+            .unwrap();
+
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, b"World"),
+                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
+        assert_eq!(req_close(prefix, flow_id, token),
+                   (StatusCode::BadRequest, Some("Closed".to_string())));
     }
 }

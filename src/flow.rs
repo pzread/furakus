@@ -150,41 +150,47 @@ impl Flow {
         ((self.bucket.len() as u64 * *META_SIZE) > self.config.meta_capacity)
     }
 
-    fn acquire_chunk(&mut self, chunk: Chunk) -> FlowFuture<u64> {
+    fn acquire_chunk(&mut self, chunk: Chunk) -> Result<u64, Error> {
         let chunk_len = chunk.len() as u64;
 
-        // The order of following code is important. We first check and return immediately if
-        // failed, then update consistently.
+        // The order of following code is important. First check and return immediately if failed,
+        // then update consistently.
 
-        // Check if the flow is already overflow. Return if failed.
-        if self.check_overflow() {
-            return future::err(Error::NotReady).boxed();
-        }
-        // Check statistic. Return if failed.
-        let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
-            Some(new_pushed) => {
-                if let Some(length) = self.config.length {
-                    // Check if the length is over.
-                    if new_pushed > length {
-                        return future::err(Error::Invalid).boxed();
-                    }
+        let (new_pushed, new_buffered) = match chunk {
+            // EOF chunk ignores any overflow check.
+            Chunk::Eof(..) => (self.statistic.pushed, self.statistic.buffered),
+            _ => {
+                // Check if the flow is already overflow. Return if failed.
+                if self.check_overflow() {
+                    return Err(Error::NotReady);
                 }
-                new_pushed
+                // Check statistic. Return if failed.
+                let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
+                    Some(new_pushed) => {
+                        if let Some(length) = self.config.length {
+                            // Check if the length is over.
+                            if new_pushed > length {
+                                return Err(Error::Invalid);
+                            }
+                        }
+                        new_pushed
+                    }
+                    None => return Err(Error::Invalid),
+                };
+                let new_buffered = match self.statistic.buffered.checked_add(chunk_len) {
+                    Some(new_buffered) => new_buffered,
+                    None => return Err(Error::Invalid),
+                };
+                (new_pushed, new_buffered)
             }
-            None => return future::err(Error::Invalid).boxed(),
         };
-        let new_buffered = match self.statistic.buffered.checked_add(chunk_len) {
-            Some(new_buffered) => new_buffered,
-            None => return future::err(Error::Invalid).boxed(),
-        };
-
         // Check and update state. Return if failed.
         if self.update_state(match chunk {
                                  Chunk::Data(..) => State::Streaming,
                                  Chunk::Eof(..) => State::Stop,
                              })
                .is_err() {
-            return future::err(Error::Invalid).boxed();
+            return Err(Error::Invalid);
         }
         // Update statistic.
         self.statistic.pushed = new_pushed;
@@ -197,15 +203,6 @@ impl Flow {
         let shared_chunk = Arc::new(Mutex::new(chunk));
         // Insert the chunk.
         self.bucket.insert(chunk_index, shared_chunk.clone());
-
-        // Check if we need to block for overflow.
-        let fut = if self.check_overflow() {
-            let (tx, rx) = oneshot::channel();
-            self.waiting_push.push_back((chunk_len, tx));
-            rx.map_err(|_| Error::Other).boxed()
-        } else {
-            future::ok(()).boxed()
-        };
 
         // Wake up the waiting pulls.
         if let Some(waits) = self.waiting_pull.lock().unwrap().remove(&chunk_index) {
@@ -222,7 +219,7 @@ impl Flow {
         // Try to sanitize the buffer.
         self.sanitize_buffer();
 
-        fut.map(move |_| chunk_index).boxed()
+        Ok(chunk_index)
     }
 
     fn sanitize_buffer(&mut self) {
@@ -231,8 +228,8 @@ impl Flow {
         let keepcount = self.config.keepcount.unwrap_or(0);
 
         while tail_index < next_index {
-            // If there is no waiting push and the flow is streaming, benignly keep chunks alive.
-            if self.state == State::Streaming && self.waiting_push.len() == 0 {
+            // If there isn't overflow and the flow is streaming, benignly keep chunks alive.
+            if self.state == State::Streaming && !self.check_overflow() {
                 break;
             }
 
@@ -289,11 +286,38 @@ impl Flow {
     }
 
     pub fn push(&mut self, data: Bytes) -> FlowFuture<u64> {
-        self.acquire_chunk(Chunk::data(data))
+        let chunk = Chunk::data(data);
+        let chunk_len = chunk.len();
+
+        // Acquire the chunk. Return if failed.
+        let chunk_index = match self.acquire_chunk(chunk) {
+            Ok(chunk_index) => chunk_index,
+            Err(err) => return future::err(err).boxed(),
+        };
+
+        // Get the overflow status first.
+        let is_overflow = self.check_overflow();
+
+        // Atomically, automatically stop the flow if it reached the end.
+        if let Some(length) = self.config.length {
+            if self.statistic.pushed >= length {
+                // Try to stop the flow.
+                self.acquire_chunk(Chunk::eof()).is_ok();
+            }
+        }
+
+        // Block for overflow.
+        if is_overflow {
+            let (tx, rx) = oneshot::channel();
+            self.waiting_push.push_back((chunk_len, tx));
+            rx.map(move |_| chunk_index).map_err(|_| Error::Other).boxed()
+        } else {
+            future::ok(chunk_index).boxed()
+        }
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
-        self.acquire_chunk(Chunk::eof()).map(|_| ()).boxed()
+        future::result(self.acquire_chunk(Chunk::eof()).map(|_| ())).boxed()
     }
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Bytes> {
@@ -308,7 +332,7 @@ impl Flow {
                 future::err(Error::Eof).boxed()
             } else if chunk_index < self.next_index {
                 future::err(Error::Dropped).boxed()
-            } else if let Some(0) = timeout {
+            } else if timeout == Some(0) {
                 future::err(Error::NotReady).boxed()
             } else {
                 let (tx, rx) = oneshot::channel();
@@ -393,6 +417,7 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(1));
         sync_assert_eq!(ptr.write().unwrap().push("!".into()), Err(Error::Invalid));
+        sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::Eof));
     }
 
     #[test]
@@ -459,6 +484,7 @@ mod tests {
 
         let fut = ptr.write().unwrap().push(vec![0u8; REF_SIZE].into());
         sync_assert_eq!(ptr.write().unwrap().push("C".into()), Err(Error::NotReady));
+        sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok("A".into()));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.into()));
         sync_assert_eq!(fut, Ok(base_idx + 1));
@@ -498,6 +524,18 @@ mod tests {
             sync_assert_eq!(ptr.write().unwrap().push("A".into()), Ok(0));
             let flow = ptr.read().unwrap();
             flow.pull(0, Some(0))
+        };
+        sync_assert_eq!(fut, Err(Error::Other));
+
+        let fut = {
+            let ptr = Flow::new(Config {
+                                    length: None,
+                                    meta_capacity: 16777216,
+                                    data_capacity: 0,
+                                    keepcount: Some(1),
+                                });
+            let mut flow = ptr.write().unwrap();
+            flow.push("12345".into())
         };
         sync_assert_eq!(fut, Err(Error::Other));
     }
