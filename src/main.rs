@@ -30,6 +30,7 @@ use hyper::server::{Http, Request, Response, Service};
 use native_tls::TlsAcceptor;
 use pool::Pool;
 use regex::Regex;
+use serde::de::DeserializeOwned;
 use std::{env, thread};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -98,6 +99,23 @@ impl FlowService {
         self.authorizer.verify(flow_id, token).is_ok()
     }
 
+    fn parse_request_parameter<T>(req: Request) -> future::BoxFuture<T, Error>
+        where T: DeserializeOwned + Send + 'static
+    {
+        let content_length = match req.headers().get() {
+            Some(&ContentLength(length)) => length,
+            None => return future::err(Error::Invalid).boxed(),
+        };
+        if content_length == 0u64 || content_length > 4096u64 {
+            return future::err(Error::Invalid).boxed();
+        }
+        req.body()
+            .concat()
+            .map_err(|err| Error::Internal(err))
+            .and_then(|body| serde_json::from_slice::<T>(&body).map_err(|_| Error::Invalid))
+            .boxed()
+    }
+
     fn response_ok() -> Response {
         Response::new().with_header(ContentLength(0))
     }
@@ -111,21 +129,11 @@ impl FlowService {
     }
 
     fn handle_new(&self, req: Request, _route: regex::Captures) -> ResponseFuture {
-        match req.headers().get() {
-            Some(&ContentLength(0)) |
-            None => return future::ok(Self::response_error("Invalid Parameter")).boxed(),
-            _ => (),
-        };
         let pool_ptr = self.pool.clone();
         let meta_capacity = self.meta_capacity;
         let data_capacity = self.data_capacity;
         let authorizer = self.authorizer.clone();
-        req.body()
-            .concat()
-            .map_err(|err| Error::Internal(err))
-            .and_then(|body| {
-                serde_json::from_slice::<NewRequest>(&body).map_err(|_| Error::Invalid)
-            })
+        Self::parse_request_parameter::<NewRequest>(req)
             .and_then(move |param| {
                 let flow_ptr = Flow::new(flow::Config {
                                              length: param.size,
@@ -887,6 +895,52 @@ mod tests {
         req.headers_mut().set(ContentLength(14));
         core.run(client.request(req).and_then(|res| {
                 check_error_response(res, "Invalid Parameter")
+            }))
+            .unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(vec![65u8; 4097]);
+        req.headers_mut().set(ContentLength(4097));
+        core.run(client.request(req).and_then(|res| {
+                check_error_response(res, "Invalid Parameter")
+            }))
+            .unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{"size": 4096}"#);
+        req.headers_mut().set(ContentLength(4097));
+        core.run(client.request(req).and_then(|res| {
+                check_error_response(res, "Invalid Parameter")
+            }))
+            .unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut body = vec![65u8; 4096];
+        body.extend_from_slice(r#"{"size": 4096}"#.as_bytes());
+        req.set_body(body);
+        req.headers_mut().set(ContentLength(4096));
+        core.run(client.request(req).and_then(|res| {
+                check_error_response(res, "Invalid Parameter")
+            }))
+            .unwrap();
+
+        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut body = r#"{"size": 4096}"#.to_string();
+        body.extend(&vec![' '; 4096]);
+        req.set_body(body);
+        req.headers_mut().set(ContentLength(4096));
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                        assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
+                        assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(&data.token).is_some());
+                        Ok(())
+                    })
             }))
             .unwrap();
     }
