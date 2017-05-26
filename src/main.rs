@@ -289,6 +289,19 @@ impl FlowService {
             Some(flow) => flow.clone(),
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
+        let (tx, body) = hyper::Body::pair();
+        let mut response = Response::new().with_header(ContentType::octet_stream()).with_body(body);
+        // TODO: The content length isn't always correct for now.
+        {
+            let flow = flow_ptr.read().unwrap();
+            let config = flow.get_config();
+            if let Some(length) = config.length {
+                // Try to make sure the content length is correct, but still can fail.
+                if flow.get_range().0 == 0 {
+                    response.headers_mut().set(ContentLength(length));
+                }
+            }
+        }
         let body_stream = stream::unfold(Some(0), move |chunk_index| {
             // Check if the flow is EOF.
             if let Some(chunk_index) = chunk_index {
@@ -310,13 +323,12 @@ impl FlowService {
                 None
             }
         });
-        let (tx, body) = hyper::Body::pair();
         // Schedule the sender to the reactor.
         self.remote
             .spawn(move |_| {
                 tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
             });
-        future::ok(Response::new().with_header(ContentType::octet_stream()).with_body(body)).boxed()
+        future::ok(response).boxed()
     }
 }
 
@@ -1177,27 +1189,66 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
-        let body: Vec<u8> = serde_json::to_vec(&NewRequest { size: Some(5) }).unwrap();
-        req.headers_mut().set(ContentLength(body.len() as u64));
-        req.set_body(body);
-        let (ref flow_id, ref token) = core.run(client
-                                                    .request(req)
-                                                    .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
-                res.body()
-                    .concat()
-                    .and_then(|body| {
-                        let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
-                        Ok((data.id, data.token))
-                    })
-            }))
-            .unwrap();
+        let param = serde_json::to_vec(&NewRequest { size: Some(5) }).unwrap();
+        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
 
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, b"Hel"), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, b"World"),
+                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
+        assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
         assert_eq!(req_push(prefix, flow_id, token, b"World"),
                    (StatusCode::BadRequest, Some("Not Ready".to_string())));
         assert_eq!(req_close(prefix, flow_id, token),
                    (StatusCode::BadRequest, Some("Closed".to_string())));
+
+        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                assert_eq!(res.headers().get::<ContentLength>().unwrap().0, 5);
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(body.to_vec(), b"Hello".to_vec());
+                        Ok(())
+                    })
+            }))
+            .unwrap();
+
+        let param = serde_json::to_vec(&NewRequest { size: Some(0) }).unwrap();
+        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
+
+        assert_eq!(req_push(prefix, flow_id, token, b"A"),
+                   (StatusCode::BadRequest, Some("Not Ready".to_string())));
+        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
+    }
+
+    #[test]
+    fn dropped_fixed_length() {
+        let prefix = &spawn_server().0;
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+        let param = serde_json::to_vec(&NewRequest { size: Some(5) }).unwrap();
+        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
+
+        assert_eq!(req_push(prefix, flow_id, token, b"Hel"), (StatusCode::Ok, None));
+        assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
+        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(b"Hel".to_vec())));
+
+        let req = Request::new(Get, format!("{}/{}/pull", prefix, flow_id).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                assert!(res.headers().get::<ContentLength>().is_none());
+                res.body()
+                    .concat()
+                    .and_then(|body| {
+                        assert_eq!(body.to_vec(), b"lo".to_vec());
+                        Ok(())
+                    })
+            }))
+            .unwrap();
     }
 }
