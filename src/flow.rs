@@ -59,6 +59,7 @@ enum State {
     Closed,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub length: Option<u64>,
     pub meta_capacity: u64,
@@ -112,6 +113,10 @@ impl Flow {
         flow_ptr
     }
 
+    pub fn get_config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn get_range(&self) -> (u64, u64) {
         (self.tail_index, self.next_index)
     }
@@ -146,8 +151,13 @@ impl Flow {
             static ref META_SIZE: u64 = (mem::size_of::<Mutex<Chunk>>() +
                                          mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
         }
-        (self.statistic.buffered > self.config.data_capacity) ||
-        ((self.bucket.len() as u64 * *META_SIZE) > self.config.meta_capacity)
+        if self.statistic.buffered > self.config.data_capacity {
+            return true;
+        }
+        if (self.bucket.len() as u64 * *META_SIZE) > self.config.meta_capacity {
+            return true;
+        }
+        false
     }
 
     fn acquire_chunk(&mut self, chunk: Chunk) -> Result<u64, Error> {
@@ -591,5 +601,26 @@ mod tests {
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.into()));
+    }
+
+    #[test]
+    fn get_config() {
+        let config = Config {
+            length: Some(18446744073709551615),
+            meta_capacity: 4096,
+            data_capacity: 65536,
+            keepcount: Some(18446744073709551615),
+        };
+        let ptr = Flow::new(config.clone());
+        assert_eq!(ptr.read().unwrap().get_config(), &config);
+
+        let config = Config {
+            length: None,
+            meta_capacity: 18446744073709551615,
+            data_capacity: 18446744073709551615,
+            keepcount: None,
+        };
+        let ptr = Flow::new(config.clone());
+        assert_eq!(ptr.read().unwrap().get_config(), &config);
     }
 }
