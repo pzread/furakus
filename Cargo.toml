@@ -14,6 +14,7 @@ bytes = "0.4"
 dotenv = "0.10"
 futures = "0.1"
 hyper = { git = "https://github.com/pzread/hyper", branch = "expect" }
+language-tags = "0.2"
 lazy_static = "0.2"
 mime = "0.2"
 regex = "0.2"
