@@ -1,4 +1,6 @@
 #[macro_use]
+extern crate language_tags;
+#[macro_use]
 extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
@@ -25,7 +27,8 @@ use dotenv::dotenv;
 use flow::Flow;
 use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
-use hyper::header::{ContentLength, ContentType, Host};
+use hyper::header::{Charset, ContentDisposition, ContentLength, ContentType, DispositionParam,
+                    DispositionType};
 use hyper::server::{Http, Request, Response, Service};
 use native_tls::TlsAcceptor;
 use pool::Pool;
@@ -99,6 +102,10 @@ impl FlowService {
         self.authorizer.verify(flow_id, token).is_ok()
     }
 
+    fn parse_request_querystring(req: &Request) -> url::form_urlencoded::Parse {
+        url::form_urlencoded::parse(req.query().unwrap_or("").as_bytes())
+    }
+
     fn parse_request_parameter<T>(req: Request) -> future::BoxFuture<T, Error>
         where T: DeserializeOwned + Send + 'static
     {
@@ -167,15 +174,12 @@ impl FlowService {
             .boxed()
     }
 
-    fn handle_push(&self,
-                   req: Request,
-                   route: regex::Captures,
-                   mut query: url::form_urlencoded::Parse)
-                   -> ResponseFuture {
-        let token = match query.find(|&(ref key, _)| key == "token") {
-            Some((_, token)) => token.to_owned(),
-            None => return future::ok(Self::response_error("Missing Token")).boxed(),
-        };
+    fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
+        let token =
+            match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
+                Some((_, token)) => token.into_owned(),
+                None => return future::ok(Self::response_error("Missing Token")).boxed(),
+            };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
             return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
@@ -196,15 +200,12 @@ impl FlowService {
             .boxed()
     }
 
-    fn handle_eof(&self,
-                  _req: Request,
-                  route: regex::Captures,
-                  mut query: url::form_urlencoded::Parse)
-                  -> ResponseFuture {
-        let token = match query.find(|&(ref key, _)| key == "token") {
-            Some((_, token)) => token.to_owned(),
-            None => return future::ok(Self::response_error("Missing Token")).boxed(),
-        };
+    fn handle_eof(&self, req: Request, route: regex::Captures) -> ResponseFuture {
+        let token =
+            match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
+                Some((_, token)) => token.into_owned(),
+                None => return future::ok(Self::response_error("Missing Token")).boxed(),
+            };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
             return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
@@ -274,7 +275,10 @@ impl FlowService {
         }
     }
 
-    fn handle_pull(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
+    fn handle_pull(&self, req: Request, route: regex::Captures) -> ResponseFuture {
+        let opt_filename = Self::parse_request_querystring(&req)
+            .find(|&(ref key, _)| key == "filename")
+            .map(|(_, token)| token.into_owned());
         let flow_id = route.get(1).unwrap().as_str();
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
@@ -292,6 +296,15 @@ impl FlowService {
                     response.headers_mut().set(ContentLength(length));
                 }
             }
+        }
+        if let Some(filename) = opt_filename {
+            let content_disp = ContentDisposition {
+                disposition: DispositionType::Attachment,
+                parameters: vec![DispositionParam::Filename(Charset::Ext("UTF-8".to_string()),
+                                                            Some(langtag!(en)),
+                                                            filename.as_bytes().to_vec())],
+            };
+            response.headers_mut().set(content_disp);
         }
         let body_stream = stream::unfold(Some(0), move |chunk_index| {
             // Check if the flow is EOF.
@@ -336,42 +349,18 @@ impl Service for FlowService {
             static ref PATTERN_EOF: Regex = Regex::new(r"^/([a-f0-9]{32})/eof$").unwrap();
             static ref PATTERN_STATUS: Regex = Regex::new(r"^/([a-f0-9]{32})/status$").unwrap();
             static ref PATTERN_FETCH: Regex = Regex::new(r"^/([a-f0-9]{32})/fetch/(\d+)$").unwrap();
-            static ref PATTERN_PULL: Regex = Regex::new(r"^/([a-f0-9]{32})/pull$").unwrap();
+            static ref PATTERN_PULL: Regex = Regex::new(r"^/([a-f0-9]{32})/pull?$").unwrap();
         }
 
-        let url = {
-            let uri = req.uri().to_owned();
-            let resolved = if uri.is_absolute() {
-                url::Url::parse(uri.as_ref())
-            } else {
-                if let Some(host) = req.headers().get::<Host>() {
-                    let hostname = host.hostname();
-                    let base = match host.port() {
-                        Some(port) => format!("http://{}:{}", hostname, port),
-                        None => format!("http://{}", hostname),
-                    };
-                    url::Url::parse(&base).and_then(|url| url.join(uri.as_ref()))
-                } else {
-                    Err(url::ParseError::RelativeUrlWithoutBase)
-                }
-            };
-            match resolved {
-                Ok(url) => url,
-                Err(_) => {
-                    return future::ok(Response::new().with_status(StatusCode::BadRequest)).boxed()
-                }
-            }
-        };
-
-        let path = url.path();
+        let path = &req.path().to_owned();
         match req.method() {
             &Method::Post => {
                 if let Some(route) = PATTERN_NEW.captures(path) {
                     self.handle_new(req, route)
                 } else if let Some(route) = PATTERN_PUSH.captures(path) {
-                    self.handle_push(req, route, url.query_pairs())
+                    self.handle_push(req, route)
                 } else if let Some(route) = PATTERN_EOF.captures(path) {
-                    self.handle_eof(req, route, url.query_pairs())
+                    self.handle_eof(req, route)
                 } else if let Some(route) = PATTERN_STATUS.captures(path) {
                     self.handle_status(req, route)
                 } else {
@@ -519,16 +508,15 @@ mod tests {
     use hyper;
     use hyper::Method::{Get, Post, Put};
     use hyper::client::{Client, Request};
-    use hyper::header::ContentLength;
+    use hyper::header::{ContentDisposition, ContentLength};
     use hyper::status::StatusCode;
     use regex::Regex;
     use serde_json;
     use std::{str, thread};
-    use std::io::prelude::*;
-    use std::net::TcpStream;
     use std::sync::mpsc;
     use std::time::Duration;
     use tokio::reactor::Core;
+    use url;
 
     const MAX_CAPACITY: u64 = 1048576;
 
@@ -733,42 +721,39 @@ mod tests {
 
     #[test]
     fn validate_route() {
-        let (ref prefix, ref ip_prefix) = spawn_server();
+        let (ref prefix, _) = spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, _) = create_flow(prefix, r#"{}"#);
 
-        let req = Request::new(Post,
-                               format!("{}/{}/x/../push?token={}", prefix, flow_id, token)
-                                   .parse()
-                                   .unwrap());
+        let req = Request::new(Post, format!("{}/neo", prefix).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
-                assert_eq!(res.status(), StatusCode::Ok);
+                assert_eq!(res.status(), StatusCode::NotFound);
                 Ok(())
             }))
             .unwrap();
 
-        let mut stream = TcpStream::connect(ip_prefix).unwrap();
-        stream.write(b"GET /neo HTTP/1.0\r\n\r\n").unwrap();
-        let mut data = [0u8; 12];
-        stream.read_exact(&mut data).unwrap();
-        assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 400");
+        let req = Request::new(Post, format!("{}/new/../new", prefix).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
 
-        let mut stream = TcpStream::connect(ip_prefix).unwrap();
-        stream.write(b"GET /neo HTTP/1.0\r\nHost: http://x\r\n\r\n").unwrap();
-        let mut data = [0u8; 12];
-        stream.read_exact(&mut data).unwrap();
-        assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 404");
+        let req = Request::new(Post, format!("{}//new", prefix).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::NotFound);
+                Ok(())
+            }))
+            .unwrap();
 
-        let mut stream = TcpStream::connect(ip_prefix).unwrap();
-        stream.write(&format!("GET {}/neo HTTP/1.0\r\n\r\n", prefix).into_bytes()).unwrap();
-        let mut data = [0u8; 12];
-        stream.read_exact(&mut data).unwrap();
-        assert_eq!(&str::from_utf8(&data).unwrap(), &"HTTP/1.1 404");
-
-        let req = Request::new(Post, format!("{}/neo", prefix).parse().unwrap());
+        let req = Request::new(Post, format!("{}/new/", prefix).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -804,7 +789,7 @@ mod tests {
             }))
             .unwrap();
 
-        let req = Request::new(Get, format!("{}/neo", prefix).parse().unwrap());
+        let req = Request::new(Post, format!("{}/{}/statusa", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -831,7 +816,7 @@ mod tests {
             }))
             .unwrap();
 
-        let req = Request::new(Put, format!("{}/neo", prefix).parse().unwrap());
+        let req = Request::new(Put, format!("{}/new", prefix).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -1009,6 +994,8 @@ mod tests {
     #[test]
     fn handle_push_pull() {
         let prefix = &spawn_server().0;
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
         let payload = vec![1u8; flow::REF_SIZE * 10];
         let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
@@ -1032,6 +1019,31 @@ mod tests {
         assert_eq!(req_pull(prefix, fake_id), (StatusCode::NotFound, None));
         assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload)));
         thd.join().unwrap();
+
+        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
+        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
+
+        let filename = "Sc r\r\nipト.рус";
+        let qs = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("filename", filename)
+            .finish();
+        let req = Request::new(Get, format!("{}/{}/pull?{}", prefix, flow_id, qs).parse().unwrap());
+        core.run(client
+                     .request(req)
+                     .and_then(|res| {
+                assert_eq!(res.status(), StatusCode::Ok);
+                let res_disp = res.headers().get::<ContentDisposition>().unwrap().clone();
+                let check_disp = ContentDisposition {
+                    disposition: DispositionType::Attachment,
+                    parameters: vec![DispositionParam::Filename(Charset::Ext("UTF-8".to_string()),
+                                                        Some(langtag!(en)),
+                                                        filename.as_bytes().to_vec())],
+                };
+                assert_eq!(res_disp, check_disp);
+                Ok(())
+            }))
+            .unwrap();
     }
 
     #[test]
