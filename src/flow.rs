@@ -84,7 +84,8 @@ pub struct Flow {
     next_index: u64,
     tail_index: u64,
     bucket: HashMap<u64, SharedChunk>,
-    waiting_push: VecDeque<(u64, oneshot::Sender<()>)>,
+    bucket_capacity: u64,
+    waiting_push: VecDeque<(u64, u64, oneshot::Sender<()>)>,
     waiting_pull: Arc<Mutex<HashMap<u64, Vec<oneshot::Sender<SharedChunk>>>>>,
     observers: Vec<Box<Observer>>,
 }
@@ -93,6 +94,15 @@ type FlowFuture<T> = future::BoxFuture<T, Error>;
 
 impl Flow {
     pub fn new(config: Config) -> Arc<RwLock<Self>> {
+        lazy_static! {
+            static ref META_SIZE: u64 = (mem::size_of::<Mutex<Chunk>>() +
+                                         mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
+        }
+        let bucket_capacity = if config.meta_capacity == 0 {
+            0
+        } else {
+            (config.meta_capacity - 1) / *META_SIZE + 1
+        };
         let flow = Flow {
             weakref: Weak::new(),
             id: Uuid::new_v4().simple().to_string(),
@@ -106,6 +116,7 @@ impl Flow {
             next_index: 0,
             tail_index: 0,
             bucket: HashMap::new(),
+            bucket_capacity,
             waiting_push: VecDeque::new(),
             waiting_pull: Arc::new(Mutex::new(HashMap::new())),
             observers: Vec::new(),
@@ -149,20 +160,16 @@ impl Flow {
     }
 
     fn check_overflow(&self) -> bool {
-        lazy_static! {
-            static ref META_SIZE: u64 = (mem::size_of::<Mutex<Chunk>>() +
-                                         mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
-        }
         if self.statistic.buffered > self.config.data_capacity {
             return true;
         }
-        if (self.bucket.len() as u64 * *META_SIZE) > self.config.meta_capacity {
+        if self.bucket.len() as u64 > self.bucket_capacity {
             return true;
         }
         false
     }
 
-    fn acquire_chunk(&mut self, chunk: Chunk) -> Result<u64, Error> {
+    fn acquire_chunk(&mut self, chunk: Chunk) -> Result<(u64, u64, u64), Error> {
         let chunk_len = chunk.len() as u64;
 
         // The order of following code is important. First check and return immediately if failed,
@@ -204,6 +211,11 @@ impl Flow {
                .is_err() {
             return Err(Error::Invalid);
         }
+
+        // Get chunk range.
+        let chunk_start = self.statistic.pushed;
+        let chunk_end = new_pushed;
+
         // Update statistic.
         self.statistic.pushed = new_pushed;
         self.statistic.buffered = new_buffered;
@@ -231,7 +243,7 @@ impl Flow {
         // Try to sanitize the buffer.
         self.sanitize_buffer();
 
-        Ok(chunk_index)
+        Ok((chunk_index, chunk_start, chunk_end))
     }
 
     fn sanitize_buffer(&mut self) {
@@ -241,7 +253,7 @@ impl Flow {
 
         while tail_index < next_index {
             // If there isn't overflow and the flow is streaming, benignly keep chunks alive.
-            if self.state == State::Streaming && !self.check_overflow() {
+            if !self.check_overflow() && self.state == State::Streaming {
                 break;
             }
 
@@ -251,32 +263,9 @@ impl Flow {
                 if chunk.count() < keepcount {
                     break;
                 }
-
+                // Update statistic.
                 self.statistic.buffered -= chunk.len();
                 self.statistic.dropped += chunk.len();
-
-                let mut remain = chunk.len();
-                while remain > 0 {
-                    let new_len = if let Some(wait) = self.waiting_push.front_mut() {
-                        let (new_remain, new_len) = if remain >= wait.0 {
-                            (remain - wait.0, 0)
-                        } else {
-                            (0, wait.0 - remain)
-                        };
-                        remain = new_remain;
-                        wait.0 = new_len;
-                        wait.0
-                    } else {
-                        break;
-                    };
-                    if new_len == 0 {
-                        // Remove should always success.
-                        let wait = self.waiting_push.pop_front().unwrap();
-                        // Don't unwrap, since the receiver can early quit.
-                        wait.1.send(()).is_ok();
-                    }
-                }
-
                 match *chunk {
                     Chunk::Eof(..) => true,
                     _ => false,
@@ -294,16 +283,34 @@ impl Flow {
             tail_index += 1;
         }
 
+        // Update the tail index.
         self.tail_index = tail_index;
+
+        // Get the offset of tail.
+        let tail_offset = self.statistic.dropped;
+        loop {
+            if let Some(wait) = self.waiting_push.front_mut() {
+                if wait.1 - tail_offset > self.config.data_capacity {
+                    break;
+                }
+                if (wait.0 - self.tail_index + 1) > self.bucket_capacity {
+                    break;
+                }
+            } else {
+                break;
+            };
+            // Remove should always success.
+            let wait = self.waiting_push.pop_front().unwrap();
+            // Don't unwrap, since the receiver can early quit.
+            wait.2.send(()).is_ok();
+        }
     }
 
     pub fn push(&mut self, data: Vec<u8>) -> FlowFuture<u64> {
         let chunk = Chunk::data(data);
-        let chunk_len = chunk.len();
-
         // Acquire the chunk. Return if failed.
-        let chunk_index = match self.acquire_chunk(chunk) {
-            Ok(chunk_index) => chunk_index,
+        let (chunk_index, chunk_end) = match self.acquire_chunk(chunk) {
+            Ok((chunk_index, _, chunk_end)) => (chunk_index, chunk_end),
             Err(err) => return future::err(err).boxed(),
         };
 
@@ -321,7 +328,7 @@ impl Flow {
         // Block for overflow.
         if is_overflow {
             let (tx, rx) = oneshot::channel();
-            self.waiting_push.push_back((chunk_len, tx));
+            self.waiting_push.push_back((chunk_index, chunk_end, tx));
             rx.map(move |_| chunk_index).map_err(|_| Error::Other).boxed()
         } else {
             future::ok(chunk_index).boxed()
@@ -621,5 +628,21 @@ mod tests {
         };
         let ptr = Flow::new(config.clone());
         assert_eq!(ptr.read().unwrap().get_config(), &config);
+    }
+
+    #[test]
+    fn deadlock() {
+        let ptr = Flow::new(Config {
+                                length: None,
+                                meta_capacity: 16777216,
+                                data_capacity: (REF_SIZE * 2) as u64,
+                                keepcount: Some(1),
+                            });
+        let payload1 = vec![0u8; REF_SIZE + 1];
+        let payload2 = vec![0u8; REF_SIZE + 2];
+        sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
+        let fut = ptr.write().unwrap().push(payload2.clone().into());
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.into()));
+        sync_assert_eq!(fut, Ok(1));
     }
 }
