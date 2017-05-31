@@ -111,7 +111,7 @@ impl FlowService {
             return future::err(Error::Invalid).boxed();
         }
         req.body()
-            .concat()
+            .concat2()
             .map_err(|err| Error::Internal(err))
             .and_then(|body| serde_json::from_slice::<T>(&body).map_err(|_| Error::Invalid))
             .boxed()
@@ -525,7 +525,7 @@ mod tests {
                                 .request(req)
                                 .and_then(|res| {
                 assert_eq!(res.status(), StatusCode::Ok);
-                res.body().concat().and_then(|body| {
+                res.body().concat2().and_then(|body| {
                     Ok(serde_json::from_slice::<NewResponse>(&body).unwrap())
                 })
             }))
@@ -554,7 +554,7 @@ mod tests {
                 let status_code = res.status();
                 let fut = if status_code == StatusCode::BadRequest {
                     res.body()
-                        .concat()
+                        .concat2()
                         .and_then(|body| {
                             let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
                             Ok(Some(data.message))
@@ -585,7 +585,7 @@ mod tests {
                 let status_code = res.status();
                 let fut = if status_code == StatusCode::BadRequest {
                     res.body()
-                        .concat()
+                        .concat2()
                         .and_then(|body| {
                             let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
                             Ok(Some(data.message))
@@ -613,7 +613,7 @@ mod tests {
                                                    .and_then(|res| {
                 let status_code = res.status();
                 let fut = if status_code == StatusCode::Ok {
-                    res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                    res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
                 } else {
                     future::ok(None).boxed()
                 };
@@ -641,7 +641,7 @@ mod tests {
                                                    .and_then(|res| {
                 let status_code = res.status();
                 let fut = if status_code == StatusCode::Ok {
-                    res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                    res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
                 } else {
                     future::ok(None).boxed()
                 };
@@ -663,7 +663,7 @@ mod tests {
                                                    .and_then(|res| {
                 let status_code = res.status();
                 let fut = if status_code == StatusCode::Ok {
-                    res.body().concat().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                    res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
                 } else {
                     future::ok(None).boxed()
                 };
@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BadRequest);
         let error = error.to_owned();
         res.body()
-            .concat()
+            .concat2()
             .and_then(move |body| {
                 assert_eq!(serde_json::from_slice::<ErrorResponse>(&body).unwrap(),
                            ErrorResponse { message: error });
@@ -755,7 +755,7 @@ mod tests {
                      .and_then(|res| {
                 assert_eq!(res.status(), StatusCode::Ok);
                 res.body()
-                    .concat()
+                    .concat2()
                     .and_then(|body| {
                         let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
                         assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
@@ -773,7 +773,7 @@ mod tests {
                      .and_then(|res| {
                 assert_eq!(res.status(), StatusCode::Ok);
                 res.body()
-                    .concat()
+                    .concat2()
                     .and_then(|body| {
                         let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
                         assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
@@ -834,7 +834,7 @@ mod tests {
                      .and_then(|res| {
                 assert_eq!(res.status(), StatusCode::Ok);
                 res.body()
-                    .concat()
+                    .concat2()
                     .and_then(|body| {
                         let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
                         assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
@@ -1253,7 +1253,7 @@ mod tests {
                 assert_eq!(res.status(), StatusCode::Ok);
                 assert_eq!(res.headers().get::<ContentLength>().unwrap().0, 5);
                 res.body()
-                    .concat()
+                    .concat2()
                     .and_then(|body| {
                         assert_eq!(body.to_vec(), b"Hello".to_vec());
                         Ok(())
@@ -1288,7 +1288,7 @@ mod tests {
                 assert_eq!(res.status(), StatusCode::Ok);
                 assert!(res.headers().get::<ContentLength>().is_none());
                 res.body()
-                    .concat()
+                    .concat2()
                     .and_then(|body| {
                         assert_eq!(body.to_vec(), b"lo".to_vec());
                         Ok(())
