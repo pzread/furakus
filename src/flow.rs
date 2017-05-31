@@ -240,9 +240,6 @@ impl Flow {
             observer.on_active(&self);
         }
 
-        // Try to sanitize the buffer.
-        self.sanitize_buffer();
-
         Ok((chunk_index, chunk_start, chunk_end))
     }
 
@@ -290,11 +287,14 @@ impl Flow {
         let tail_offset = self.statistic.dropped;
         loop {
             if let Some(wait) = self.waiting_push.front_mut() {
-                if wait.1 - tail_offset > self.config.data_capacity {
-                    break;
-                }
-                if (wait.0 - self.tail_index + 1) > self.bucket_capacity {
-                    break;
+                // Check if the waiting chunk has been dropped.
+                if wait.0 >= self.tail_index {
+                    if wait.1 - tail_offset > self.config.data_capacity {
+                        break;
+                    }
+                    if (wait.0 - self.tail_index + 1) > self.bucket_capacity {
+                        break;
+                    }
                 }
             } else {
                 break;
@@ -326,13 +326,18 @@ impl Flow {
         }
 
         // Block for overflow.
-        if is_overflow {
+        let fut = if is_overflow {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_index, chunk_end, tx));
             rx.map(move |_| chunk_index).map_err(|_| Error::Other).boxed()
         } else {
             future::ok(chunk_index).boxed()
-        }
+        };
+
+        // Try to sanitize the buffer.
+        self.sanitize_buffer();
+
+        fut
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
@@ -631,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn deadlock() {
+    fn sanitize() {
         let ptr = Flow::new(Config {
                                 length: None,
                                 meta_capacity: 16777216,
@@ -644,5 +649,48 @@ mod tests {
         let fut = ptr.write().unwrap().push(payload2.clone().into());
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.into()));
         sync_assert_eq!(fut, Ok(1));
+
+        let payload1 = vec![0u8; REF_SIZE];
+        let ptr = Flow::new(Config {
+                                length: None,
+                                meta_capacity: 0,
+                                data_capacity: 0,
+                                keepcount: None,
+                            });
+        for idx in 0..100 {
+            sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
+        }
+        assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
+
+        let ptr = Flow::new(Config {
+                                length: None,
+                                meta_capacity: 16777216,
+                                data_capacity: 0,
+                                keepcount: None,
+                            });
+        for idx in 0..100 {
+            sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
+        }
+        assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
+
+        let ptr = Flow::new(Config {
+                                length: None,
+                                meta_capacity: 0,
+                                data_capacity: 16777216,
+                                keepcount: None,
+                            });
+        for idx in 0..100 {
+            sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
+        }
+        assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
+
+        let ptr = Flow::new(Config {
+                                length: Some(payload1.len() as u64),
+                                meta_capacity: 0,
+                                data_capacity: 0,
+                                keepcount: None,
+                            });
+        sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Err(Error::Invalid));
     }
 }
