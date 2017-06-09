@@ -303,17 +303,6 @@ impl FlowService {
         };
         let (tx, body) = hyper::Body::pair();
         let mut response = Response::new().with_header(ContentType::octet_stream()).with_body(body);
-        // TODO: The content length isn't always correct for now.
-        {
-            let flow = flow_ptr.read().unwrap();
-            let config = flow.get_config();
-            if let Some(length) = config.length {
-                // Try to make sure the content length is correct, but still can fail.
-                if flow.get_range().0 == 0 {
-                    response.headers_mut().set(ContentLength(length));
-                }
-            }
-        }
         if let Some(filename) = opt_filename {
             let content_disp = ContentDisposition {
                 disposition: DispositionType::Attachment,
@@ -323,33 +312,47 @@ impl FlowService {
             };
             response.headers_mut().set(content_disp);
         }
-        let body_stream = stream::unfold(Some(0), move |chunk_index| {
-            // Check if the flow is EOF.
-            if let Some(chunk_index) = chunk_index {
-                let flow = flow_ptr.read().unwrap();
-                // Check if we need to get the first chunk index.
-                let chunk_index = if chunk_index == 0 {
-                    flow.get_range().0
-                } else {
-                    chunk_index
-                };
-                let fut = flow.pull(chunk_index, None)
-                    .and_then(move |chunk| {
-                        let hyper_chunk = Ok(hyper::Chunk::from(chunk));
-                        future::ok((hyper_chunk, Some(chunk_index + 1)))
-                    })
-                    .or_else(|_| future::ok((Ok(hyper::Chunk::from(vec![])), None)));
-                Some(fut)
-            } else {
-                None
+        let (pull_fut, tail_index) = {
+            let flow = flow_ptr.read().unwrap();
+            let (tail_index, _) = flow.get_range();
+            let config = flow.get_config();
+            if let Some(length) = config.length {
+                // Try to make sure the content length is correct, but still can fail.
+                if flow.get_range().0 == 0 {
+                    response.headers_mut().set(ContentLength(length));
+                }
             }
-        });
-        // Schedule the sender to the reactor.
-        self.remote
-            .spawn(move |_| {
-                tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
-            });
-        future::ok(response).boxed()
+            (flow.pull(tail_index, None), tail_index)
+        };
+        let remote = self.remote.clone();
+        pull_fut
+            .and_then(move |chunk| {
+                let body_stream = stream::unfold(Some((tail_index, chunk)), move |previous| {
+                    // Check if the flow is EOF.
+                    if let Some((prev_index, prev_chunk)) = previous {
+                        let flow = flow_ptr.read().unwrap();
+                        let chunk_index = prev_index + 1;
+                        let hyper_chunk = Ok(prev_chunk.into());
+                        let fut = flow.pull(chunk_index, None)
+                            .then(move |ret| match ret {
+                                      Ok(chunk) => {
+                                          future::ok((hyper_chunk, Some((chunk_index, chunk))))
+                                      }
+                                      Err(_) => future::ok((hyper_chunk, None)),
+                                  });
+                        Some(fut)
+                    } else {
+                        None
+                    }
+                });
+                // Schedule the sender to the reactor.
+                remote.spawn(move |_| {
+                    tx.send_all(body_stream).and_then(|(mut tx, _)| tx.close()).then(|_| Ok(()))
+                });
+                Ok(response)
+            })
+            .or_else(|_| Ok(Response::new().with_status(StatusCode::NotFound)))
+            .boxed()
     }
 }
 
