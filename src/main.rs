@@ -317,8 +317,8 @@ impl FlowService {
             let (tail_index, _) = flow.get_range();
             let config = flow.get_config();
             if let Some(length) = config.length {
-                // Try to make sure the content length is correct, but still can fail.
-                if flow.get_range().0 == 0 {
+                // Only set content length when the flow is still complete.
+                if tail_index == 0 {
                     response.headers_mut().set(ContentLength(length));
                 }
             }
@@ -980,6 +980,10 @@ mod tests {
                 Ok(())
             }))
             .unwrap();
+
+        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
+        assert_eq!(req_pull(prefix, flow_id), (StatusCode::NotFound, None));
     }
 
     #[test]
