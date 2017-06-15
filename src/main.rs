@@ -519,9 +519,9 @@ mod tests {
     use futures::{Future, Sink, Stream, future, stream};
     use hyper;
     use hyper::Method::{Get, Patch, Post, Put};
+    use hyper::StatusCode;
     use hyper::client::{Client, Request};
     use hyper::header::{ContentDisposition, ContentLength};
-    use hyper::status::StatusCode;
     use regex::Regex;
     use serde_json;
     use std::{str, thread};
