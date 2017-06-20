@@ -354,7 +354,7 @@ impl Service for FlowService {
                 .unwrap();
             static ref PATTERN_FETCH: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/fetch/(\d+)$")
                 .unwrap();
-            static ref PATTERN_PULL: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/pull?$").unwrap();
+            static ref PATTERN_PULL: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/pull$").unwrap();
         }
 
         let path = &req.path().to_owned();
