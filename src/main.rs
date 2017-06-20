@@ -27,7 +27,8 @@ use dotenv::dotenv;
 use flow::Flow;
 use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
-use hyper::header::{Charset, ContentDisposition, ContentLength, ContentType, DispositionParam,
+use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, Charset,
+                    ContentDisposition, ContentLength, ContentType, DispositionParam,
                     DispositionType};
 use hyper::server::{Http, Request, Response, Service};
 use native_tls::TlsAcceptor;
@@ -359,37 +360,48 @@ impl Service for FlowService {
 
         let path = &req.path().to_owned();
         match req.method() {
-            &Method::Post => {
-                if let Some(route) = PATTERN_NEW.captures(path) {
-                    self.handle_new(req, route)
-                } else if let Some(route) = PATTERN_PUSH.captures(path) {
-                    self.handle_push(req, route)
-                } else if let Some(route) = PATTERN_EOF.captures(path) {
-                    self.handle_eof(req, route)
-                } else if let Some(route) = PATTERN_STATUS.captures(path) {
-                    self.handle_status(req, route)
-                } else {
-                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                &Method::Post => {
+                    if let Some(route) = PATTERN_NEW.captures(path) {
+                        self.handle_new(req, route)
+                    } else if let Some(route) = PATTERN_PUSH.captures(path) {
+                        self.handle_push(req, route)
+                    } else if let Some(route) = PATTERN_EOF.captures(path) {
+                        self.handle_eof(req, route)
+                    } else if let Some(route) = PATTERN_STATUS.captures(path) {
+                        self.handle_status(req, route)
+                    } else {
+                        future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                    }
                 }
-            }
-            &Method::Put => {
-                if let Some(route) = PATTERN_PUSH.captures(path) {
-                    self.handle_push(req, route)
-                } else {
-                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                &Method::Put => {
+                    if let Some(route) = PATTERN_PUSH.captures(path) {
+                        self.handle_push(req, route)
+                    } else {
+                        future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                    }
                 }
-            }
-            &Method::Get => {
-                if let Some(route) = PATTERN_FETCH.captures(path) {
-                    self.handle_fetch(req, route)
-                } else if let Some(route) = PATTERN_PULL.captures(path) {
-                    self.handle_pull(req, route)
-                } else {
-                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                &Method::Get => {
+                    if let Some(route) = PATTERN_FETCH.captures(path) {
+                        self.handle_fetch(req, route)
+                    } else if let Some(route) = PATTERN_PULL.captures(path) {
+                        self.handle_pull(req, route)
+                    } else {
+                        future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                    }
                 }
+                &Method::Options => {
+                    future::ok(Response::new().with_header(AccessControlAllowMethods(vec![
+                                Method::Post,
+                                Method::Put,
+                                Method::Get,
+                                Method::Options,
+                            ])))
+                            .boxed()
+                }
+                _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed(),
             }
-            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed(),
-        }
+            .map(|res| res.with_header(AccessControlAllowOrigin::Any))
+            .boxed()
     }
 }
 
@@ -518,13 +530,14 @@ mod tests {
     use flow;
     use futures::{Future, Sink, Stream, future, stream};
     use hyper;
-    use hyper::Method::{Get, Patch, Post, Put};
-    use hyper::StatusCode;
+    use hyper::{Method, StatusCode};
     use hyper::client::{Client, Request};
-    use hyper::header::{ContentDisposition, ContentLength};
+    use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, ContentDisposition,
+                        ContentLength};
     use regex::Regex;
     use serde_json;
     use std::{str, thread};
+    use std::collections::HashSet;
     use std::sync::mpsc;
     use std::time::Duration;
     use tokio::reactor::Core;
@@ -550,7 +563,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(param.to_owned());
         req.headers_mut().set(ContentLength(param.len() as u64));
 
@@ -575,7 +588,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut req = Request::new(Post,
+        let mut req = Request::new(Method::Post,
                                    format!("{}/flow/{}/push?token={}", prefix, flow_id, token)
                                        .parse()
                                        .unwrap());
@@ -607,7 +620,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let req = Request::new(Post,
+        let req = Request::new(Method::Post,
                                format!("{}/flow/{}/eof?token={}", prefix, flow_id, token)
                                    .parse()
                                    .unwrap());
@@ -638,7 +651,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let req = Request::new(Post,
+        let req = Request::new(Method::Post,
                                format!("{}/flow/{}/status", prefix, flow_id).parse().unwrap());
 
         let (status_code, response) = core.run(client
@@ -666,7 +679,7 @@ mod tests {
         let client = Client::new(&core.handle());
 
         let req =
-            Request::new(Get,
+            Request::new(Method::Get,
                          format!("{}/flow/{}/fetch/{}", prefix, flow_id, index).parse().unwrap());
 
         let (status_code, response) = core.run(client
@@ -689,7 +702,8 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let req = Request::new(Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Get,
+                               format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
 
         let (status_code, response) = core.run(client
                                                    .request(req)
@@ -740,52 +754,73 @@ mod tests {
         let (ref prefix, _) = spawn_server();
         let (ref flow_id, _) = create_flow(prefix, r#"{}"#);
 
-        fn check_status(req: Request, status_code: StatusCode) {
+        fn check_status(req: Request, status_code: StatusCode) -> Response {
             let mut core = Core::new().unwrap();
             let client = Client::new(&core.handle());
             core.run(client
                          .request(req)
                          .and_then(|res| {
+                    assert_eq!(res.headers().get::<AccessControlAllowOrigin>(),
+                               Some(&AccessControlAllowOrigin::Any));
                     assert_eq!(res.status(), status_code);
-                    Ok(())
+                    Ok(res)
                 }))
-                .unwrap();
+                .unwrap()
         }
 
-        let req = Request::new(Post, format!("{}/neo", prefix).parse().unwrap());
+        let req = Request::new(Method::Post, format!("{}/neo", prefix).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post, format!("{}/new/../new", prefix).parse().unwrap());
+        let req = Request::new(Method::Post, format!("{}/new/../new", prefix).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post, format!("{}//new", prefix).parse().unwrap());
+        let req = Request::new(Method::Post, format!("{}//new", prefix).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post, format!("{}/new/", prefix).parse().unwrap());
+        let req = Request::new(Method::Post, format!("{}/new/", prefix).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post, format!("{}/{}/push", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Post,
+                               format!("{}/{}/push", prefix, flow_id).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post, format!("{}/flow/{}/pusha", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Post,
+                               format!("{}/flow/{}/pusha", prefix, flow_id).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post, format!("{}/flow/{}/eofa", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Post,
+                               format!("{}/flow/{}/eofa", prefix, flow_id).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Post,
+        let req = Request::new(Method::Post,
                                format!("{}/flow/{}/statusa", prefix, flow_id).parse().unwrap());
         check_status(req, StatusCode::NotFound);
-        let req = Request::new(Get, format!("{}/flow/{}/pullb", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Get,
+                               format!("{}/flow/{}/pullb", prefix, flow_id).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Get, format!("{}/flow/{}/fetchb", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Get,
+                               format!("{}/flow/{}/fetchb", prefix, flow_id).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Put, format!("{}/new", prefix).parse().unwrap());
+        let req = Request::new(Method::Put, format!("{}/new", prefix).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Patch, format!("{}/new", prefix).parse().unwrap());
+        let req = Request::new(Method::Options, format!("{}/abc", prefix).parse().unwrap());
+        let res = check_status(req, StatusCode::Ok);
+        let allow_methods: HashSet<_> = res.headers()
+            .get::<AccessControlAllowMethods>()
+            .unwrap()
+            .0
+            .iter()
+            .map(|method| method.clone())
+            .collect();
+        assert_eq!(allow_methods,
+                   vec![Method::Get, Method::Post, Method::Put, Method::Options]
+                       .into_iter()
+                       .collect());
+
+        let req = Request::new(Method::Patch, format!("{}/new", prefix).parse().unwrap());
         check_status(req, StatusCode::MethodNotAllowed);
     }
 
@@ -795,7 +830,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
         req.headers_mut().set(ContentLength(2));
         core.run(client
@@ -813,7 +848,7 @@ mod tests {
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4096}"#);
         req.headers_mut().set(ContentLength(14));
         core.run(client
@@ -831,14 +866,14 @@ mod tests {
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
         core.run(client.request(req).and_then(|res| {
                 check_error_response(res, "Invalid Parameter")
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4O96}"#);
         req.headers_mut().set(ContentLength(14));
         core.run(client.request(req).and_then(|res| {
@@ -846,7 +881,7 @@ mod tests {
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(vec![65u8; 4097]);
         req.headers_mut().set(ContentLength(4097));
         core.run(client.request(req).and_then(|res| {
@@ -854,7 +889,7 @@ mod tests {
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{"size": 4096}"#);
         req.headers_mut().set(ContentLength(4097));
         core.run(client.request(req).and_then(|res| {
@@ -862,7 +897,7 @@ mod tests {
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         let mut body = vec![65u8; 4096];
         body.extend_from_slice(r#"{"size": 4096}"#.as_bytes());
         req.set_body(body);
@@ -872,7 +907,7 @@ mod tests {
             }))
             .unwrap();
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         let mut body = r#"{"size": 4096}"#.to_string();
         body.extend(&vec![' '; 4096]);
         req.set_body(body);
@@ -908,7 +943,7 @@ mod tests {
 
         // The empty chunk should be ignored.
         // No content length.
-        let req = Request::new(Post,
+        let req = Request::new(Method::Post,
                                format!("{}/flow/{}/push?token={}", prefix, flow_id, token)
                                    .parse()
                                    .unwrap());
@@ -922,7 +957,8 @@ mod tests {
         // With 0 content length.
         assert_eq!(req_push(prefix, flow_id, token, b""), (StatusCode::Ok, None));
 
-        let req = Request::new(Post, format!("{}/flow/{}/push", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Post,
+                               format!("{}/flow/{}/push", prefix, flow_id).parse().unwrap());
         core.run(client.request(req).and_then(|res| check_error_response(res, "Missing Token")))
             .unwrap();
 
@@ -936,7 +972,7 @@ mod tests {
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
         assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::Ok, Some(payload2.to_vec())));
 
-        let mut req = Request::new(Put,
+        let mut req = Request::new(Method::Put,
                                    format!("{}/flow/{}/push?token={}", prefix, flow_id, token)
                                        .parse()
                                        .unwrap());
@@ -1008,7 +1044,7 @@ mod tests {
         let qs = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("filename", filename)
             .finish();
-        let req = Request::new(Get,
+        let req = Request::new(Method::Get,
                                format!("{}/flow/{}/pull?{}", prefix, flow_id, qs).parse().unwrap());
         core.run(client
                      .request(req)
@@ -1041,7 +1077,8 @@ mod tests {
         let mal_token = "sjlc(84c84w47wq87a";
         let fake_token = "bdc62e9323003d0f5cb44c8c745a0470bdc62e9323003d0f5cb44c8c745a0470";
 
-        let req = Request::new(Post, format!("{}/flow/{}/eof", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Post,
+                               format!("{}/flow/{}/eof", prefix, flow_id).parse().unwrap());
         core.run(client.request(req).and_then(|res| check_error_response(res, "Missing Token")))
             .unwrap();
 
@@ -1171,7 +1208,7 @@ mod tests {
                 });
 
                 let mut req =
-                    Request::new(Post,
+                    Request::new(Method::Post,
                                  format!("{}/flow/{}/push?token={}", prefix, flow_id, token)
                                      .parse()
                                      .unwrap());
@@ -1194,7 +1231,8 @@ mod tests {
                 let flow_id = &flow_id;
 
                 let req =
-                    Request::new(Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+                    Request::new(Method::Get,
+                                 format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
 
                 let mut park_once = true;
                 core.run(client
@@ -1238,7 +1276,7 @@ mod tests {
             create_flow(prefix, r#"{}"#);
         }
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
         req.headers_mut().set(ContentLength(2));
         core.run(client
@@ -1256,7 +1294,7 @@ mod tests {
             create_flow(prefix, r#"{}"#);
         }
 
-        let mut req = Request::new(Post, format!("{}/new", prefix).parse().unwrap());
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         req.set_body(r#"{}"#);
         req.headers_mut().set(ContentLength(2));
         core.run(client
@@ -1298,7 +1336,8 @@ mod tests {
         assert_eq!(req_close(prefix, flow_id, token),
                    (StatusCode::BadRequest, Some("Closed".to_string())));
 
-        let req = Request::new(Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Get,
+                               format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
@@ -1333,7 +1372,8 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(b"Hel".to_vec())));
 
-        let req = Request::new(Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        let req = Request::new(Method::Get,
+                               format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
         core.run(client
                      .request(req)
                      .and_then(|res| {
