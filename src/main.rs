@@ -8,15 +8,16 @@ extern crate bytes;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
+extern crate native_tls;
+extern crate openssl;
 extern crate regex;
 extern crate ring;
 extern crate serde;
 extern crate serde_json;
 extern crate tokio_core as tokio;
+extern crate tokio_tls;
 extern crate url;
 extern crate uuid;
-extern crate native_tls;
-extern crate tokio_tls;
 mod auth;
 mod flow;
 mod pool;
@@ -31,7 +32,11 @@ use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, Charset
                     ContentDisposition, ContentLength, ContentType, DispositionParam,
                     DispositionType};
 use hyper::server::{Http, Request, Response, Service};
-use native_tls::TlsAcceptor;
+use native_tls::{TlsAcceptor, TlsAcceptorBuilder};
+use native_tls::backend::openssl::TlsAcceptorBuilderExt;
+use openssl::pkey::PKey;
+use openssl::ssl::{SslAcceptorBuilder, SslMethod};
+use openssl::x509::X509;
 use pool::Pool;
 use regex::Regex;
 use serde::de::DeserializeOwned;
@@ -406,21 +411,23 @@ impl Service for FlowService {
 }
 
 fn config_tls(cert_path: &str, priv_path: &str) -> TlsAcceptor {
-    let cert_pem = {
+    let fullchain = {
         let cert_file = File::open(cert_path).unwrap();
         let mut buf = Vec::new();
         BufReader::new(cert_file).read_to_end(&mut buf).unwrap();
-        buf
+        X509::stack_from_pem(&buf).unwrap()
     };
-    let priv_key_pem = {
+    let privkey = {
         let priv_file = File::open(priv_path).unwrap();
         let mut buf = Vec::new();
         BufReader::new(priv_file).read_to_end(&mut buf).unwrap();
-        buf
+        PKey::private_key_from_pem(&buf).unwrap()
     };
-    let mut builder = TlsAcceptor::builder_from_pem(&cert_pem, &priv_key_pem).unwrap();
-    builder.supported_protocols(&[native_tls::Protocol::Tlsv12]).unwrap();
-    builder.build().unwrap()
+    let cert = fullchain.first().unwrap();
+    let builder =
+        SslAcceptorBuilder::mozilla_modern(SslMethod::tls(), &privkey, &cert, &fullchain[1..])
+            .unwrap();
+    TlsAcceptorBuilder::from_openssl(builder).build().unwrap()
 }
 
 fn start_service(

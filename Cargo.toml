@@ -17,7 +17,8 @@ hyper = { git = "https://github.com/furakus/hyper", branch = "aggressive" }
 language-tags = "0.2"
 lazy_static = "0.2"
 mime = "0.2"
-native-tls = { git = "https://github.com/furakus/rust-native-tls.git", branch = "limit" }
+native-tls = { git = "https://github.com/sfackler/rust-native-tls.git" }
+openssl = "0.9"
 regex = "0.2"
 ring = "0.9"
 serde = "1.0"
