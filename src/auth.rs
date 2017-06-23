@@ -29,11 +29,9 @@ impl Authorizer for HMACAuthorizer {
     }
 
     fn verify(&self, flow_id: &str, token: &str) -> Result<(), ()> {
-        utils::unhex(token)
-            .map_err(|_| ())
-            .and_then(|sig| {
-                hmac::verify_with_own_key(&self.signkey, flow_id.as_bytes(), &sig).map_err(|_| ())
-            })
+        utils::unhex(token).map_err(|_| ()).and_then(|sig| {
+            hmac::verify_with_own_key(&self.signkey, flow_id.as_bytes(), &sig).map_err(|_| ())
+        })
     }
 }
 

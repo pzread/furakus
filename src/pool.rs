@@ -34,11 +34,11 @@ impl Entry {
         Entry {
             flow: flow_ptr,
             node: Arc::new(Mutex::new(TimeLinkNode {
-                                          key: flow_id.to_owned(),
-                                          timestamp: Instant::now(),
-                                          prev: Some(Weak::new()),
-                                          next: Some(Weak::new()),
-                                      })),
+                key: flow_id.to_owned(),
+                timestamp: Instant::now(),
+                prev: Some(Weak::new()),
+                next: Some(Weak::new()),
+            })),
         }
     }
 }
@@ -123,14 +123,11 @@ impl Pool {
     }
 
     pub fn remove(&mut self, flow_id: &str) -> Result<(), ()> {
-        self.bucket
-            .remove(flow_id)
-            .ok_or(())
-            .and_then(|entry| {
-                let mut node = entry.node.lock().unwrap();
-                TimeLinkNode::unlink(&mut node, self);
-                Ok(())
-            })
+        self.bucket.remove(flow_id).ok_or(()).and_then(|entry| {
+            let mut node = entry.node.lock().unwrap();
+            TimeLinkNode::unlink(&mut node, self);
+            Ok(())
+        })
     }
 
     fn sanitize_bucket(&mut self) {
@@ -141,18 +138,15 @@ impl Pool {
 
         let droplist = iter::repeat(())
             .scan(self.timelink_tail.clone(), |tail_weakref, _| {
-                tail_weakref
-                    .as_ref()
-                    .and_then(|weakref| weakref.upgrade())
-                    .and_then(|tail_ptr| {
-                        let node = tail_ptr.lock().unwrap();
-                        if node.timestamp.elapsed() <= deactive_timeout {
-                            None
-                        } else {
-                            *tail_weakref = node.prev.clone();
-                            Some(node.key.to_owned())
-                        }
-                    })
+                tail_weakref.as_ref().and_then(|weakref| weakref.upgrade()).and_then(|tail_ptr| {
+                    let node = tail_ptr.lock().unwrap();
+                    if node.timestamp.elapsed() <= deactive_timeout {
+                        None
+                    } else {
+                        *tail_weakref = node.prev.clone();
+                        Some(node.key.to_owned())
+                    }
+                })
             })
             .collect::<Vec<String>>();
 
@@ -213,9 +207,11 @@ mod tests {
         let flow_b = Flow::new(FLOW_CONFIG);
         let flow_c = Flow::new(FLOW_CONFIG);
         let (flowa_id, flowb_id, flowc_id) = {
-            (flow_a.read().unwrap().id.to_owned(),
-             flow_b.read().unwrap().id.to_owned(),
-             flow_c.read().unwrap().id.to_owned())
+            (
+                flow_a.read().unwrap().id.to_owned(),
+                flow_b.read().unwrap().id.to_owned(),
+                flow_c.read().unwrap().id.to_owned(),
+            )
         };
         {
             let mut pool = ptr.write().unwrap();

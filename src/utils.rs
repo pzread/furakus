@@ -1,6 +1,22 @@
 pub fn hex(bytes: &[u8]) -> String {
-    const HEXLIST: [char; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c',
-                                 'd', 'e', 'f'];
+    const HEXLIST: [char; 16] = [
+        '0',
+        '1',
+        '2',
+        '3',
+        '4',
+        '5',
+        '6',
+        '7',
+        '8',
+        '9',
+        'a',
+        'b',
+        'c',
+        'd',
+        'e',
+        'f',
+    ];
     let mut hexstr = String::new();
     for byte in bytes {
         hexstr.push(HEXLIST[(byte >> 4) as usize]);
@@ -36,8 +52,24 @@ mod tests {
     #[test]
     fn hexify() {
         let bytes: Vec<u8> = (0..256).map(|num: u32| num as u8).collect();
-        const HEXLIST: [char; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b',
-                                     'c', 'd', 'e', 'f'];
+        const HEXLIST: [char; 16] = [
+            '0',
+            '1',
+            '2',
+            '3',
+            '4',
+            '5',
+            '6',
+            '7',
+            '8',
+            '9',
+            'a',
+            'b',
+            'c',
+            'd',
+            'e',
+            'f',
+        ];
         let mut hexstr = String::new();
         for hi in HEXLIST.iter() {
             for lo in HEXLIST.iter() {

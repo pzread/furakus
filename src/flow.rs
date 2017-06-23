@@ -203,10 +203,10 @@ impl Flow {
         };
         // Check and update state. Return if failed.
         if self.update_state(match chunk {
-                                 Chunk::Data(..) => State::Streaming,
-                                 Chunk::Eof(..) => State::Stop,
-                             })
-               .is_err() {
+            Chunk::Data(..) => State::Streaming,
+            Chunk::Eof(..) => State::Stop,
+        }).is_err()
+        {
             return Err(Error::Invalid);
         }
 
@@ -368,32 +368,31 @@ impl Flow {
         let flow_ref = self.weakref.clone();
         let keepcount = self.config.keepcount;
         fut.and_then(move |chunk| {
-                let flow_ptr = match flow_ref.upgrade() {
-                    Some(ptr) => ptr.clone(),
-                    None => return future::err(Error::Other),
-                };
+            let flow_ptr = match flow_ref.upgrade() {
+                Some(ptr) => ptr.clone(),
+                None => return future::err(Error::Other),
+            };
 
-                let (count, result) = {
-                    let mut chunk = chunk.lock().unwrap();
-                    let (count, result) = match *chunk {
-                        Chunk::Data(ref mut count, ref data) => (count, Ok(data.clone())),
-                        Chunk::Eof(ref mut count) => (count, Err(Error::Eof)),
-                    };
-                    *count += 1;
-                    (*count, result)
+            let (count, result) = {
+                let mut chunk = chunk.lock().unwrap();
+                let (count, result) = match *chunk {
+                    Chunk::Data(ref mut count, ref data) => (count, Ok(data.clone())),
+                    Chunk::Eof(ref mut count) => (count, Err(Error::Eof)),
                 };
+                *count += 1;
+                (*count, result)
+            };
 
-                // Fast check if we need to sanitize.
-                if let Some(keepcount) = keepcount {
-                    if count >= keepcount {
-                        let mut flow = flow_ptr.write().unwrap();
-                        flow.sanitize_buffer();
-                    }
+            // Fast check if we need to sanitize.
+            if let Some(keepcount) = keepcount {
+                if count >= keepcount {
+                    let mut flow = flow_ptr.write().unwrap();
+                    flow.sanitize_buffer();
                 }
+            }
 
-                future::result(result)
-            })
-            .boxed()
+            future::result(result)
+        }).boxed()
     }
 }
 
@@ -431,11 +430,11 @@ mod tests {
     #[test]
     fn fixed_size_flow() {
         let ptr = Flow::new(Config {
-                                length: Some(10),
-                                meta_capacity: 16777216,
-                                data_capacity: 16777216,
-                                keepcount: Some(1),
-                            });
+            length: Some(10),
+            meta_capacity: 16777216,
+            data_capacity: 16777216,
+            keepcount: Some(1),
+        });
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(1));
         sync_assert_eq!(ptr.write().unwrap().push("!".into()), Err(Error::Invalid));
@@ -458,11 +457,11 @@ mod tests {
     #[test]
     fn dropped_chunk() {
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: (REF_SIZE * 2) as u64,
-                                data_capacity: (REF_SIZE * 2) as u64,
-                                keepcount: Some(2),
-                            });
+            length: None,
+            meta_capacity: (REF_SIZE * 2) as u64,
+            data_capacity: (REF_SIZE * 2) as u64,
+            keepcount: Some(2),
+        });
         let payload1 = vec![0u8; REF_SIZE];
         let payload2 = vec![1u8; REF_SIZE];
         let payload3 = vec![2u8; REF_SIZE];
@@ -515,11 +514,11 @@ mod tests {
     #[test]
     fn waiting_meta() {
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: 4096,
-                                data_capacity: 65536,
-                                keepcount: Some(1),
-                            });
+            length: None,
+            meta_capacity: 4096,
+            data_capacity: 65536,
+            keepcount: Some(1),
+        });
 
         for _ in 0..4096 {
             ptr.write().unwrap().push("A".into());
@@ -551,11 +550,11 @@ mod tests {
 
         let fut = {
             let ptr = Flow::new(Config {
-                                    length: None,
-                                    meta_capacity: 16777216,
-                                    data_capacity: 0,
-                                    keepcount: Some(1),
-                                });
+                length: None,
+                meta_capacity: 16777216,
+                data_capacity: 0,
+                keepcount: Some(1),
+            });
             let mut flow = ptr.write().unwrap();
             flow.push("12345".into())
         };
@@ -598,11 +597,11 @@ mod tests {
     #[test]
     fn nonblocking() {
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: (REF_SIZE * 16) as u64,
-                                data_capacity: (REF_SIZE * 16) as u64,
-                                keepcount: None,
-                            });
+            length: None,
+            meta_capacity: (REF_SIZE * 16) as u64,
+            data_capacity: (REF_SIZE * 16) as u64,
+            keepcount: None,
+        });
         let payload = vec![0u8; REF_SIZE];
 
         for idx in 0..16 {
@@ -639,11 +638,11 @@ mod tests {
     #[test]
     fn sanitize() {
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: 16777216,
-                                data_capacity: (REF_SIZE * 2) as u64,
-                                keepcount: Some(1),
-                            });
+            length: None,
+            meta_capacity: 16777216,
+            data_capacity: (REF_SIZE * 2) as u64,
+            keepcount: Some(1),
+        });
         let payload1 = vec![0u8; REF_SIZE + 1];
         let payload2 = vec![0u8; REF_SIZE + 2];
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
@@ -653,44 +652,44 @@ mod tests {
 
         let payload1 = vec![0u8; REF_SIZE];
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: 0,
-                                data_capacity: 0,
-                                keepcount: None,
-                            });
+            length: None,
+            meta_capacity: 0,
+            data_capacity: 0,
+            keepcount: None,
+        });
         for idx in 0..100 {
             sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
         }
         assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
 
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: 16777216,
-                                data_capacity: 0,
-                                keepcount: None,
-                            });
+            length: None,
+            meta_capacity: 16777216,
+            data_capacity: 0,
+            keepcount: None,
+        });
         for idx in 0..100 {
             sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
         }
         assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
 
         let ptr = Flow::new(Config {
-                                length: None,
-                                meta_capacity: 0,
-                                data_capacity: 16777216,
-                                keepcount: None,
-                            });
+            length: None,
+            meta_capacity: 0,
+            data_capacity: 16777216,
+            keepcount: None,
+        });
         for idx in 0..100 {
             sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
         }
         assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
 
         let ptr = Flow::new(Config {
-                                length: Some(payload1.len() as u64),
-                                meta_capacity: 0,
-                                data_capacity: 0,
-                                keepcount: None,
-                            });
+            length: Some(payload1.len() as u64),
+            meta_capacity: 0,
+            data_capacity: 0,
+            keepcount: None,
+        });
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Err(Error::Invalid));
     }
