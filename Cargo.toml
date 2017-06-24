@@ -17,7 +17,7 @@ hyper = { git = "https://github.com/furakus/hyper", branch = "aggressive" }
 language-tags = "0.2"
 lazy_static = "0.2"
 mime = "0.2"
-native-tls = { git = "https://github.com/sfackler/rust-native-tls.git" }
+native-tls = "0.1"
 openssl = "0.9"
 regex = "0.2"
 ring = "0.9"
@@ -25,6 +25,6 @@ serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 tokio-core = "0.1"
-tokio-tls = { git = "https://github.com/furakus/tokio-tls.git", branch = "limit" }
+tokio-tls = "0.1"
 url = "1.4"
 uuid = { version = "0.4", features = ["v4"] }
