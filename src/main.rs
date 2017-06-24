@@ -540,17 +540,21 @@ mod tests {
     use flow;
     use futures::{Future, Sink, Stream, future, stream};
     use hyper;
-    use hyper::{Method, StatusCode};
-    use hyper::client::{Client, Request};
+    use hyper::{Method, Request, StatusCode, Uri};
+    use hyper::client::{Client, HttpConnector};
     use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, ContentDisposition,
                         ContentLength};
+    use hyper::server::Service;
+    use native_tls::{Certificate, TlsConnector};
     use regex::Regex;
     use serde_json;
-    use std::{str, thread};
+    use std::{io, str, thread};
     use std::collections::HashSet;
     use std::sync::mpsc;
     use std::time::Duration;
+    use tokio::net::TcpStream;
     use tokio::reactor::Core;
+    use tokio_tls::{TlsConnectorExt, TlsStream};
     use url;
 
     const MAX_CAPACITY: u64 = 1048576;
@@ -731,22 +735,6 @@ mod tests {
                 Ok(())
             })
             .boxed()
-    }
-
-    #[test]
-    fn tls_service() {
-        let tls_config = config_tls("./tests/cert.pem", "./tests/private.pem");
-        start_service(
-            "127.0.0.1:0".parse().unwrap(),
-            1,
-            Some(32),
-            Some(Duration::from_secs(6)),
-            MAX_CAPACITY,
-            MAX_CAPACITY,
-            Some(tls_config),
-            false,
-        ).unwrap()
-            .port();
     }
 
     #[test]
@@ -1377,5 +1365,74 @@ mod tests {
                 Ok(())
             })
         })).unwrap();
+    }
+
+    #[test]
+    fn tls_service() {
+        let tls_config = config_tls("./tests/cert.pem", "./tests/private.pem");
+        let port = start_service(
+            "127.0.0.1:0".parse().unwrap(),
+            1,
+            Some(32),
+            Some(Duration::from_secs(6)),
+            MAX_CAPACITY,
+            MAX_CAPACITY,
+            Some(tls_config),
+            false,
+        ).unwrap()
+            .port();
+
+        let prefix = format!("https://127.0.0.1:{}", port);
+        let mut core = Core::new().unwrap();
+
+        let rootca = {
+            let cert_file = File::open("./tests/cert.der").unwrap();
+            let mut buf = Vec::new();
+            BufReader::new(cert_file).read_to_end(&mut buf).unwrap();
+            Certificate::from_der(&buf).unwrap()
+        };
+        let mut tls_builder = TlsConnector::builder().unwrap();
+        tls_builder.add_root_certificate(rootca).unwrap();
+        let tls_connector = tls_builder.build().unwrap();
+        let mut connector = HttpsConnector {
+            tls: Arc::new(tls_connector),
+            http: HttpConnector::new(2, &core.handle()),
+        };
+        connector.http.enforce_http(false);
+        let client = Client::configure().connector(connector).build(&core.handle());
+
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(r#"{}"#);
+        req.headers_mut().set(ContentLength(2));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat2().and_then(|body| {
+                let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                assert!(Regex::new("^[a-f0-9]{32}$").unwrap().find(&data.id).is_some());
+                assert!(Regex::new("^[a-f0-9]{64}$").unwrap().find(&data.token).is_some());
+                Ok(())
+            })
+        })).unwrap();
+    }
+
+    struct HttpsConnector {
+        tls: Arc<TlsConnector>,
+        http: HttpConnector,
+    }
+
+    impl Service for HttpsConnector {
+        type Request = Uri;
+        type Response = TlsStream<TcpStream>;
+        type Error = io::Error;
+        type Future = Box<Future<Item = Self::Response, Error = io::Error>>;
+
+        fn call(&self, uri: Uri) -> Self::Future {
+            let tls_connector = self.tls.clone();
+            Box::new(self.http.call(uri).and_then(move |io| {
+                tls_connector.connect_async("example.com", io).map_err(|err| {
+                    io::Error::new(io::ErrorKind::Other, err)
+                })
+            }))
+        }
     }
 }
