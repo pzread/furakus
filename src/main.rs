@@ -1347,9 +1347,9 @@ mod tests {
         }).join()
             .is_ok();
         if cfg!(unix) {
-            assert!(res, true);
+            assert_eq!(res, true);
         } else {
-            assert!(res, false);
+            assert_eq!(res, false);
         }
     }
 }
