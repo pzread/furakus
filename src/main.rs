@@ -433,6 +433,10 @@ fn start_service(
     data_capacity: u64,
     blocking: bool,
 ) -> Option<std::net::SocketAddr> {
+    if !cfg!(unix) && num_worker > 1 {
+        panic!("Multi-workers isn't supported on Windows");
+    }
+
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
     let auth_ptr = Arc::new(HMACAuthorizer::new());
@@ -475,7 +479,7 @@ fn start_service(
         for worker in workers {
             worker.join().unwrap();
         }
-        None
+        unreachable!();
     } else {
         Some(upstream_listener.local_addr().unwrap())
     }
@@ -1326,5 +1330,26 @@ mod tests {
                 Ok(())
             })
         })).unwrap();
+    }
+
+    #[test]
+    fn multi_workers() {
+        let res = thread::spawn(|| {
+            start_service(
+                "127.0.0.1:0".parse().unwrap(),
+                4,
+                None,
+                None,
+                MAX_CAPACITY,
+                MAX_CAPACITY,
+                false,
+            ).unwrap();
+        }).join()
+            .is_ok();
+        if cfg!(unix) {
+            assert!(res, true);
+        } else {
+            assert!(res, false);
+        }
     }
 }
