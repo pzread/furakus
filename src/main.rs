@@ -28,9 +28,9 @@ use dotenv::dotenv;
 use flow::Flow;
 use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
-use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, Charset,
-                    ContentDisposition, ContentLength, ContentType, DispositionParam,
-                    DispositionType};
+use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, CacheControl,
+                    CacheDirective, Charset, ContentDisposition, ContentLength, ContentType,
+                    DispositionParam, DispositionType};
 use hyper::server::{Http, Request, Response, Service};
 use native_tls::{TlsAcceptor, TlsAcceptorBuilder};
 use native_tls::backend::openssl::TlsAcceptorBuilderExt;
@@ -132,7 +132,11 @@ impl FlowService {
     }
 
     fn response_ok() -> Response {
-        Response::new().with_header(ContentLength(0))
+        Response::new().with_header(ContentLength(0)).with_header(CacheControl(vec![
+            CacheDirective::NoCache,
+            CacheDirective::NoStore,
+            CacheDirective::MustRevalidate,
+        ]))
     }
 
     fn response_error(error: &str) -> Response {
@@ -171,6 +175,11 @@ impl FlowService {
                     Response::new()
                         .with_header(ContentType::json())
                         .with_header(ContentLength(body.len() as u64))
+                        .with_header(CacheControl(vec![
+                            CacheDirective::NoCache,
+                            CacheDirective::NoStore,
+                            CacheDirective::MustRevalidate,
+                        ]))
                         .with_body(body),
                 )
             })
@@ -249,6 +258,11 @@ impl FlowService {
             Response::new()
                 .with_header(ContentType::json())
                 .with_header(ContentLength(body.len() as u64))
+                .with_header(CacheControl(vec![
+                    CacheDirective::NoCache,
+                    CacheDirective::NoStore,
+                    CacheDirective::MustRevalidate,
+                ]))
                 .with_body(body),
         ).boxed()
     }
@@ -271,6 +285,10 @@ impl FlowService {
                         Response::new()
                             .with_header(ContentType::octet_stream())
                             .with_header(ContentLength(chunk.len() as u64))
+                            .with_header(CacheControl(vec![
+                                CacheDirective::MaxAge(365000000),
+                                CacheDirective::Extension("immutable".into(), None),
+                            ]))
                             .with_body(chunk),
                     )
                 })
@@ -295,13 +313,16 @@ impl FlowService {
             None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
         };
         let (tx, body) = hyper::Body::pair();
-        let mut response = Response::new().with_header(ContentType::octet_stream()).with_body(body);
+        let mut response = Response::new()
+            .with_header(ContentType::octet_stream())
+            .with_header(CacheControl(vec![CacheDirective::NoCache]))
+            .with_body(body);
         if let Some(filename) = opt_filename {
             let content_disp = ContentDisposition {
                 disposition: DispositionType::Attachment,
                 parameters: vec![
                     DispositionParam::Filename(
-                        Charset::Ext("UTF-8".to_string()),
+                        Charset::Ext("UTF-8".into()),
                         Some(langtag!(en)),
                         filename.as_bytes().to_vec()
                     ),
@@ -1032,7 +1053,7 @@ mod tests {
                 disposition: DispositionType::Attachment,
                 parameters: vec![
                     DispositionParam::Filename(
-                        Charset::Ext("UTF-8".to_string()),
+                        Charset::Ext("UTF-8".into()),
                         Some(langtag!(en)),
                         filename.as_bytes().to_vec()
                     ),
