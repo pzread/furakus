@@ -121,11 +121,7 @@ impl FlowService {
     }
 
     fn response_ok() -> Response {
-        Response::new().with_header(ContentLength(0)).with_header(CacheControl(vec![
-            CacheDirective::NoCache,
-            CacheDirective::NoStore,
-            CacheDirective::MustRevalidate,
-        ]))
+        Response::new().with_header(ContentLength(0))
     }
 
     fn response_error(error: &str) -> Response {
@@ -164,11 +160,6 @@ impl FlowService {
                     Response::new()
                         .with_header(ContentType::json())
                         .with_header(ContentLength(body.len() as u64))
-                        .with_header(CacheControl(vec![
-                            CacheDirective::NoCache,
-                            CacheDirective::NoStore,
-                            CacheDirective::MustRevalidate,
-                        ]))
                         .with_body(body),
                 )
             })
@@ -272,11 +263,6 @@ impl FlowService {
             Response::new()
                 .with_header(ContentType::json())
                 .with_header(ContentLength(body.len() as u64))
-                .with_header(CacheControl(vec![
-                    CacheDirective::NoCache,
-                    CacheDirective::NoStore,
-                    CacheDirective::MustRevalidate,
-                ]))
                 .with_body(body),
         ).boxed()
     }
@@ -533,8 +519,8 @@ mod tests {
     use hyper;
     use hyper::{Method, StatusCode};
     use hyper::client::{Client, Request};
-    use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, ContentDisposition,
-                        ContentLength};
+    use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, CacheControl,
+                        CacheDirective, ContentDisposition, ContentLength};
     use regex::Regex;
     use serde_json;
     use std::{str, thread};
@@ -677,6 +663,23 @@ mod tests {
 
         let (status_code, response) = core.run(client.request(req).and_then(|res| {
             let status_code = res.status();
+            if status_code == StatusCode::Ok {
+                let policies = res.headers().get::<CacheControl>().unwrap();
+                let mut check_immutable = false;
+                let mut check_maxage = false;
+                for policy in policies.iter() {
+                    match policy {
+                        &CacheDirective::Extension(ref ext, None) if ext == "immutable" => {
+                            check_immutable = true;
+                        }
+                        &CacheDirective::MaxAge(age) if age == 365000000 => {
+                            check_maxage = true;
+                        }
+                        _ => panic!("Unexpected cache policy"),
+                    }
+                }
+                assert!(check_immutable && check_maxage);
+            }
             let fut = if status_code == StatusCode::Ok {
                 res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
             } else {
@@ -697,6 +700,12 @@ mod tests {
 
         let (status_code, response) = core.run(client.request(req).and_then(|res| {
             let status_code = res.status();
+            if status_code == StatusCode::Ok {
+                assert_eq!(
+                    res.headers().get::<CacheControl>().unwrap(),
+                    &CacheControl(vec![CacheDirective::NoCache])
+                );
+            }
             let fut = if status_code == StatusCode::Ok {
                 res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
             } else {
@@ -794,9 +803,9 @@ mod tests {
         let allow_methods: HashSet<_> = res.headers()
             .get::<AccessControlAllowMethods>()
             .unwrap()
+            .clone()
             .0
-            .iter()
-            .map(|method| method.clone())
+            .into_iter()
             .collect();
         assert_eq!(
             allow_methods,
@@ -1009,7 +1018,7 @@ mod tests {
         );
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
-            let res_disp = res.headers().get::<ContentDisposition>().unwrap().clone();
+            let res_disp = res.headers().get::<ContentDisposition>().unwrap();
             let check_disp = ContentDisposition {
                 disposition: DispositionType::Attachment,
                 parameters: vec![
@@ -1020,7 +1029,7 @@ mod tests {
                     ),
                 ],
             };
-            assert_eq!(res_disp, check_disp);
+            assert_eq!(res_disp, &check_disp);
             Ok(())
         })).unwrap();
 
@@ -1179,12 +1188,10 @@ mod tests {
                     Some(future::ok((Ok(hyper::Chunk::from(vec![0u8; flow::REF_SIZE])), ())))
                 });
 
-                let mut req =
-                    Request::new(
-                        Method::Post,
-                        format!("{}/flow/{}/push?token={}", prefix, flow_id, token).parse().unwrap(),
-                    );
                 let (tx, body) = hyper::Body::pair();
+                let url =
+                    format!("{}/flow/{}/push?token={}", prefix, flow_id, token).parse().unwrap();
+                let mut req = Request::new(Method::Post, url);
                 req.set_body(body);
 
                 // Schedule the sender to the reactor.
