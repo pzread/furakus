@@ -198,6 +198,7 @@ mod tests {
         meta_capacity: 16777216,
         data_capacity: 16777216,
         keepcount: Some(1),
+        preserve_mode: false,
     };
 
     #[test]

@@ -67,6 +67,7 @@ pub struct Config {
     pub meta_capacity: u64,
     pub data_capacity: u64,
     pub keepcount: Option<u64>,
+    pub preserve_mode: bool,
 }
 
 pub struct Statistic {
@@ -83,6 +84,7 @@ pub struct Flow {
     state: State,
     next_index: u64,
     tail_index: u64,
+    sanitize_index: u64,
     bucket: HashMap<u64, SharedChunk>,
     bucket_capacity: u64,
     waiting_push: VecDeque<(u64, u64, oneshot::Sender<()>)>,
@@ -115,6 +117,7 @@ impl Flow {
             state: State::Streaming,
             next_index: 0,
             tail_index: 0,
+            sanitize_index: 0,
             bucket: HashMap::new(),
             bucket_capacity,
             waiting_push: VecDeque::new(),
@@ -132,6 +135,10 @@ impl Flow {
 
     pub fn get_range(&self) -> (u64, u64) {
         (self.tail_index, self.next_index)
+    }
+
+    pub fn get_statistic(&self) -> &Statistic {
+        &self.statistic
     }
 
     pub fn observe<T: Observer>(&mut self, observer: T) {
@@ -244,44 +251,43 @@ impl Flow {
     }
 
     fn sanitize_buffer(&mut self) {
-        let mut tail_index = self.tail_index;
         let next_index = self.next_index;
         let keepcount = self.config.keepcount.unwrap_or(0);
-
-        while tail_index < next_index {
-            // If there isn't overflow and the flow is streaming, benignly keep chunks alive.
-            if !self.check_overflow() && self.state == State::Streaming {
-                break;
-            }
-
+        while self.sanitize_index < next_index {
             let closed = {
                 // Get should always success.
-                let chunk = self.bucket.get(&tail_index).unwrap().lock().unwrap();
+                let chunk = self.bucket.get(&self.sanitize_index).unwrap().lock().unwrap();
                 if chunk.count() < keepcount {
                     break;
                 }
-                // Update statistic.
-                self.statistic.buffered -= chunk.len();
-                self.statistic.dropped += chunk.len();
                 match *chunk {
                     Chunk::Eof(..) => true,
                     _ => false,
                 }
             };
-
             // Try to close the flow.
             if closed {
                 self.update_state(State::Closed).is_ok();
             }
-
-            // Remove should always success.
-            self.bucket.remove(&tail_index).unwrap();
-
-            tail_index += 1;
+            self.sanitize_index += 1;
         }
 
-        // Update the tail index.
-        self.tail_index = tail_index;
+        // Remain one buffer chunk in preserve mode.
+        if !self.config.preserve_mode || (self.sanitize_index + 1) >= next_index {
+            // If there isn't overflow, benignly keep chunks alive.
+            while self.tail_index < self.sanitize_index && self.check_overflow() {
+                {
+                    let chunk_len =
+                        self.bucket.get(&self.tail_index).unwrap().lock().unwrap().len();
+                    // Update statistic.
+                    self.statistic.buffered -= chunk_len;
+                    self.statistic.dropped += chunk_len;
+                }
+                // Remove should always success.
+                self.bucket.remove(&self.tail_index).unwrap();
+                self.tail_index += 1;
+            }
+        }
 
         // Get the offset of tail.
         let tail_offset = self.statistic.dropped;
@@ -407,6 +413,7 @@ mod tests {
         meta_capacity: 16777216,
         data_capacity: 16777216,
         keepcount: Some(1),
+        preserve_mode: false,
     };
 
     macro_rules! sync_assert_eq {
@@ -433,6 +440,7 @@ mod tests {
             meta_capacity: 16777216,
             data_capacity: 16777216,
             keepcount: Some(1),
+            preserve_mode: false,
         });
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(1));
@@ -460,6 +468,7 @@ mod tests {
             meta_capacity: (REF_SIZE * 2) as u64,
             data_capacity: (REF_SIZE * 2) as u64,
             keepcount: Some(2),
+            preserve_mode: false,
         });
         let payload1 = vec![0u8; REF_SIZE];
         let payload2 = vec![1u8; REF_SIZE];
@@ -517,6 +526,7 @@ mod tests {
             meta_capacity: 4096,
             data_capacity: 65536,
             keepcount: Some(1),
+            preserve_mode: false,
         });
 
         for _ in 0..4096 {
@@ -553,6 +563,7 @@ mod tests {
                 meta_capacity: 16777216,
                 data_capacity: 0,
                 keepcount: Some(1),
+                preserve_mode: false,
             });
             let mut flow = ptr.write().unwrap();
             flow.push("12345".into())
@@ -600,6 +611,7 @@ mod tests {
             meta_capacity: (REF_SIZE * 16) as u64,
             data_capacity: (REF_SIZE * 16) as u64,
             keepcount: None,
+            preserve_mode: false,
         });
         let payload = vec![0u8; REF_SIZE];
 
@@ -620,6 +632,7 @@ mod tests {
             meta_capacity: 4096,
             data_capacity: 65536,
             keepcount: Some(18446744073709551615),
+            preserve_mode: false,
         };
         let ptr = Flow::new(config.clone());
         assert_eq!(ptr.read().unwrap().get_config(), &config);
@@ -629,6 +642,7 @@ mod tests {
             meta_capacity: 18446744073709551615,
             data_capacity: 18446744073709551615,
             keepcount: None,
+            preserve_mode: false,
         };
         let ptr = Flow::new(config.clone());
         assert_eq!(ptr.read().unwrap().get_config(), &config);
@@ -641,6 +655,7 @@ mod tests {
             meta_capacity: 16777216,
             data_capacity: (REF_SIZE * 2) as u64,
             keepcount: Some(1),
+            preserve_mode: false,
         });
         let payload1 = vec![0u8; REF_SIZE + 1];
         let payload2 = vec![0u8; REF_SIZE + 2];
@@ -655,6 +670,7 @@ mod tests {
             meta_capacity: 0,
             data_capacity: 0,
             keepcount: None,
+            preserve_mode: false,
         });
         for idx in 0..100 {
             sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
@@ -666,6 +682,7 @@ mod tests {
             meta_capacity: 16777216,
             data_capacity: 0,
             keepcount: None,
+            preserve_mode: false,
         });
         for idx in 0..100 {
             sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
@@ -677,6 +694,7 @@ mod tests {
             meta_capacity: 0,
             data_capacity: 16777216,
             keepcount: None,
+            preserve_mode: false,
         });
         for idx in 0..100 {
             sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
@@ -688,6 +706,7 @@ mod tests {
             meta_capacity: 0,
             data_capacity: 0,
             keepcount: None,
+            preserve_mode: false,
         });
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Err(Error::Invalid));

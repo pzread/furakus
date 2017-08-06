@@ -68,6 +68,8 @@ struct NewResponse {
 struct StatusResponse {
     pub tail: u64,
     pub next: u64,
+    pub dropped: u64,
+    pub pushed: u64,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -144,6 +146,7 @@ impl FlowService {
                     meta_capacity,
                     data_capacity,
                     keepcount: Some(1),
+                    preserve_mode: false,
                 });
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
@@ -257,7 +260,13 @@ impl FlowService {
         let body = {
             let flow = flow_ptr.read().unwrap();
             let (tail, next) = flow.get_range();
-            serde_json::to_string(&StatusResponse { tail, next }).unwrap()
+            let statistic = flow.get_statistic();
+            serde_json::to_string(&StatusResponse {
+                tail,
+                next,
+                dropped: statistic.dropped,
+                pushed: statistic.pushed,
+            }).unwrap()
         }.into_bytes();
         future::ok(
             Response::new()
@@ -1113,8 +1122,11 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, payload2), (StatusCode::Ok, None));
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
+        assert_eq!(
+            req_pull(prefix, flow_id),
+            (StatusCode::Ok, Some([payload1, payload2].concat()))
+        );
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
-        assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload2.to_vec())));
     }
 
     #[test]
@@ -1287,10 +1299,15 @@ mod tests {
         assert_eq!(req_status(prefix, fake_id), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
-        assert_eq!(
-            req_status(prefix, flow_id),
-            (StatusCode::Ok, Some(StatusResponse { tail: 0, next: 2 }))
-        );
+        assert_eq!(req_status(prefix, flow_id), (
+            StatusCode::Ok,
+            Some(StatusResponse {
+                tail: 0,
+                next: 2,
+                dropped: 0,
+                pushed: 10,
+            }),
+        ));
     }
 
     #[test]
@@ -1354,9 +1371,9 @@ mod tests {
             Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
-            assert!(res.headers().get::<ContentLength>().is_none());
+            assert_eq!(res.headers().get::<ContentLength>().unwrap().0, 5);
             res.body().concat2().and_then(|body| {
-                assert_eq!(body.to_vec(), b"lo".to_vec());
+                assert_eq!(body.to_vec(), b"Hello".to_vec());
                 Ok(())
             })
         })).unwrap();
