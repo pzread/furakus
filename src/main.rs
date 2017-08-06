@@ -25,9 +25,10 @@ use dotenv::dotenv;
 use flow::Flow;
 use futures::{Future, Sink, Stream, future, stream};
 use hyper::{Method, StatusCode};
-use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, CacheControl,
-                    CacheDirective, Charset, ContentDisposition, ContentLength, ContentType,
-                    DispositionParam, DispositionType};
+use hyper::header::{AcceptRanges, AccessControlAllowMethods, AccessControlAllowOrigin,
+                    ByteRangeSpec, CacheControl, CacheDirective, Charset, ContentDisposition,
+                    ContentLength, ContentRange, ContentRangeSpec, ContentType, DispositionParam,
+                    DispositionType, Range, RangeUnit};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
@@ -112,7 +113,7 @@ impl FlowService {
             Some(&ContentLength(length)) => length,
             None => return future::err(Error::Invalid).boxed(),
         };
-        if content_length == 0u64 || content_length > 4096u64 {
+        if content_length == 0 || content_length > 4096 {
             return future::err(Error::Invalid).boxed();
         }
         req.body()
@@ -146,7 +147,7 @@ impl FlowService {
                     meta_capacity,
                     data_capacity,
                     keepcount: Some(1),
-                    preserve_mode: false,
+                    preserve_mode: true,
                 });
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
@@ -339,29 +340,79 @@ impl FlowService {
             };
             response.headers_mut().set(content_disp);
         }
-        let (pull_fut, tail_index) = {
+        let (pull_fut, mut chunk_index, mut skip_len) = {
             let flow = flow_ptr.read().unwrap();
             let (tail_index, _) = flow.get_range();
             let config = flow.get_config();
+            let mut skip_len = 0;
             if let Some(length) = config.length {
-                // Only set content length when the flow is still complete.
-                if tail_index == 0 {
+                if let Some(range) = req.headers().get::<Range>() {
+                    let range_start = match *range {
+                        Range::Bytes(ref ranges) if ranges.len() == 1 => {
+                            match ranges[0] {
+                                ByteRangeSpec::FromTo(start, _) |
+                                ByteRangeSpec::AllFrom(start) => Some(start),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(range_start) = range_start {
+                        let tail_offset = flow.get_statistic().dropped;
+                        if range_start < tail_offset {
+                            return future::ok(Response::new().with_status(StatusCode::NotFound))
+                                .boxed();
+                        } else if range_start >= length {
+                            return future::ok(
+                                Response::new()
+                                    .with_status(StatusCode::RangeNotSatisfiable)
+                                    .with_header(ContentRange(ContentRangeSpec::Bytes {
+                                        range: None,
+                                        instance_length: Some(length),
+                                    })),
+                            ).boxed();
+                        } else {
+                            skip_len = range_start - tail_offset;
+                            response.set_status(StatusCode::PartialContent);
+                            response.headers_mut().set(ContentRange(ContentRangeSpec::Bytes {
+                                range: Some((range_start, length - 1)),
+                                instance_length: Some(length),
+                            }));
+                            response.headers_mut().set(ContentLength(length - range_start));
+                        }
+                    } else {
+                        return future::ok(Response::new().with_status(StatusCode::NotFound))
+                            .boxed();
+                    }
+                } else if tail_index == 0 {
+                    // Only set content length when the flow is still complete.
+                    response.headers_mut().set(AcceptRanges(vec![RangeUnit::Bytes]));
                     response.headers_mut().set(ContentLength(length));
                 }
             }
-            (flow.pull(tail_index, None), tail_index)
+            (flow.pull(tail_index, None), tail_index, skip_len)
         };
         let remote = self.remote.clone();
         pull_fut
             .and_then(move |chunk| {
-                let body_stream = stream::unfold(Some((tail_index, chunk)), move |previous| {
+                let body_stream = stream::unfold(Some(chunk), move |previous| {
                     // Check if the flow is EOF.
-                    if let Some((prev_index, prev_chunk)) = previous {
+                    if let Some(prev_chunk) = previous {
                         let flow = flow_ptr.read().unwrap();
-                        let chunk_index = prev_index + 1;
-                        let hyper_chunk = Ok(prev_chunk.into());
+                        let prev_chunk_len = prev_chunk.len() as u64;
+                        let hyper_chunk: Result<hyper::Chunk, _> = if skip_len == 0 {
+                            Ok(prev_chunk.into())
+                        } else if prev_chunk_len <= skip_len {
+                            skip_len -= prev_chunk_len;
+                            Ok(vec![].into())
+                        } else {
+                            let slice_chunk = prev_chunk.slice_from(skip_len as usize);
+                            skip_len = 0;
+                            Ok(slice_chunk.into())
+                        };
+                        chunk_index += 1;
                         let fut = flow.pull(chunk_index, None).then(move |ret| match ret {
-                            Ok(chunk) => future::ok((hyper_chunk, Some((chunk_index, chunk)))),
+                            Ok(chunk) => future::ok((hyper_chunk, Some(chunk))),
                             Err(_) => future::ok((hyper_chunk, None)),
                         });
                         Some(fut)
