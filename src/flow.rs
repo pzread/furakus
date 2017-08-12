@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::{Future, future};
+use futures::{future, Future};
 use futures::sync::oneshot;
 use std::collections::{HashMap, VecDeque};
 use std::mem;
@@ -70,6 +70,7 @@ pub struct Config {
     pub preserve_mode: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Statistic {
     pub pushed: u64,
     pub dropped: u64,
@@ -478,15 +479,50 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(payload2.clone().into()), Ok(1));
         let fut = ptr.write().unwrap().push(payload3.clone().into());
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
         sync_assert_eq!(fut, Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
         let fut = ptr.write().unwrap().push(payload3.clone().into());
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
         sync_assert_eq!(fut, Ok(3));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Dropped));
         assert_eq!(ptr.read().unwrap().get_range(), (2, 4));
+        assert_eq!(
+            ptr.read().unwrap().get_statistic(),
+            &Statistic {
+                pushed: (payload1.len() + payload2.len() + payload3.len() * 2) as u64,
+                dropped: (payload1.len() + payload2.len()) as u64,
+                buffered: (payload3.len() * 2) as u64,
+            }
+        );
+
+        let ptr = Flow::new(Config {
+            length: None,
+            meta_capacity: (REF_SIZE * 2) as u64,
+            data_capacity: (REF_SIZE * 2) as u64,
+            keepcount: Some(1),
+            preserve_mode: true,
+        });
+        sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
+        sync_assert_eq!(ptr.write().unwrap().push(payload2.clone().into()), Ok(1));
+        let fut = ptr.write().unwrap().push(payload3.clone().into());
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
+        sync_assert_eq!(fut, Ok(2));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
+        assert_eq!(ptr.read().unwrap().get_range(), (1, 3));
+        assert_eq!(
+            ptr.read().unwrap().get_statistic(),
+            &Statistic {
+                pushed: (payload1.len() + payload2.len() + payload3.len()) as u64,
+                dropped: payload1.len() as u64,
+                buffered: (payload2.len() + payload3.len()) as u64,
+            }
+        );
     }
 
     #[test]
@@ -535,9 +571,7 @@ mod tests {
 
         sync_assert_eq!(ptr.write().unwrap().push("B".into()), Err(Error::NotReady));
 
-        let next_index = {
-            ptr.read().unwrap().get_range().1
-        };
+        let next_index = { ptr.read().unwrap().get_range().1 };
         for idx in 0..next_index {
             sync_assert_eq!(ptr.read().unwrap().pull(idx, Some(0)), Ok("A".into()));
         }
@@ -606,6 +640,19 @@ mod tests {
 
     #[test]
     fn nonblocking() {
+        fn run_test(ptr: Arc<RwLock<Flow>>) {
+            let payload = vec![0u8; REF_SIZE];
+
+            for idx in 0..16 {
+                sync_assert_eq!(ptr.write().unwrap().push(payload.clone().into()), Ok(idx));
+            }
+            sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(16));
+
+            sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
+            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
+            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.into()));
+        }
+
         let ptr = Flow::new(Config {
             length: None,
             meta_capacity: (REF_SIZE * 16) as u64,
@@ -613,16 +660,16 @@ mod tests {
             keepcount: None,
             preserve_mode: false,
         });
-        let payload = vec![0u8; REF_SIZE];
+        run_test(ptr);
 
-        for idx in 0..16 {
-            sync_assert_eq!(ptr.write().unwrap().push(payload.clone().into()), Ok(idx));
-        }
-        sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(16));
-
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.into()));
+        let ptr = Flow::new(Config {
+            length: None,
+            meta_capacity: (REF_SIZE * 16) as u64,
+            data_capacity: (REF_SIZE * 16) as u64,
+            keepcount: None,
+            preserve_mode: true,
+        });
+        run_test(ptr);
     }
 
     #[test]
@@ -710,5 +757,17 @@ mod tests {
         });
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Err(Error::Invalid));
+
+        let ptr = Flow::new(Config {
+            length: None,
+            meta_capacity: 0,
+            data_capacity: 0,
+            keepcount: None,
+            preserve_mode: true,
+        });
+        for idx in 0..100 {
+            sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
+        }
+        assert_eq!(ptr.read().unwrap().get_range(), (100, 100));
     }
 }
