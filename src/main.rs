@@ -28,7 +28,7 @@ use hyper::{Method, StatusCode};
 use hyper::header::{AcceptRanges, AccessControlAllowMethods, AccessControlAllowOrigin,
                     ByteRangeSpec, CacheControl, CacheDirective, Charset, ContentDisposition,
                     ContentLength, ContentRange, ContentRangeSpec, ContentType, DispositionParam,
-                    DispositionType, Range, RangeUnit};
+                    DispositionType, ETag, EntityTag, Range, RangeUnit};
 use hyper::server::{Http, Request, Response, Service};
 use pool::Pool;
 use regex::Regex;
@@ -326,6 +326,7 @@ impl FlowService {
         let mut response = Response::new()
             .with_header(ContentType::octet_stream())
             .with_header(CacheControl(vec![CacheDirective::NoCache]))
+            .with_header(ETag(EntityTag::new(false, flow_id.to_owned())))
             .with_body(body);
         if let Some(filename) = opt_filename {
             let content_disp = ContentDisposition {
