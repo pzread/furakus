@@ -470,6 +470,8 @@ fn start_service(
                     data_capacity,
                     auth_ptr.clone(),
                 );
+                // 4x REF_SIZE should be enough for sending a chunk.
+                io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                 http.bind_connection(&handle, io, addr, service);
                 Ok(())
             });
