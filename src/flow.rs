@@ -6,6 +6,8 @@ use std::mem;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use uuid::Uuid;
 
+pub const REF_SIZE: usize = 32768;
+
 #[derive(Debug, PartialEq)]
 pub enum Error {
     Invalid,
@@ -398,9 +400,6 @@ impl Flow {
         }).boxed()
     }
 }
-
-#[cfg(test)]
-pub const REF_SIZE: usize = 32768;
 
 #[cfg(test)]
 mod tests {
