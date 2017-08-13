@@ -1466,6 +1466,25 @@ mod tests {
 
         let mut req =
             Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::Last(0)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![
+            ByteRangeSpec::FromTo(MAX_CAPACITY * 4, MAX_CAPACITY * 4),
+            ByteRangeSpec::FromTo(MAX_CAPACITY * 4, MAX_CAPACITY * 4),
+        ]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
         req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::AllFrom(0)]));
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::NotFound);
