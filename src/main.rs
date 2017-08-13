@@ -206,9 +206,9 @@ impl FlowService {
         req.body()
             .for_each(move |chunk| {
                 let mut flow = flow_ptr.write().unwrap();
-                flow.push(chunk.into_bytes()).map(|_| ()).map_err(
-                    |_| hyper::error::Error::Incomplete,
-                )
+                flow.push(chunk.into_bytes())
+                    .map(|_| ())
+                    .map_err(|_| hyper::error::Error::Incomplete)
             })
             .and_then(|_| Ok(Self::response_ok()))
             .or_else(|_| Ok(Self::response_error("Not Ready")))
@@ -1503,9 +1503,9 @@ mod tests {
         fn call(&self, uri: Uri) -> Self::Future {
             let tls_connector = self.tls.clone();
             Box::new(self.http.call(uri).and_then(move |io| {
-                tls_connector.connect_async("example.com", io).map_err(|err| {
-                    io::Error::new(io::ErrorKind::Other, err)
-                })
+                tls_connector
+                    .connect_async("example.com", io)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
             }))
         }
     }
