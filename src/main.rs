@@ -26,11 +26,12 @@ mod utils;
 use auth::{Authorizer, HMACAuthorizer};
 use dotenv::dotenv;
 use flow::Flow;
-use futures::{Future, Sink, Stream, future, stream};
+use futures::{future, stream, Future, Sink, Stream};
 use hyper::{Method, StatusCode};
-use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, CacheControl,
-                    CacheDirective, Charset, ContentDisposition, ContentLength, ContentType,
-                    DispositionParam, DispositionType};
+use hyper::header::{AcceptRanges, AccessControlAllowMethods, AccessControlAllowOrigin,
+                    ByteRangeSpec, CacheControl, CacheDirective, Charset, ContentDisposition,
+                    ContentLength, ContentRange, ContentRangeSpec, ContentType, DispositionParam,
+                    DispositionType, ETag, EntityTag, Range, RangeUnit};
 use hyper::server::{Http, Request, Response, Service};
 use native_tls::{TlsAcceptor, TlsAcceptorBuilder};
 use native_tls::backend::openssl::TlsAcceptorBuilderExt;
@@ -67,6 +68,7 @@ struct FlowService {
 #[derive(Serialize, Deserialize)]
 struct NewRequest {
     pub size: Option<u64>,
+    pub preserve_mode: bool,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -79,6 +81,8 @@ struct NewResponse {
 struct StatusResponse {
     pub tail: u64,
     pub next: u64,
+    pub dropped: u64,
+    pub pushed: u64,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -121,7 +125,7 @@ impl FlowService {
             Some(&ContentLength(length)) => length,
             None => return future::err(Error::Invalid).boxed(),
         };
-        if content_length == 0u64 || content_length > 4096u64 {
+        if content_length == 0 || content_length > 4096 {
             return future::err(Error::Invalid).boxed();
         }
         req.body()
@@ -136,7 +140,9 @@ impl FlowService {
     }
 
     fn response_error(error: &str) -> Response {
-        let body = serde_json::to_string(&ErrorResponse { message: error.to_owned() }).unwrap();
+        let body = serde_json::to_string(&ErrorResponse {
+            message: error.to_owned(),
+        }).unwrap();
         Response::new()
             .with_status(StatusCode::BadRequest)
             .with_header(ContentLength(body.len() as u64))
@@ -155,6 +161,7 @@ impl FlowService {
                     meta_capacity,
                     data_capacity,
                     keepcount: Some(1),
+                    preserve_mode: param.preserve_mode,
                 });
                 let flow_id = flow_ptr.read().unwrap().id.to_owned();
                 {
@@ -243,7 +250,13 @@ impl FlowService {
         let body = {
             let flow = flow_ptr.read().unwrap();
             let (tail, next) = flow.get_range();
-            serde_json::to_string(&StatusResponse { tail, next }).unwrap()
+            let statistic = flow.get_statistic();
+            serde_json::to_string(&StatusResponse {
+                tail,
+                next,
+                dropped: statistic.dropped,
+                pushed: statistic.pushed,
+            }).unwrap()
         }.into_bytes();
         future::ok(
             Response::new()
@@ -302,6 +315,7 @@ impl FlowService {
         let mut response = Response::new()
             .with_header(ContentType::octet_stream())
             .with_header(CacheControl(vec![CacheDirective::NoCache]))
+            .with_header(ETag(EntityTag::new(false, flow_id.to_owned())))
             .with_body(body);
         if let Some(filename) = opt_filename {
             let content_disp = ContentDisposition {
@@ -310,35 +324,84 @@ impl FlowService {
                     DispositionParam::Filename(
                         Charset::Ext("UTF-8".into()),
                         Some(langtag!(en)),
-                        filename.as_bytes().to_vec()
+                        filename.as_bytes().to_vec(),
                     ),
                 ],
             };
             response.headers_mut().set(content_disp);
         }
-        let (pull_fut, tail_index) = {
+        let (pull_fut, mut chunk_index, mut skip_len) = {
             let flow = flow_ptr.read().unwrap();
             let (tail_index, _) = flow.get_range();
             let config = flow.get_config();
+            let mut skip_len = 0;
             if let Some(length) = config.length {
-                // Only set content length when the flow is still complete.
-                if tail_index == 0 {
+                if let Some(range) = req.headers().get::<Range>() {
+                    let range_start = match *range {
+                        Range::Bytes(ref ranges) if ranges.len() == 1 => match ranges[0] {
+                            ByteRangeSpec::FromTo(start, _) | ByteRangeSpec::AllFrom(start) => {
+                                Some(start)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(range_start) = range_start {
+                        let tail_offset = flow.get_statistic().dropped;
+                        if range_start < tail_offset {
+                            return future::ok(Response::new().with_status(StatusCode::NotFound))
+                                .boxed();
+                        } else if range_start >= length {
+                            return future::ok(
+                                Response::new()
+                                    .with_status(StatusCode::RangeNotSatisfiable)
+                                    .with_header(ContentRange(ContentRangeSpec::Bytes {
+                                        range: None,
+                                        instance_length: Some(length),
+                                    })),
+                            ).boxed();
+                        } else {
+                            skip_len = range_start - tail_offset;
+                            response.set_status(StatusCode::PartialContent);
+                            response.headers_mut().set(ContentRange(ContentRangeSpec::Bytes {
+                                range: Some((range_start, length - 1)),
+                                instance_length: Some(length),
+                            }));
+                            response.headers_mut().set(ContentLength(length - range_start));
+                        }
+                    } else {
+                        return future::ok(Response::new().with_status(StatusCode::NotFound))
+                            .boxed();
+                    }
+                } else if tail_index == 0 {
+                    // Only set content length when the flow is still complete.
+                    response.headers_mut().set(AcceptRanges(vec![RangeUnit::Bytes]));
                     response.headers_mut().set(ContentLength(length));
                 }
             }
-            (flow.pull(tail_index, None), tail_index)
+            (flow.pull(tail_index, None), tail_index, skip_len)
         };
         let remote = self.remote.clone();
         pull_fut
             .and_then(move |chunk| {
-                let body_stream = stream::unfold(Some((tail_index, chunk)), move |previous| {
+                let body_stream = stream::unfold(Some(chunk), move |previous| {
                     // Check if the flow is EOF.
-                    if let Some((prev_index, prev_chunk)) = previous {
+                    if let Some(prev_chunk) = previous {
                         let flow = flow_ptr.read().unwrap();
-                        let chunk_index = prev_index + 1;
-                        let hyper_chunk = Ok(prev_chunk.into());
+                        let prev_chunk_len = prev_chunk.len() as u64;
+                        let hyper_chunk: Result<hyper::Chunk, _> = if skip_len == 0 {
+                            Ok(prev_chunk.into())
+                        } else if prev_chunk_len <= skip_len {
+                            skip_len -= prev_chunk_len;
+                            Ok(vec![].into())
+                        } else {
+                            let slice_chunk = prev_chunk.slice_from(skip_len as usize);
+                            skip_len = 0;
+                            Ok(slice_chunk.into())
+                        };
+                        chunk_index += 1;
                         let fut = flow.pull(chunk_index, None).then(move |ret| match ret {
-                            Ok(chunk) => future::ok((hyper_chunk, Some((chunk_index, chunk)))),
+                            Ok(chunk) => future::ok((hyper_chunk, Some(chunk))),
                             Err(_) => future::ok((hyper_chunk, None)),
                         });
                         Some(fut)
@@ -377,40 +440,32 @@ impl Service for FlowService {
 
         let path = &req.path().to_owned();
         match req.method() {
-            &Method::Post => {
-                if let Some(route) = PATTERN_NEW.captures(path) {
-                    self.handle_new(req, route)
-                } else if let Some(route) = PATTERN_PUSH.captures(path) {
-                    self.handle_push(req, route)
-                } else if let Some(route) = PATTERN_EOF.captures(path) {
-                    self.handle_eof(req, route)
-                } else if let Some(route) = PATTERN_STATUS.captures(path) {
-                    self.handle_status(req, route)
-                } else {
-                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
-                }
-            }
-            &Method::Put => {
-                if let Some(route) = PATTERN_PUSH.captures(path) {
-                    self.handle_push(req, route)
-                } else {
-                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
-                }
-            }
-            &Method::Get => {
-                if let Some(route) = PATTERN_FETCH.captures(path) {
-                    self.handle_fetch(req, route)
-                } else if let Some(route) = PATTERN_PULL.captures(path) {
-                    self.handle_pull(req, route)
-                } else {
-                    future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
-                }
-            }
-            &Method::Options => {
-                future::ok(Response::new().with_header(AccessControlAllowMethods(
-                    vec![Method::Post, Method::Put, Method::Get, Method::Options],
-                ))).boxed()
-            }
+            &Method::Post => if let Some(route) = PATTERN_NEW.captures(path) {
+                self.handle_new(req, route)
+            } else if let Some(route) = PATTERN_PUSH.captures(path) {
+                self.handle_push(req, route)
+            } else if let Some(route) = PATTERN_EOF.captures(path) {
+                self.handle_eof(req, route)
+            } else if let Some(route) = PATTERN_STATUS.captures(path) {
+                self.handle_status(req, route)
+            } else {
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+            },
+            &Method::Put => if let Some(route) = PATTERN_PUSH.captures(path) {
+                self.handle_push(req, route)
+            } else {
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+            },
+            &Method::Get => if let Some(route) = PATTERN_FETCH.captures(path) {
+                self.handle_fetch(req, route)
+            } else if let Some(route) = PATTERN_PULL.captures(path) {
+                self.handle_pull(req, route)
+            } else {
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+            },
+            &Method::Options => future::ok(Response::new().with_header(AccessControlAllowMethods(
+                vec![Method::Post, Method::Put, Method::Get, Method::Options],
+            ))).boxed(),
             _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed(),
         }.map(|res| res.with_header(AccessControlAllowOrigin::Any))
             .boxed()
@@ -487,6 +542,8 @@ fn start_service(
                                     data_capacity,
                                     auth_ptr,
                                 );
+                                // 4x REF_SIZE should be enough for sending a chunk.
+                                io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                                 Http::new().bind_connection(&handle, io, addr, service);
                                 Ok(())
                             })
@@ -501,12 +558,14 @@ fn start_service(
                             data_capacity,
                             auth_ptr.clone(),
                         );
+                        // 4x REF_SIZE should be enough for sending a chunk.
+                        io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                         Http::new().bind_connection(&handle, io, addr, service);
                         Ok(())
                     }))
                 };
-            barrier.wait();
             println!("Worker #{} is started.", idx);
+            barrier.wait();
             core.run(acceptor).unwrap();
         });
         workers.push(worker);
@@ -548,27 +607,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow;
-    use futures::{Future, Sink, Stream, future, stream};
-    use hyper;
-    use hyper::{Method, Request, StatusCode, Uri};
     use hyper::client::{Client, HttpConnector};
-    use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, CacheControl,
-                        CacheDirective, ContentDisposition, ContentLength};
-    use hyper::server::Service;
     use native_tls::{Certificate, TlsConnector};
-    use regex::Regex;
-    use serde_json;
-    use std::{io, str, thread};
     use std::collections::HashSet;
     use std::sync::mpsc;
-    use std::time::Duration;
-    use tokio::net::TcpStream;
-    use tokio::reactor::Core;
-    use tokio_tls::{TlsConnectorExt, TlsStream};
-    use url;
+    use tokio_tls::TlsConnectorExt;
 
     const MAX_CAPACITY: u64 = 1048576;
+    const DEFL_FLOW_PARAM: &str = r#"{"preserve_mode": false}"#;
 
     fn spawn_server() -> (String, String) {
         let port = start_service(
@@ -595,9 +641,9 @@ mod tests {
 
         let data = core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
-            res.body().concat2().and_then(
-                |body| Ok(serde_json::from_slice::<NewResponse>(&body).unwrap()),
-            )
+            res.body()
+                .concat2()
+                .and_then(|body| Ok(serde_json::from_slice::<NewResponse>(&body).unwrap()))
         })).unwrap();
 
         (data.id, data.token)
@@ -744,6 +790,10 @@ mod tests {
                     res.headers().get::<CacheControl>().unwrap(),
                     &CacheControl(vec![CacheDirective::NoCache])
                 );
+                assert_eq!(
+                    res.headers().get::<ETag>().unwrap(),
+                    &ETag(EntityTag::new(false, flow_id.to_owned()))
+                );
             }
             let fut = if status_code == StatusCode::Ok {
                 res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
@@ -774,7 +824,7 @@ mod tests {
     #[test]
     fn validate_route() {
         let (ref prefix, _) = spawn_server();
-        let (ref flow_id, _) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, _) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         fn check_status(req: Request, status_code: StatusCode) -> Response {
             let mut core = Core::new().unwrap();
@@ -862,8 +912,9 @@ mod tests {
         let client = Client::new(&core.handle());
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{}"#);
-        req.headers_mut().set(ContentLength(2));
+        let param = r#"{"preserve_mode": false}"#;
+        req.set_body(param);
+        req.headers_mut().set(ContentLength(param.len() as u64));
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat2().and_then(|body| {
@@ -875,8 +926,9 @@ mod tests {
         })).unwrap();
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{"size": 4096}"#);
-        req.headers_mut().set(ContentLength(14));
+        let param = r#"{"size": 4096, "preserve_mode": false}"#;
+        req.set_body(param);
+        req.headers_mut().set(ContentLength(param.len() as u64));
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat2().and_then(|body| {
@@ -888,14 +940,15 @@ mod tests {
         })).unwrap();
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{}"#);
+        req.set_body(r#"{"preserve_mode": false}"#);
         core.run(
             client.request(req).and_then(|res| check_error_response(res, "Invalid Parameter")),
         ).unwrap();
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{"size": 4O96}"#);
-        req.headers_mut().set(ContentLength(14));
+        let param = r#"{"size": 4O96, "preserve_mode": false}"#;
+        req.set_body(param);
+        req.headers_mut().set(ContentLength(param.len() as u64));
         core.run(
             client.request(req).and_then(|res| check_error_response(res, "Invalid Parameter")),
         ).unwrap();
@@ -908,7 +961,7 @@ mod tests {
         ).unwrap();
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{"size": 4096}"#);
+        req.set_body(r#"{"preserve_mode": false}"#);
         req.headers_mut().set(ContentLength(4097));
         core.run(
             client.request(req).and_then(|res| check_error_response(res, "Invalid Parameter")),
@@ -916,7 +969,7 @@ mod tests {
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
         let mut body = vec![65u8; 4096];
-        body.extend_from_slice(r#"{"size": 4096}"#.as_bytes());
+        body.extend_from_slice(r#"{"preserve_mode": false}"#.as_bytes());
         req.set_body(body);
         req.headers_mut().set(ContentLength(4096));
         core.run(
@@ -924,7 +977,7 @@ mod tests {
         ).unwrap();
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        let mut body = r#"{"size": 4096}"#.to_string();
+        let mut body = r#"{"preserve_mode": false}"#.to_string();
         body.extend(&vec![' '; 4096]);
         req.set_body(body);
         req.headers_mut().set(ContentLength(4096));
@@ -945,7 +998,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         let mal_token = "sjlc(84c84w47wq87a";
         let fake_token = "bdc62e9323003d0f5cb44c8c745a0470bdc62e9323003d0f5cb44c8c745a0470";
@@ -1020,7 +1073,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
         let payload = vec![1u8; flow::REF_SIZE * 10];
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
 
         let thd = {
@@ -1043,7 +1096,7 @@ mod tests {
         assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload)));
         thd.join().unwrap();
 
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
 
@@ -1064,7 +1117,7 @@ mod tests {
                     DispositionParam::Filename(
                         Charset::Ext("UTF-8".into()),
                         Some(langtag!(en)),
-                        filename.as_bytes().to_vec()
+                        filename.as_bytes().to_vec(),
                     ),
                 ],
             };
@@ -1072,7 +1125,7 @@ mod tests {
             Ok(())
         })).unwrap();
 
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
         assert_eq!(req_pull(prefix, flow_id), (StatusCode::NotFound, None));
     }
@@ -1082,7 +1135,7 @@ mod tests {
         let prefix = &spawn_server().0;
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         let mal_token = "sjlc(84c84w47wq87a";
         let fake_token = "bdc62e9323003d0f5cb44c8c745a0470bdc62e9323003d0f5cb44c8c745a0470";
@@ -1096,10 +1149,10 @@ mod tests {
         assert_eq!(req_close(prefix, flow_id, mal_token), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id, fake_token), (StatusCode::NotFound, None));
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (
-            StatusCode::BadRequest,
-            Some("Not Ready".to_string()),
-        ));
+        assert_eq!(
+            req_push(prefix, flow_id, token, b"Hello"),
+            (StatusCode::BadRequest, Some("Not Ready".to_string()),)
+        );
         assert_eq!(
             req_close(prefix, flow_id, token),
             (StatusCode::BadRequest, Some("Closed".to_string()))
@@ -1111,7 +1164,7 @@ mod tests {
     #[test]
     fn recycle_and_release() {
         let prefix = &spawn_server().0;
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         let (tx, rx) = mpsc::channel();
         let thd = {
@@ -1142,7 +1195,7 @@ mod tests {
     #[test]
     fn dropped() {
         let prefix = &spawn_server().0;
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
 
@@ -1150,14 +1203,17 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, payload2), (StatusCode::Ok, None));
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(payload1.to_vec())));
+        assert_eq!(
+            req_pull(prefix, flow_id),
+            (StatusCode::Ok, Some([payload1, payload2].concat()))
+        );
         assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::NotFound, None));
-        assert_eq!(req_pull(prefix, flow_id), (StatusCode::Ok, Some(payload2.to_vec())));
     }
 
     #[test]
     fn full_push() {
         let prefix = &spawn_server().0;
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
 
@@ -1192,10 +1248,10 @@ mod tests {
         }
         rx.recv().unwrap();
 
-        assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (
-            StatusCode::BadRequest,
-            Some("Not Ready".to_string()),
-        ));
+        assert_eq!(
+            req_push(prefix, flow_id, token, b"Hello"),
+            (StatusCode::BadRequest, Some("Not Ready".to_string()),)
+        );
 
         req_pull(prefix, flow_id);
         rx.recv().unwrap();
@@ -1204,7 +1260,7 @@ mod tests {
     #[test]
     fn racing_pull() {
         let prefix = &spawn_server().0;
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         let (send_tx, send_rx) = mpsc::channel();
 
@@ -1287,14 +1343,14 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         for _ in 1..32 {
-            create_flow(prefix, r#"{}"#);
+            create_flow(prefix, DEFL_FLOW_PARAM);
         }
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{}"#);
-        req.headers_mut().set(ContentLength(2));
+        req.set_body(DEFL_FLOW_PARAM);
+        req.headers_mut().set(ContentLength(DEFL_FLOW_PARAM.len() as u64));
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::ServiceUnavailable);
             Ok(())
@@ -1304,12 +1360,12 @@ mod tests {
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         thread::sleep(Duration::from_secs(4));
         for _ in 0..31 {
-            create_flow(prefix, r#"{}"#);
+            create_flow(prefix, DEFL_FLOW_PARAM);
         }
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{}"#);
-        req.headers_mut().set(ContentLength(2));
+        req.set_body(DEFL_FLOW_PARAM);
+        req.headers_mut().set(ContentLength(DEFL_FLOW_PARAM.len() as u64));
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::ServiceUnavailable);
             Ok(())
@@ -1319,14 +1375,22 @@ mod tests {
     #[test]
     fn handle_status() {
         let prefix = &spawn_server().0;
-        let (ref flow_id, ref token) = create_flow(prefix, r#"{}"#);
+        let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         assert_eq!(req_status(prefix, fake_id), (StatusCode::NotFound, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
         assert_eq!(
             req_status(prefix, flow_id),
-            (StatusCode::Ok, Some(StatusResponse { tail: 0, next: 2 }))
+            (
+                StatusCode::Ok,
+                Some(StatusResponse {
+                    tail: 0,
+                    next: 2,
+                    dropped: 0,
+                    pushed: 10,
+                }),
+            )
         );
     }
 
@@ -1336,19 +1400,18 @@ mod tests {
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
-        let param = serde_json::to_vec(&NewRequest { size: Some(5) }).unwrap();
+        let param = serde_json::to_vec(&NewRequest {
+            size: Some(5),
+            preserve_mode: false,
+        }).unwrap();
         let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
 
         assert_eq!(req_push(prefix, flow_id, token, b"Hel"), (StatusCode::Ok, None));
-        assert_eq!(req_push(prefix, flow_id, token, b"World"), (
-            StatusCode::BadRequest,
-            Some("Not Ready".to_string()),
-        ));
+        assert_eq!(
+            req_push(prefix, flow_id, token, b"World"),
+            (StatusCode::BadRequest, Some("Not Ready".to_string()),)
+        );
         assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
-        assert_eq!(req_push(prefix, flow_id, token, b"World"), (
-            StatusCode::BadRequest,
-            Some("Not Ready".to_string()),
-        ));
         assert_eq!(
             req_close(prefix, flow_id, token),
             (StatusCode::BadRequest, Some("Closed".to_string()))
@@ -1365,38 +1428,17 @@ mod tests {
             })
         })).unwrap();
 
-        let param = serde_json::to_vec(&NewRequest { size: Some(0) }).unwrap();
+        let param = serde_json::to_vec(&NewRequest {
+            size: Some(0),
+            preserve_mode: false,
+        }).unwrap();
         let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
 
-        assert_eq!(req_push(prefix, flow_id, token, b"A"), (
-            StatusCode::BadRequest,
-            Some("Not Ready".to_string()),
-        ));
+        assert_eq!(
+            req_push(prefix, flow_id, token, b"A"),
+            (StatusCode::BadRequest, Some("Not Ready".to_string()),)
+        );
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
-    }
-
-    #[test]
-    fn dropped_fixed_length() {
-        let prefix = &spawn_server().0;
-        let mut core = Core::new().unwrap();
-        let client = Client::new(&core.handle());
-        let param = serde_json::to_vec(&NewRequest { size: Some(5) }).unwrap();
-        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
-
-        assert_eq!(req_push(prefix, flow_id, token, b"Hel"), (StatusCode::Ok, None));
-        assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
-        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(b"Hel".to_vec())));
-
-        let req =
-            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            assert!(res.headers().get::<ContentLength>().is_none());
-            res.body().concat2().and_then(|body| {
-                assert_eq!(body.to_vec(), b"lo".to_vec());
-                Ok(())
-            })
-        })).unwrap();
     }
 
     #[test]
@@ -1488,5 +1530,133 @@ mod tests {
         } else {
             assert_eq!(res, false);
         }
+    }
+
+    #[test]
+    fn preserve_mode() {
+        let prefix = &spawn_server().0;
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let param = serde_json::to_vec(&NewRequest {
+            size: Some(MAX_CAPACITY * 4),
+            preserve_mode: true,
+        }).unwrap();
+        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
+
+        let thd1 = {
+            let prefix = prefix.to_owned();
+            let flow_id = flow_id.to_owned();
+            let token = token.to_owned();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                let token = &token;
+                let payload = vec![0u8; flow::REF_SIZE];
+                for _ in 0..(MAX_CAPACITY * 2) / flow::REF_SIZE as u64 {
+                    assert_eq!(req_push(prefix, flow_id, token, &payload), (StatusCode::Ok, None))
+                }
+            })
+        };
+
+        let req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            assert_eq!(
+                res.headers().get::<AcceptRanges>().unwrap(),
+                &AcceptRanges(vec![RangeUnit::Bytes])
+            );
+            let mut partial_len = 0;
+            res.body()
+                .take_while(move |chunk| {
+                    partial_len += chunk.len();
+                    Ok((partial_len as u64) < MAX_CAPACITY)
+                })
+                .for_each(|_| Ok(()))
+        })).unwrap();
+
+        thd1.join().unwrap();
+
+        let status = req_status(prefix, flow_id).1.unwrap();
+
+        let thd2 = {
+            let prefix = prefix.to_owned();
+            let flow_id = flow_id.to_owned();
+            let token = token.to_owned();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                let token = &token;
+                let payload = vec![1u8; flow::REF_SIZE];
+                for _ in 0..(MAX_CAPACITY * 2) / flow::REF_SIZE as u64 {
+                    assert_eq!(req_push(prefix, flow_id, token, &payload), (StatusCode::Ok, None))
+                }
+            })
+        };
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::Last(0)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![
+            ByteRangeSpec::FromTo(MAX_CAPACITY * 4, MAX_CAPACITY * 4),
+            ByteRangeSpec::FromTo(MAX_CAPACITY * 4, MAX_CAPACITY * 4),
+        ]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::AllFrom(0)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut()
+            .set(Range::Bytes(vec![ByteRangeSpec::FromTo(MAX_CAPACITY * 4, MAX_CAPACITY * 4)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::RangeNotSatisfiable);
+            assert_eq!(
+                res.headers().get::<ContentRange>().unwrap(),
+                &ContentRange(ContentRangeSpec::Bytes {
+                    range: None,
+                    instance_length: Some(MAX_CAPACITY * 4),
+                })
+            );
+            Ok(())
+        })).unwrap();
+
+        let range_start = (status.pushed + status.dropped) / 2 + 1;
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::AllFrom(range_start)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::PartialContent);
+            assert_eq!(
+                res.headers().get::<ContentRange>().unwrap(),
+                &ContentRange(ContentRangeSpec::Bytes {
+                    range: Some((range_start, MAX_CAPACITY * 4 - 1)),
+                    instance_length: Some(MAX_CAPACITY * 4),
+                })
+            );
+            res.body().concat2().and_then(|body| {
+                assert_eq!(body.len() as u64, MAX_CAPACITY * 4 - range_start);
+                Ok(())
+            })
+        })).unwrap();
+
+        thd2.join().unwrap();
     }
 }
