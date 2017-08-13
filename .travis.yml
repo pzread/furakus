@@ -1,12 +1,11 @@
 language: rust
 
+sudo: false
+
 cache: cargo
 
 rust:
   - stable
-
-before_install:
-  - sudo apt-get update
 
 env:
   global:

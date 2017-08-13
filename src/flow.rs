@@ -74,7 +74,6 @@ pub struct Config {
 pub struct Statistic {
     pub pushed: u64,
     pub dropped: u64,
-    pub buffered: u64,
 }
 
 pub struct Flow {
@@ -113,7 +112,6 @@ impl Flow {
             statistic: Statistic {
                 pushed: 0,
                 dropped: 0,
-                buffered: 0,
             },
             state: State::Streaming,
             next_index: 0,
@@ -168,7 +166,7 @@ impl Flow {
     }
 
     fn check_overflow(&self) -> bool {
-        if self.statistic.buffered > self.config.data_capacity {
+        if self.statistic.pushed - self.statistic.dropped > self.config.data_capacity {
             return true;
         }
         if self.bucket.len() as u64 > self.bucket_capacity {
@@ -186,16 +184,16 @@ impl Flow {
         // The order of following code is important. First check and return immediately if failed,
         // then update consistently.
 
-        let (new_pushed, new_buffered) = match chunk {
+        let new_pushed = match chunk {
             // EOF chunk ignores any overflow check.
-            Chunk::Eof(..) => (self.statistic.pushed, self.statistic.buffered),
+            Chunk::Eof(..) => self.statistic.pushed,
             _ => {
                 // Check if the flow is already overflow. Return if failed.
                 if self.check_overflow() {
                     return Err(Error::NotReady);
                 }
                 // Check statistic. Return if failed.
-                let new_pushed = match self.statistic.pushed.checked_add(chunk_len) {
+                match self.statistic.pushed.checked_add(chunk_len) {
                     Some(new_pushed) => {
                         if let Some(length) = self.config.length {
                             // Check if the length is over.
@@ -206,12 +204,7 @@ impl Flow {
                         new_pushed
                     }
                     None => return Err(Error::Invalid),
-                };
-                let new_buffered = match self.statistic.buffered.checked_add(chunk_len) {
-                    Some(new_buffered) => new_buffered,
-                    None => return Err(Error::Invalid),
-                };
-                (new_pushed, new_buffered)
+                }
             }
         };
         // Check and update state. Return if failed.
@@ -229,7 +222,6 @@ impl Flow {
 
         // Update statistic.
         self.statistic.pushed = new_pushed;
-        self.statistic.buffered = new_buffered;
 
         // Acquire the chunk index.
         let chunk_index = self.next_index;
@@ -277,14 +269,13 @@ impl Flow {
         }
 
         // Remain one buffer chunk in preserve mode.
-        if !self.config.preserve_mode || (self.sanitize_index + 1) >= next_index {
+        if !self.config.preserve_mode || next_index - self.sanitize_index <= 1 {
             // If there isn't overflow, benignly keep chunks alive.
             while self.tail_index < self.sanitize_index && self.check_overflow() {
                 {
                     let chunk_len =
                         self.bucket.get(&self.tail_index).unwrap().lock().unwrap().len();
                     // Update statistic.
-                    self.statistic.buffered -= chunk_len;
                     self.statistic.dropped += chunk_len;
                 }
                 // Remove should always success.
@@ -475,9 +466,9 @@ mod tests {
         });
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
+        sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
         sync_assert_eq!(ptr.write().unwrap().push("world".into()), Err(Error::Invalid));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
-        sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
     }
 
     #[test]
@@ -511,7 +502,6 @@ mod tests {
             &Statistic {
                 pushed: (payload1.len() + payload2.len() + payload3.len() * 2) as u64,
                 dropped: (payload1.len() + payload2.len()) as u64,
-                buffered: (payload3.len() * 2) as u64,
             }
         );
     }
@@ -545,7 +535,6 @@ mod tests {
             &Statistic {
                 pushed: (payload1.len() + payload2.len() + payload3.len()) as u64,
                 dropped: (payload1.len() + payload2.len()) as u64,
-                buffered: payload3.len() as u64,
             }
         );
     }
@@ -596,7 +585,7 @@ mod tests {
 
         sync_assert_eq!(ptr.write().unwrap().push("B".into()), Err(Error::NotReady));
 
-        let next_index = { ptr.read().unwrap().get_range().1 };
+        let (_, next_index) = ptr.read().unwrap().get_range();
         for idx in 0..next_index {
             sync_assert_eq!(ptr.read().unwrap().pull(idx, Some(0)), Ok("A".into()));
         }
