@@ -532,6 +532,8 @@ fn start_service(
                         let remote = remote.clone();
                         let pool_ptr = pool_ptr.clone();
                         let auth_ptr = auth_ptr.clone();
+                        // 4x REF_SIZE should be enough for sending a chunk.
+                        io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                         tls_acceptor
                             .accept_async(io)
                             .and_then(move |io| {
@@ -542,8 +544,6 @@ fn start_service(
                                     data_capacity,
                                     auth_ptr,
                                 );
-                                // 4x REF_SIZE should be enough for sending a chunk.
-                                io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                                 Http::new().bind_connection(&handle, io, addr, service);
                                 Ok(())
                             })
@@ -607,11 +607,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::Uri;
     use hyper::client::{Client, HttpConnector};
     use native_tls::{Certificate, TlsConnector};
     use std::collections::HashSet;
+    use std::io;
     use std::sync::mpsc;
-    use tokio_tls::TlsConnectorExt;
+    use tokio::net::TcpStream;
+    use tokio_tls::{TlsConnectorExt, TlsStream};
 
     const MAX_CAPACITY: u64 = 1048576;
     const DEFL_FLOW_PARAM: &str = r#"{"preserve_mode": false}"#;
@@ -1476,8 +1479,8 @@ mod tests {
         let client = Client::configure().connector(connector).build(&core.handle());
 
         let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
-        req.set_body(r#"{}"#);
-        req.headers_mut().set(ContentLength(2));
+        req.set_body(DEFL_FLOW_PARAM);
+        req.headers_mut().set(ContentLength(DEFL_FLOW_PARAM.len() as u64));
         core.run(client.request(req).and_then(|res| {
             assert_eq!(res.status(), StatusCode::Ok);
             res.body().concat2().and_then(|body| {
