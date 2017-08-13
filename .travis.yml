@@ -10,6 +10,7 @@ rust:
 env:
   global:
   - RUSTFLAGS="-C link-dead-code"
+  - RUST_BACKTRACE="1"
 
 addons:
   apt:
