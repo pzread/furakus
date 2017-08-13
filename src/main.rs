@@ -1435,7 +1435,7 @@ mod tests {
         }).unwrap();
         let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
 
-        let thd = {
+        let thd1 = {
             let prefix = prefix.to_owned();
             let flow_id = flow_id.to_owned();
             let token = token.to_owned();
@@ -1443,9 +1443,9 @@ mod tests {
                 let prefix = &prefix;
                 let flow_id = &flow_id;
                 let token = &token;
-                let payload1 = vec![0u8; flow::REF_SIZE];
-                for _ in 0..(MAX_CAPACITY * 4) / flow::REF_SIZE as u64 {
-                    assert_eq!(req_push(prefix, flow_id, token, &payload1), (StatusCode::Ok, None))
+                let payload = vec![0u8; flow::REF_SIZE];
+                for _ in 0..(MAX_CAPACITY * 2) / flow::REF_SIZE as u64 {
+                    assert_eq!(req_push(prefix, flow_id, token, &payload), (StatusCode::Ok, None))
                 }
             })
         };
@@ -1458,11 +1458,33 @@ mod tests {
                 res.headers().get::<AcceptRanges>().unwrap(),
                 &AcceptRanges(vec![RangeUnit::Bytes])
             );
-            res.body().take(MAX_CAPACITY / flow::REF_SIZE as u64).concat2().then(|_| Ok(()))
+            let mut partial_len = 0;
+            res.body()
+                .take_while(move |chunk| {
+                    partial_len += chunk.len();
+                    Ok((partial_len as u64) < MAX_CAPACITY)
+                })
+                .for_each(|_| Ok(()))
         })).unwrap();
 
-        thread::sleep(Duration::from_millis(5000));
+        thd1.join().unwrap();
+
         let status = req_status(prefix, flow_id).1.unwrap();
+
+        let thd2 = {
+            let prefix = prefix.to_owned();
+            let flow_id = flow_id.to_owned();
+            let token = token.to_owned();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                let token = &token;
+                let payload = vec![1u8; flow::REF_SIZE];
+                for _ in 0..(MAX_CAPACITY * 2) / flow::REF_SIZE as u64 {
+                    assert_eq!(req_push(prefix, flow_id, token, &payload), (StatusCode::Ok, None))
+                }
+            })
+        };
 
         let mut req =
             Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
@@ -1526,6 +1548,6 @@ mod tests {
             })
         })).unwrap();
 
-        thd.join().unwrap();
+        thd2.join().unwrap();
     }
 }

@@ -552,11 +552,11 @@ mod tests {
     #[test]
     fn waiting_push() {
         let ptr = Flow::new(FLOW_CONFIG);
-        let payload1 = vec![0u8; REF_SIZE];
+        let payload = vec![0u8; REF_SIZE];
 
         sync_assert_eq!(ptr.write().unwrap().push("A".into()), Ok(0));
         for idx in 1..(FLOW_CONFIG.data_capacity / REF_SIZE as u64) {
-            sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
+            sync_assert_eq!(ptr.write().unwrap().push(payload.clone().into()), Ok(idx));
         }
         let base_idx = FLOW_CONFIG.data_capacity / REF_SIZE as u64;
         sync_assert_eq!(ptr.write().unwrap().push("D".into()), Ok(base_idx));
@@ -565,7 +565,7 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push("C".into()), Err(Error::NotReady));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok("A".into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
         sync_assert_eq!(fut, Ok(base_idx + 1));
     }
 
@@ -677,20 +677,20 @@ mod tests {
         }
 
         fn run_test(ptr: Arc<RwLock<Flow>>) {
-            let payload1 = vec![0u8; REF_SIZE];
+            let payload = vec![0u8; REF_SIZE];
             let ob1 = Ob::new();
             ptr.write().unwrap().observe(ob1.clone());
 
             for idx in 0..16 {
-                sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(idx));
+                sync_assert_eq!(ptr.write().unwrap().push(payload.clone().into()), Ok(idx));
             }
             sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(16));
 
             sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload1.clone().into()));
+            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
 
             sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
-            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload1.clone().into()));
+            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
             sync_assert_eq!(ptr.write().unwrap().push("!".into()), Err(Error::Invalid));
             assert_eq!(*ob1.0.lock().unwrap(), false);
             sync_assert_eq!(ptr.read().unwrap().pull(17, Some(0)), Err(Error::Eof));
@@ -790,11 +790,11 @@ mod tests {
             keepcount: Some(1),
             preserve_mode: false,
         });
-        let payload1 = vec![0u8; 0];
-        sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
+        let payload = vec![0u8; 0];
+        sync_assert_eq!(ptr.write().unwrap().push(payload.clone().into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(vec![0u8; 1].into()), Err(Error::Invalid));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload.clone().into()));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
     }
 }
