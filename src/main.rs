@@ -571,21 +571,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flow;
-    use futures::{future, stream, Future, Sink, Stream};
-    use hyper;
-    use hyper::{Method, StatusCode};
     use hyper::client::{Client, Request};
-    use hyper::header::{AccessControlAllowMethods, AccessControlAllowOrigin, CacheControl,
-                        CacheDirective, ContentDisposition, ContentLength};
-    use regex::Regex;
-    use serde_json;
-    use std::{str, thread};
     use std::collections::HashSet;
     use std::sync::mpsc;
-    use std::time::Duration;
-    use tokio::reactor::Core;
-    use url;
 
     const MAX_CAPACITY: u64 = 1048576;
     const DEFL_FLOW_PARAM: &str = r#"{"preserve_mode": false}"#;
@@ -762,6 +750,10 @@ mod tests {
                 assert_eq!(
                     res.headers().get::<CacheControl>().unwrap(),
                     &CacheControl(vec![CacheDirective::NoCache])
+                );
+                assert_eq!(
+                    res.headers().get::<ETag>().unwrap(),
+                    &ETag(EntityTag::new(false, flow_id.to_owned()))
                 );
             }
             let fut = if status_code == StatusCode::Ok {
@@ -1382,10 +1374,6 @@ mod tests {
         );
         assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
         assert_eq!(
-            req_push(prefix, flow_id, token, b"World"),
-            (StatusCode::BadRequest, Some("Not Ready".to_string()),)
-        );
-        assert_eq!(
             req_close(prefix, flow_id, token),
             (StatusCode::BadRequest, Some("Closed".to_string()))
         );
@@ -1415,33 +1403,6 @@ mod tests {
     }
 
     #[test]
-    fn dropped_fixed_length() {
-        let prefix = &spawn_server().0;
-        let mut core = Core::new().unwrap();
-        let client = Client::new(&core.handle());
-        let param = serde_json::to_vec(&NewRequest {
-            size: Some(5),
-            preserve_mode: false,
-        }).unwrap();
-        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
-
-        assert_eq!(req_push(prefix, flow_id, token, b"Hel"), (StatusCode::Ok, None));
-        assert_eq!(req_push(prefix, flow_id, token, b"lo"), (StatusCode::Ok, None));
-        assert_eq!(req_fetch(prefix, flow_id, 0), (StatusCode::Ok, Some(b"Hel".to_vec())));
-
-        let req =
-            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
-        core.run(client.request(req).and_then(|res| {
-            assert_eq!(res.status(), StatusCode::Ok);
-            assert_eq!(res.headers().get::<ContentLength>().unwrap().0, 5);
-            res.body().concat2().and_then(|body| {
-                assert_eq!(body.to_vec(), b"Hello".to_vec());
-                Ok(())
-            })
-        })).unwrap();
-    }
-
-    #[test]
     fn multi_workers() {
         let res = thread::spawn(|| {
             start_service(
@@ -1460,5 +1421,92 @@ mod tests {
         } else {
             assert_eq!(res, false);
         }
+    }
+
+    #[test]
+    fn preserve_mode() {
+        let prefix = &spawn_server().0;
+        let mut core = Core::new().unwrap();
+        let client = Client::new(&core.handle());
+
+        let param = serde_json::to_vec(&NewRequest {
+            size: Some(MAX_CAPACITY * 4),
+            preserve_mode: true,
+        }).unwrap();
+        let (ref flow_id, ref token) = create_flow(prefix, &String::from_utf8(param).unwrap());
+
+        let thd = {
+            let prefix = prefix.to_owned();
+            let flow_id = flow_id.to_owned();
+            let token = token.to_owned();
+            thread::spawn(move || {
+                let prefix = &prefix;
+                let flow_id = &flow_id;
+                let token = &token;
+                let payload1 = vec![0u8; flow::REF_SIZE];
+                for _ in 0..(MAX_CAPACITY * 4) / flow::REF_SIZE as u64 {
+                    assert_eq!(req_push(prefix, flow_id, token, &payload1), (StatusCode::Ok, None))
+                }
+            })
+        };
+
+        let req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            assert_eq!(
+                res.headers().get::<AcceptRanges>().unwrap(),
+                &AcceptRanges(vec![RangeUnit::Bytes])
+            );
+            res.body().take(MAX_CAPACITY / flow::REF_SIZE as u64).concat2().then(|_| Ok(()))
+        })).unwrap();
+
+        thread::sleep(Duration::from_millis(5000));
+        let status = req_status(prefix, flow_id).1.unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::AllFrom(0)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::NotFound);
+            Ok(())
+        })).unwrap();
+
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut()
+            .set(Range::Bytes(vec![ByteRangeSpec::FromTo(MAX_CAPACITY * 4, MAX_CAPACITY * 4)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::RangeNotSatisfiable);
+            assert_eq!(
+                res.headers().get::<ContentRange>().unwrap(),
+                &ContentRange(ContentRangeSpec::Bytes {
+                    range: None,
+                    instance_length: Some(MAX_CAPACITY * 4),
+                })
+            );
+            Ok(())
+        })).unwrap();
+
+        let range_start = (status.pushed + status.dropped) / 2 + 1;
+        let mut req =
+            Request::new(Method::Get, format!("{}/flow/{}/pull", prefix, flow_id).parse().unwrap());
+        req.headers_mut().set(Range::Bytes(vec![ByteRangeSpec::AllFrom(range_start)]));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::PartialContent);
+            assert_eq!(
+                res.headers().get::<ContentRange>().unwrap(),
+                &ContentRange(ContentRangeSpec::Bytes {
+                    range: Some((range_start, MAX_CAPACITY * 4 - 1)),
+                    instance_length: Some(MAX_CAPACITY * 4),
+                })
+            );
+            res.body().concat2().and_then(|body| {
+                assert_eq!(body.len() as u64, MAX_CAPACITY * 4 - range_start);
+                Ok(())
+            })
+        })).unwrap();
+
+        thd.join().unwrap();
     }
 }
