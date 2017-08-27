@@ -4,6 +4,7 @@ use futures::sync::oneshot;
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use utils::BoxedFuture;
 use uuid::Uuid;
 
 pub const REF_SIZE: usize = 32768;
@@ -92,7 +93,7 @@ pub struct Flow {
     observers: Vec<Box<Observer>>,
 }
 
-type FlowFuture<T> = future::BoxFuture<T, Error>;
+type FlowFuture<T> = Box<Future<Item = T, Error = Error> + Send>;
 
 impl Flow {
     pub fn new(config: Config) -> Arc<RwLock<Self>> {
@@ -312,7 +313,7 @@ impl Flow {
         // Acquire the chunk. Return if failed.
         let (chunk_index, chunk_end) = match self.acquire_chunk(chunk) {
             Ok((chunk_index, _, chunk_end)) => (chunk_index, chunk_end),
-            Err(err) => return future::err(err).boxed(),
+            Err(err) => return future::err(err).boxed2(),
         };
 
         // Get the overflow status first.
@@ -330,9 +331,9 @@ impl Flow {
         let fut = if is_overflow {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_index, chunk_end, tx));
-            rx.map(move |_| chunk_index).map_err(|_| Error::Other).boxed()
+            rx.map(move |_| chunk_index).map_err(|_| Error::Other).boxed2()
         } else {
-            future::ok(chunk_index).boxed()
+            future::ok(chunk_index).boxed2()
         };
 
         // Try to sanitize the buffer.
@@ -342,7 +343,7 @@ impl Flow {
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
-        future::result(self.acquire_chunk(Chunk::eof()).map(|_| ())).boxed()
+        future::result(self.acquire_chunk(Chunk::eof()).map(|_| ())).boxed2()
     }
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Bytes> {
@@ -351,20 +352,20 @@ impl Flow {
 
         // Try to get the chunk.
         let fut = if let Some(chunk) = chunk {
-            future::ok(chunk).boxed()
+            future::ok(chunk).boxed2()
         } else {
             if self.state != State::Streaming {
-                future::err(Error::Eof).boxed()
+                future::err(Error::Eof).boxed2()
             } else if chunk_index < self.next_index {
-                future::err(Error::Dropped).boxed()
+                future::err(Error::Dropped).boxed2()
             } else if timeout == Some(0) {
-                future::err(Error::NotReady).boxed()
+                future::err(Error::NotReady).boxed2()
             } else {
                 let (tx, rx) = oneshot::channel();
                 let mut waiting_pull = self.waiting_pull.lock().unwrap();
                 let waits = waiting_pull.entry(chunk_index).or_insert(Vec::new());
                 waits.push(tx);
-                rx.map_err(|_| Error::Other).boxed()
+                rx.map_err(|_| Error::Other).boxed2()
             }
         };
 
@@ -397,7 +398,7 @@ impl Flow {
             }
 
             future::result(result)
-        }).boxed()
+        }).boxed2()
     }
 }
 

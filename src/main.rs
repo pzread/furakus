@@ -38,6 +38,7 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
+use utils::BoxedFuture;
 
 #[derive(Debug)]
 pub enum Error {
@@ -79,7 +80,7 @@ struct ErrorResponse {
     pub message: String,
 }
 
-type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
+type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
 
 impl FlowService {
     fn new(
@@ -106,22 +107,22 @@ impl FlowService {
         url::form_urlencoded::parse(req.query().unwrap_or("").as_bytes())
     }
 
-    fn parse_request_parameter<T>(req: Request) -> future::BoxFuture<T, Error>
+    fn parse_request_parameter<T>(req: Request) -> Box<Future<Item = T, Error = Error> + Send>
     where
         T: DeserializeOwned + Send + 'static,
     {
         let content_length = match req.headers().get() {
             Some(&ContentLength(length)) => length,
-            None => return future::err(Error::Invalid).boxed(),
+            None => return future::err(Error::Invalid).boxed2(),
         };
         if content_length == 0 || content_length > 4096 {
-            return future::err(Error::Invalid).boxed();
+            return future::err(Error::Invalid).boxed2();
         }
         req.body()
             .concat2()
             .map_err(|err| Error::Internal(err))
             .and_then(|body| serde_json::from_slice::<T>(&body).map_err(|_| Error::Invalid))
-            .boxed()
+            .boxed2()
     }
 
     fn response_ok() -> Response {
@@ -175,22 +176,22 @@ impl FlowService {
                 Error::NotReady => Ok(Response::new().with_status(StatusCode::ServiceUnavailable)),
                 Error::Internal(err) => Err(err),
             })
-            .boxed()
+            .boxed2()
     }
 
     fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
         let token =
             match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
                 Some((_, token)) => token.into_owned(),
-                None => return future::ok(Self::response_error("Missing Token")).boxed(),
+                None => return future::ok(Self::response_error("Missing Token")).boxed2(),
             };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
-            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2();
         }
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         req.body()
             .fold(Vec::<u8>::with_capacity(flow::REF_SIZE * 2), {
@@ -206,9 +207,9 @@ impl FlowService {
                         flow.push(chunk)
                             .map(|_| buf_chunk)
                             .map_err(|_| hyper::error::Error::Incomplete)
-                            .boxed()
+                            .boxed2()
                     } else {
-                        future::ok(buf_chunk).boxed()
+                        future::ok(buf_chunk).boxed2()
                     }
                 }
             })
@@ -219,29 +220,29 @@ impl FlowService {
                     flow.push(chunk)
                         .map(|_| ())
                         .map_err(|_| hyper::error::Error::Incomplete)
-                        .boxed()
+                        .boxed2()
                 } else {
-                    future::ok(()).boxed()
+                    future::ok(()).boxed2()
                 }
             })
             .and_then(|_| Ok(Self::response_ok()))
             .or_else(|_| Ok(Self::response_error("Not Ready")))
-            .boxed()
+            .boxed2()
     }
 
     fn handle_eof(&self, req: Request, route: regex::Captures) -> ResponseFuture {
         let token =
             match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
                 Some((_, token)) => token.into_owned(),
-                None => return future::ok(Self::response_error("Missing Token")).boxed(),
+                None => return future::ok(Self::response_error("Missing Token")).boxed2(),
             };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
-            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2();
         }
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         {
             let mut flow = flow_ptr.write().unwrap();
@@ -251,7 +252,7 @@ impl FlowService {
                     Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
                     _ => Ok(Response::new().with_status(StatusCode::InternalServerError)),
                 })
-                .boxed()
+                .boxed2()
         }
     }
 
@@ -259,7 +260,7 @@ impl FlowService {
         let flow_id = route.get(1).unwrap().as_str();
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         let body = {
             let flow = flow_ptr.read().unwrap();
@@ -277,18 +278,18 @@ impl FlowService {
                 .with_header(ContentType::json())
                 .with_header(ContentLength(body.len() as u64))
                 .with_body(body),
-        ).boxed()
+        ).boxed2()
     }
 
     fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
         let chunk_index: u64 = match route.get(2).unwrap().as_str().parse() {
             Ok(index) => index,
-            Err(_) => return future::ok(Self::response_error("Invalid Parameter")).boxed(),
+            Err(_) => return future::ok(Self::response_error("Invalid Parameter")).boxed2(),
         };
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         {
             let flow = flow_ptr.read().unwrap();
@@ -312,7 +313,7 @@ impl FlowService {
                     };
                     future::ok(Response::new().with_status(status))
                 })
-                .boxed()
+                .boxed2()
         }
     }
 
@@ -323,7 +324,7 @@ impl FlowService {
         let flow_id = route.get(1).unwrap().as_str();
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         let (tx, body) = hyper::Body::pair();
         let mut response = Response::new()
@@ -364,7 +365,7 @@ impl FlowService {
                         let tail_offset = flow.get_statistic().dropped;
                         if range_start < tail_offset {
                             return future::ok(Response::new().with_status(StatusCode::NotFound))
-                                .boxed();
+                                .boxed2();
                         } else if range_start >= length {
                             return future::ok(
                                 Response::new()
@@ -373,7 +374,7 @@ impl FlowService {
                                         range: None,
                                         instance_length: Some(length),
                                     })),
-                            ).boxed();
+                            ).boxed2();
                         } else {
                             skip_len = range_start - tail_offset;
                             response.set_status(StatusCode::PartialContent);
@@ -385,7 +386,7 @@ impl FlowService {
                         }
                     } else {
                         return future::ok(Response::new().with_status(StatusCode::NotFound))
-                            .boxed();
+                            .boxed2();
                     }
                 } else if tail_index == 0 {
                     // Only set content length when the flow is still complete.
@@ -430,7 +431,7 @@ impl FlowService {
                 Ok(response)
             })
             .or_else(|_| Ok(Response::new().with_status(StatusCode::NotFound)))
-            .boxed()
+            .boxed2()
     }
 }
 
@@ -463,26 +464,26 @@ impl Service for FlowService {
             } else if let Some(route) = PATTERN_STATUS.captures(path) {
                 self.handle_status(req, route)
             } else {
-                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Put => if let Some(route) = PATTERN_PUSH.captures(path) {
                 self.handle_push(req, route)
             } else {
-                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Get => if let Some(route) = PATTERN_FETCH.captures(path) {
                 self.handle_fetch(req, route)
             } else if let Some(route) = PATTERN_PULL.captures(path) {
                 self.handle_pull(req, route)
             } else {
-                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Options => future::ok(Response::new().with_header(AccessControlAllowMethods(
                 vec![Method::Post, Method::Put, Method::Get, Method::Options],
-            ))).boxed(),
-            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed(),
+            ))).boxed2(),
+            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed2(),
         }.map(|res| res.with_header(AccessControlAllowOrigin::Any))
-            .boxed()
+            .boxed2()
     }
 }
 
@@ -634,9 +635,9 @@ mod tests {
                         let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
                         Ok(Some(data.message))
                     })
-                    .boxed()
+                    .boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -662,9 +663,9 @@ mod tests {
                         let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
                         Ok(Some(data.message))
                     })
-                    .boxed()
+                    .boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -684,9 +685,9 @@ mod tests {
         let (status_code, response) = core.run(client.request(req).and_then(|res| {
             let status_code = res.status();
             let fut = if status_code == StatusCode::Ok {
-                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| {
                 let response =
@@ -727,9 +728,9 @@ mod tests {
                 assert!(check_immutable && check_maxage);
             }
             let fut = if status_code == StatusCode::Ok {
-                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -757,9 +758,9 @@ mod tests {
                 );
             }
             let fut = if status_code == StatusCode::Ok {
-                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -767,7 +768,10 @@ mod tests {
         (status_code, response)
     }
 
-    fn check_error_response(res: Response, error: &str) -> future::BoxFuture<(), hyper::Error> {
+    fn check_error_response(
+        res: Response,
+        error: &str,
+    ) -> Box<Future<Item = (), Error = hyper::Error>> {
         assert_eq!(res.status(), StatusCode::BadRequest);
         let error = error.to_owned();
         res.body()
@@ -779,7 +783,7 @@ mod tests {
                 );
                 Ok(())
             })
-            .boxed()
+            .boxed2()
     }
 
     #[test]
@@ -1281,7 +1285,7 @@ mod tests {
                             }
                             Ok(())
                         })
-                        .boxed()
+                        .boxed2()
                 })).unwrap();
             })
         };

@@ -1,3 +1,13 @@
+use futures::Future;
+
+pub trait BoxedFuture: Future + Send + Sized + 'static {
+    fn boxed2(self) -> Box<Future<Item = Self::Item, Error = Self::Error> + Send> {
+        Box::new(self)
+    }
+}
+
+impl<T: Future + Send + 'static> BoxedFuture for T {}
+
 pub fn hex(bytes: &[u8]) -> String {
     const HEXLIST: [char; 16] = [
         '0',
