@@ -532,12 +532,11 @@ fn start_service(
                     auth_ptr.clone(),
                 );
                 if let Some(ref tls_ptr) = tls_ptr {
-                    Box::new(tls_ptr
+                    let fut = tls_ptr
                         .accept_async(io)
-                        .map(move |io| {
-                            http.bind_connection(handle, io, addr, service);
-                        })
-                        .or_else(|_| Ok(())))
+                        .map(move |io| { http.bind_connection(handle, io, addr, service); })
+                        .or_else(|_| Ok(()));
+                    Box::new(fut)
                 } else {
                     http.bind_connection(handle, io, addr, service);
                     Box::new(future::ok(()))
