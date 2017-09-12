@@ -245,9 +245,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let ptr = Pool::new(None, None);
         let flow = Flow::new(FLOW_CONFIG);
-        let flow_id = {
-            flow.read().unwrap().id.to_owned()
-        };
+        let flow_id = { flow.read().unwrap().id.to_owned() };
         {
             let mut pool = ptr.write().unwrap();
             pool.insert(flow.clone()).unwrap();
@@ -273,9 +271,7 @@ mod tests {
         let flow = Flow::new(FLOW_CONFIG);
         {
             let ptr = Pool::new(None, None);
-            let flow_id = {
-                flow.read().unwrap().id.to_owned()
-            };
+            let flow_id = { flow.read().unwrap().id.to_owned() };
             {
                 let mut pool = ptr.write().unwrap();
                 pool.insert(flow.clone()).unwrap();

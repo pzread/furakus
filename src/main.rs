@@ -1,18 +1,18 @@
-#[macro_use]
-extern crate language_tags;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
 extern crate bytes;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
+#[macro_use]
+extern crate language_tags;
+#[macro_use]
+extern crate lazy_static;
 extern crate native_tls;
 extern crate openssl;
 extern crate regex;
 extern crate ring;
 extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core as tokio;
 extern crate tokio_tls;
@@ -44,11 +44,11 @@ use serde::de::DeserializeOwned;
 use std::{env, thread};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
 use tokio_tls::TlsAcceptorExt;
+use utils::BoxedFuture;
 
 #[derive(Debug)]
 pub enum Error {
@@ -90,7 +90,7 @@ struct ErrorResponse {
     pub message: String,
 }
 
-type ResponseFuture = future::BoxFuture<Response, hyper::Error>;
+type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
 
 impl FlowService {
     fn new(
@@ -117,22 +117,22 @@ impl FlowService {
         url::form_urlencoded::parse(req.query().unwrap_or("").as_bytes())
     }
 
-    fn parse_request_parameter<T>(req: Request) -> future::BoxFuture<T, Error>
+    fn parse_request_parameter<T>(req: Request) -> Box<Future<Item = T, Error = Error> + Send>
     where
         T: DeserializeOwned + Send + 'static,
     {
         let content_length = match req.headers().get() {
             Some(&ContentLength(length)) => length,
-            None => return future::err(Error::Invalid).boxed(),
+            None => return future::err(Error::Invalid).boxed2(),
         };
         if content_length == 0 || content_length > 4096 {
-            return future::err(Error::Invalid).boxed();
+            return future::err(Error::Invalid).boxed2();
         }
         req.body()
             .concat2()
             .map_err(|err| Error::Internal(err))
             .and_then(|body| serde_json::from_slice::<T>(&body).map_err(|_| Error::Invalid))
-            .boxed()
+            .boxed2()
     }
 
     fn response_ok() -> Response {
@@ -186,22 +186,22 @@ impl FlowService {
                 Error::NotReady => Ok(Response::new().with_status(StatusCode::ServiceUnavailable)),
                 Error::Internal(err) => Err(err),
             })
-            .boxed()
+            .boxed2()
     }
 
     fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
-        let token =
-            match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
-                Some((_, token)) => token.into_owned(),
-                None => return future::ok(Self::response_error("Missing Token")).boxed(),
-            };
+        let token = match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token")
+        {
+            Some((_, token)) => token.into_owned(),
+            None => return future::ok(Self::response_error("Missing Token")).boxed2(),
+        };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
-            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2();
         }
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         req.body()
             .for_each(move |chunk| {
@@ -212,22 +212,22 @@ impl FlowService {
             })
             .and_then(|_| Ok(Self::response_ok()))
             .or_else(|_| Ok(Self::response_error("Not Ready")))
-            .boxed()
+            .boxed2()
     }
 
     fn handle_eof(&self, req: Request, route: regex::Captures) -> ResponseFuture {
-        let token =
-            match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
-                Some((_, token)) => token.into_owned(),
-                None => return future::ok(Self::response_error("Missing Token")).boxed(),
-            };
+        let token = match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token")
+        {
+            Some((_, token)) => token.into_owned(),
+            None => return future::ok(Self::response_error("Missing Token")).boxed2(),
+        };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
-            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed();
+            return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2();
         }
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         {
             let mut flow = flow_ptr.write().unwrap();
@@ -237,7 +237,7 @@ impl FlowService {
                     Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
                     _ => Ok(Response::new().with_status(StatusCode::InternalServerError)),
                 })
-                .boxed()
+                .boxed2()
         }
     }
 
@@ -245,7 +245,7 @@ impl FlowService {
         let flow_id = route.get(1).unwrap().as_str();
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         let body = {
             let flow = flow_ptr.read().unwrap();
@@ -263,18 +263,18 @@ impl FlowService {
                 .with_header(ContentType::json())
                 .with_header(ContentLength(body.len() as u64))
                 .with_body(body),
-        ).boxed()
+        ).boxed2()
     }
 
     fn handle_fetch(&self, _req: Request, route: regex::Captures) -> ResponseFuture {
         let flow_id = route.get(1).unwrap().as_str();
         let chunk_index: u64 = match route.get(2).unwrap().as_str().parse() {
             Ok(index) => index,
-            Err(_) => return future::ok(Self::response_error("Invalid Parameter")).boxed(),
+            Err(_) => return future::ok(Self::response_error("Invalid Parameter")).boxed2(),
         };
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         {
             let flow = flow_ptr.read().unwrap();
@@ -298,7 +298,7 @@ impl FlowService {
                     };
                     future::ok(Response::new().with_status(status))
                 })
-                .boxed()
+                .boxed2()
         }
     }
 
@@ -309,7 +309,7 @@ impl FlowService {
         let flow_id = route.get(1).unwrap().as_str();
         let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
             Some(flow) => flow.clone(),
-            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed(),
+            None => return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2(),
         };
         let (tx, body) = hyper::Body::pair();
         let mut response = Response::new()
@@ -350,7 +350,7 @@ impl FlowService {
                         let tail_offset = flow.get_statistic().dropped;
                         if range_start < tail_offset {
                             return future::ok(Response::new().with_status(StatusCode::NotFound))
-                                .boxed();
+                                .boxed2();
                         } else if range_start >= length {
                             return future::ok(
                                 Response::new()
@@ -359,7 +359,7 @@ impl FlowService {
                                         range: None,
                                         instance_length: Some(length),
                                     })),
-                            ).boxed();
+                            ).boxed2();
                         } else {
                             skip_len = range_start - tail_offset;
                             response.set_status(StatusCode::PartialContent);
@@ -371,7 +371,7 @@ impl FlowService {
                         }
                     } else {
                         return future::ok(Response::new().with_status(StatusCode::NotFound))
-                            .boxed();
+                            .boxed2();
                     }
                 } else if tail_index == 0 {
                     // Only set content length when the flow is still complete.
@@ -416,7 +416,7 @@ impl FlowService {
                 Ok(response)
             })
             .or_else(|_| Ok(Response::new().with_status(StatusCode::NotFound)))
-            .boxed()
+            .boxed2()
     }
 }
 
@@ -449,26 +449,26 @@ impl Service for FlowService {
             } else if let Some(route) = PATTERN_STATUS.captures(path) {
                 self.handle_status(req, route)
             } else {
-                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Put => if let Some(route) = PATTERN_PUSH.captures(path) {
                 self.handle_push(req, route)
             } else {
-                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Get => if let Some(route) = PATTERN_FETCH.captures(path) {
                 self.handle_fetch(req, route)
             } else if let Some(route) = PATTERN_PULL.captures(path) {
                 self.handle_pull(req, route)
             } else {
-                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed()
+                future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Options => future::ok(Response::new().with_header(AccessControlAllowMethods(
                 vec![Method::Post, Method::Put, Method::Get, Method::Options],
-            ))).boxed(),
-            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed(),
+            ))).boxed2(),
+            _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed2(),
         }.map(|res| res.with_header(AccessControlAllowOrigin::Any))
-            .boxed()
+            .boxed2()
     }
 }
 
@@ -500,87 +500,58 @@ fn start_service(
     meta_capacity: u64,
     data_capacity: u64,
     tls_config: Option<TlsAcceptor>,
-    blocking: bool,
-) -> Option<std::net::SocketAddr> {
-    if !cfg!(unix) && num_worker > 1 {
-        panic!("Multi-workers isn't supported on Windows");
-    }
-
+) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
     let auth_ptr = Arc::new(HMACAuthorizer::new());
-    let mut workers = Vec::with_capacity(num_worker);
-    let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
     let tls_ptr = tls_config.map(|tls_config| Arc::new(tls_config));
+    let mut workers = Vec::with_capacity(num_worker);
 
     for idx in 0..num_worker {
-        let addr = addr.clone();
-        let listener = upstream_listener.try_clone().unwrap();
-        let barrier = barrier.clone();
+        // Size of backlog = 64.
+        let (io_tx, io_rx) = futures::sync::mpsc::channel::<std::net::TcpStream>(64);
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
-        let tls_acceptor = tls_ptr.clone();
-        let worker = thread::spawn(move || {
+        let tls_ptr = tls_ptr.clone();
+        thread::spawn(move || {
             let mut core = Core::new().unwrap();
-            let handle = core.handle();
             let remote = core.remote();
-            let listener = TcpListener::from_listener(listener, &addr, &handle).unwrap();
-            let acceptor: Box<Future<Item = _, Error = _>> =
-                if let Some(tls_acceptor) = tls_acceptor {
-                    Box::new(listener.incoming().for_each(move |(io, addr)| {
-                        let handle = handle.clone();
-                        let remote = remote.clone();
-                        let pool_ptr = pool_ptr.clone();
-                        let auth_ptr = auth_ptr.clone();
-                        // 4x REF_SIZE should be enough for sending a chunk.
-                        io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
-                        tls_acceptor
-                            .accept_async(io)
-                            .and_then(move |io| {
-                                let service = FlowService::new(
-                                    pool_ptr,
-                                    remote,
-                                    meta_capacity,
-                                    data_capacity,
-                                    auth_ptr,
-                                );
-                                Http::new().bind_connection(&handle, io, addr, service);
-                                Ok(())
-                            })
-                            .or_else(|_| Ok(()))
-                    }))
-                } else {
-                    Box::new(listener.incoming().for_each(|(io, addr)| {
-                        let service = FlowService::new(
-                            pool_ptr.clone(),
-                            remote.clone(),
-                            meta_capacity,
-                            data_capacity,
-                            auth_ptr.clone(),
-                        );
-                        // 4x REF_SIZE should be enough for sending a chunk.
-                        io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
-                        Http::new().bind_connection(&handle, io, addr, service);
-                        Ok(())
-                    }))
-                };
+            let handle = &core.handle();
+            let http = &Http::new();
             println!("Worker #{} is started.", idx);
-            barrier.wait();
-            core.run(acceptor).unwrap();
+            core.run(io_rx.for_each::<_, Box<Future<Item = (), Error = ()>>>(|io| {
+                let io = tokio::net::TcpStream::from_stream(io, handle).unwrap();
+                let addr = io.peer_addr().unwrap();
+                // 4x REF_SIZE should be enough for sending a chunk.
+                io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
+                let service = FlowService::new(
+                    pool_ptr.clone(),
+                    remote.clone(),
+                    meta_capacity,
+                    data_capacity,
+                    auth_ptr.clone(),
+                );
+                if let Some(ref tls_ptr) = tls_ptr {
+                    Box::new(tls_ptr
+                        .accept_async(io)
+                        .map(move |io| {
+                            http.bind_connection(handle, io, addr, service);
+                        })
+                        .or_else(|_| Ok(())))
+                } else {
+                    http.bind_connection(handle, io, addr, service);
+                    Box::new(future::ok(()))
+                }
+            })).unwrap();
         });
-        workers.push(worker);
+        workers.push(io_tx);
     }
-
-    barrier.wait();
-
-    if blocking {
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        unreachable!();
-    } else {
-        Some(upstream_listener.local_addr().unwrap())
-    }
+    let bind_addr = upstream_listener.local_addr().unwrap();
+    let service_thd =
+        thread::spawn(move || for (idx, io) in upstream_listener.incoming().enumerate() {
+            workers[idx % workers.len()].clone().send(io.unwrap()).wait().unwrap();
+        });
+    (bind_addr, service_thd)
 }
 
 fn main() {
@@ -592,7 +563,7 @@ fn main() {
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
     let tls_config = config_tls(&env::var("TLS_CERT").unwrap(), &env::var("TLS_PRIVATE").unwrap());
-    start_service(
+    let (_, service_thd) = start_service(
         addr,
         num_worker,
         Some(pool_size),
@@ -600,8 +571,8 @@ fn main() {
         meta_capacity,
         data_capacity,
         Some(tls_config),
-        true,
     );
+    service_thd.join().unwrap();
 }
 
 #[cfg(test)]
@@ -619,8 +590,8 @@ mod tests {
     const MAX_CAPACITY: u64 = 1048576;
     const DEFL_FLOW_PARAM: &str = r#"{"preserve_mode": false}"#;
 
-    fn spawn_server() -> (String, String) {
-        let port = start_service(
+    fn spawn_server() -> String {
+        let (bind_addr, _) = start_service(
             "127.0.0.1:0".parse().unwrap(),
             1,
             Some(32),
@@ -628,10 +599,9 @@ mod tests {
             MAX_CAPACITY,
             MAX_CAPACITY,
             None,
-            false,
-        ).unwrap()
-            .port();
-        (format!("http://127.0.0.1:{}", port), format!("127.0.0.1:{}", port))
+        );
+        let port = bind_addr.port();
+        format!("http://127.0.0.1:{}", port)
     }
 
     fn create_flow(prefix: &str, param: &str) -> (String, String) {
@@ -676,9 +646,9 @@ mod tests {
                         let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
                         Ok(Some(data.message))
                     })
-                    .boxed()
+                    .boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -704,9 +674,9 @@ mod tests {
                         let data = serde_json::from_slice::<ErrorResponse>(&body).unwrap();
                         Ok(Some(data.message))
                     })
-                    .boxed()
+                    .boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -726,9 +696,9 @@ mod tests {
         let (status_code, response) = core.run(client.request(req).and_then(|res| {
             let status_code = res.status();
             let fut = if status_code == StatusCode::Ok {
-                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| {
                 let response =
@@ -769,9 +739,9 @@ mod tests {
                 assert!(check_immutable && check_maxage);
             }
             let fut = if status_code == StatusCode::Ok {
-                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -799,9 +769,9 @@ mod tests {
                 );
             }
             let fut = if status_code == StatusCode::Ok {
-                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed()
+                res.body().concat2().and_then(|body| Ok(Some(body.to_vec()))).boxed2()
             } else {
-                future::ok(None).boxed()
+                future::ok(None).boxed2()
             };
             fut.and_then(move |body| Ok((status_code, body)))
         })).unwrap();
@@ -809,7 +779,10 @@ mod tests {
         (status_code, response)
     }
 
-    fn check_error_response(res: Response, error: &str) -> future::BoxFuture<(), hyper::Error> {
+    fn check_error_response(
+        res: Response,
+        error: &str,
+    ) -> Box<Future<Item = (), Error = hyper::Error>> {
         assert_eq!(res.status(), StatusCode::BadRequest);
         let error = error.to_owned();
         res.body()
@@ -821,12 +794,12 @@ mod tests {
                 );
                 Ok(())
             })
-            .boxed()
+            .boxed2()
     }
 
     #[test]
     fn validate_route() {
-        let (ref prefix, _) = spawn_server();
+        let prefix = &spawn_server();
         let (ref flow_id, _) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         fn check_status(req: Request, status_code: StatusCode) -> Response {
@@ -910,7 +883,7 @@ mod tests {
 
     #[test]
     fn handle_new() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -997,7 +970,7 @@ mod tests {
 
     #[test]
     fn handle_push_fetch() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -1072,7 +1045,7 @@ mod tests {
 
     #[test]
     fn handle_push_pull() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
         let payload = vec![1u8; flow::REF_SIZE * 10];
@@ -1135,7 +1108,7 @@ mod tests {
 
     #[test]
     fn handle_eof() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
@@ -1166,7 +1139,7 @@ mod tests {
 
     #[test]
     fn recycle_and_release() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         let (tx, rx) = mpsc::channel();
@@ -1197,7 +1170,7 @@ mod tests {
 
     #[test]
     fn dropped() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
@@ -1215,7 +1188,7 @@ mod tests {
 
     #[test]
     fn full_push() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
@@ -1262,7 +1235,7 @@ mod tests {
 
     #[test]
     fn racing_pull() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         let (send_tx, send_rx) = mpsc::channel();
@@ -1323,7 +1296,7 @@ mod tests {
                             }
                             Ok(())
                         })
-                        .boxed()
+                        .boxed2()
                 })).unwrap();
             })
         };
@@ -1342,7 +1315,7 @@ mod tests {
 
     #[test]
     fn overload() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -1377,7 +1350,7 @@ mod tests {
 
     #[test]
     fn handle_status() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         assert_eq!(req_status(prefix, fake_id), (StatusCode::NotFound, None));
@@ -1399,7 +1372,7 @@ mod tests {
 
     #[test]
     fn fixed_length() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -1447,7 +1420,7 @@ mod tests {
     #[test]
     fn tls_service() {
         let tls_config = config_tls("./tests/cert.pem", "./tests/private.pem");
-        let port = start_service(
+        let (bind_addr, _) = start_service(
             "127.0.0.1:0".parse().unwrap(),
             1,
             Some(32),
@@ -1455,11 +1428,9 @@ mod tests {
             MAX_CAPACITY,
             MAX_CAPACITY,
             Some(tls_config),
-            false,
-        ).unwrap()
-            .port();
+        );
 
-        let prefix = format!("https://127.0.0.1:{}", port);
+        let prefix = format!("https://127.0.0.1:{}", bind_addr.port());
         let mut core = Core::new().unwrap();
 
         let rootca = {
@@ -1515,29 +1486,20 @@ mod tests {
 
     #[test]
     fn multi_workers() {
-        let res = thread::spawn(|| {
-            start_service(
-                "127.0.0.1:0".parse().unwrap(),
-                4,
-                None,
-                None,
-                MAX_CAPACITY,
-                MAX_CAPACITY,
-                None,
-                false,
-            ).unwrap();
-        }).join()
-            .is_ok();
-        if cfg!(unix) {
-            assert_eq!(res, true);
-        } else {
-            assert_eq!(res, false);
-        }
+        start_service(
+            "127.0.0.1:0".parse().unwrap(),
+            4,
+            None,
+            None,
+            MAX_CAPACITY,
+            MAX_CAPACITY,
+            None,
+        );
     }
 
     #[test]
     fn preserve_mode() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 

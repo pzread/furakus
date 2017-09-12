@@ -16,15 +16,15 @@ impl HMACAuthorizer {
         let rng = rand::SystemRandom::new();
         let mut seckey = vec![0u8; hmac::recommended_key_len(&digest::SHA256)];
         rng.fill(&mut seckey).unwrap();
-        HMACAuthorizer { signkey: hmac::SigningKey::new(&digest::SHA256, &seckey) }
+        HMACAuthorizer {
+            signkey: hmac::SigningKey::new(&digest::SHA256, &seckey),
+        }
     }
 }
 
 impl Authorizer for HMACAuthorizer {
     fn sign(&self, flow_id: &str) -> String {
-        let signature = {
-            hmac::sign(&self.signkey, &flow_id.as_bytes())
-        };
+        let signature = { hmac::sign(&self.signkey, &flow_id.as_bytes()) };
         utils::hex(signature.as_ref())
     }
 
