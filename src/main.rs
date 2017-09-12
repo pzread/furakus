@@ -600,8 +600,7 @@ mod tests {
             MAX_CAPACITY,
             None,
         );
-        let port = bind_addr.port();
-        format!("http://127.0.0.1:{}", port)
+        format!("http://127.0.0.1:{}", bind_addr.port())
     }
 
     fn create_flow(prefix: &str, param: &str) -> (String, String) {
