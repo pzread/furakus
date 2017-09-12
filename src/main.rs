@@ -1,16 +1,16 @@
-#[macro_use]
-extern crate language_tags;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
 extern crate bytes;
 extern crate dotenv;
 extern crate futures;
 extern crate hyper;
+#[macro_use]
+extern crate language_tags;
+#[macro_use]
+extern crate lazy_static;
 extern crate regex;
 extern crate ring;
 extern crate serde;
+#[macro_use]
+extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core as tokio;
 extern crate url;
@@ -34,9 +34,8 @@ use pool::Pool;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use std::{env, mem, thread};
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::reactor::{self, Core};
 use utils::BoxedFuture;
 
@@ -180,11 +179,11 @@ impl FlowService {
     }
 
     fn handle_push(&self, req: Request, route: regex::Captures) -> ResponseFuture {
-        let token =
-            match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
-                Some((_, token)) => token.into_owned(),
-                None => return future::ok(Self::response_error("Missing Token")).boxed2(),
-            };
+        let token = match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token")
+        {
+            Some((_, token)) => token.into_owned(),
+            None => return future::ok(Self::response_error("Missing Token")).boxed2(),
+        };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
             return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2();
@@ -231,11 +230,11 @@ impl FlowService {
     }
 
     fn handle_eof(&self, req: Request, route: regex::Captures) -> ResponseFuture {
-        let token =
-            match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token") {
-                Some((_, token)) => token.into_owned(),
-                None => return future::ok(Self::response_error("Missing Token")).boxed2(),
-            };
+        let token = match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token")
+        {
+            Some((_, token)) => token.into_owned(),
+            None => return future::ok(Self::response_error("Missing Token")).boxed2(),
+        };
         let flow_id = route.get(1).unwrap().as_str();
         if !self.check_authorization(flow_id, &token) {
             return future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2();
@@ -494,31 +493,26 @@ fn start_service(
     deactive_timeout: Option<Duration>,
     meta_capacity: u64,
     data_capacity: u64,
-    blocking: bool,
-) -> Option<std::net::SocketAddr> {
-    if !cfg!(unix) && num_worker > 1 {
-        panic!("Multi-workers isn't supported on Windows");
-    }
-
+) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
     let auth_ptr = Arc::new(HMACAuthorizer::new());
     let mut workers = Vec::with_capacity(num_worker);
-    let barrier = Arc::new(Barrier::new(num_worker.checked_add(1).unwrap()));
 
     for idx in 0..num_worker {
-        let addr = addr.clone();
-        let listener = upstream_listener.try_clone().unwrap();
-        let barrier = barrier.clone();
+        // Size of backlog = 64.
+        let (io_tx, io_rx) = futures::sync::mpsc::channel::<std::net::TcpStream>(64);
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
-        let worker = thread::spawn(move || {
+        thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
-            let listener = TcpListener::from_listener(listener, &addr, &handle).unwrap();
             let http = Http::new();
-            let acceptor = listener.incoming().for_each(|(io, addr)| {
+            println!("Worker #{} is started.", idx);
+            core.run(io_rx.for_each(|io| {
+                let io = tokio::net::TcpStream::from_stream(io, &handle).unwrap();
+                let addr = io.peer_addr().unwrap();
                 let service = FlowService::new(
                     pool_ptr.clone(),
                     remote.clone(),
@@ -530,24 +524,16 @@ fn start_service(
                 io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                 http.bind_connection(&handle, io, addr, service);
                 Ok(())
-            });
-            println!("Worker #{} is started.", idx);
-            barrier.wait();
-            core.run(acceptor).unwrap();
+            })).unwrap();
         });
-        workers.push(worker);
+        workers.push(io_tx);
     }
-
-    barrier.wait();
-
-    if blocking {
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        unreachable!();
-    } else {
-        Some(upstream_listener.local_addr().unwrap())
-    }
+    let bind_addr = upstream_listener.local_addr().unwrap();
+    let service_thd =
+        thread::spawn(move || for (idx, io) in upstream_listener.incoming().enumerate() {
+            workers[idx % workers.len()].clone().send(io.unwrap()).wait().unwrap();
+        });
+    (bind_addr, service_thd)
 }
 
 fn main() {
@@ -558,15 +544,15 @@ fn main() {
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
-    start_service(
+    let (_, service_thd) = start_service(
         addr,
         num_worker,
         Some(pool_size),
         Some(Duration::from_secs(deactive_timeout)),
         meta_capacity,
         data_capacity,
-        true,
     );
+    service_thd.join().unwrap();
 }
 
 #[cfg(test)]
@@ -579,18 +565,17 @@ mod tests {
     const MAX_CAPACITY: u64 = 1048576;
     const DEFL_FLOW_PARAM: &str = r#"{"preserve_mode": false}"#;
 
-    fn spawn_server() -> (String, String) {
-        let port = start_service(
+    fn spawn_server() -> String {
+        let (bind_addr, _) = start_service(
             "127.0.0.1:0".parse().unwrap(),
             1,
             Some(32),
             Some(Duration::from_secs(6)),
             MAX_CAPACITY,
             MAX_CAPACITY,
-            false,
-        ).unwrap()
-            .port();
-        (format!("http://127.0.0.1:{}", port), format!("127.0.0.1:{}", port))
+        );
+        let port = bind_addr.port();
+        format!("http://127.0.0.1:{}", port)
     }
 
     fn create_flow(prefix: &str, param: &str) -> (String, String) {
@@ -788,7 +773,7 @@ mod tests {
 
     #[test]
     fn validate_route() {
-        let (ref prefix, _) = spawn_server();
+        let prefix = &spawn_server();
         let (ref flow_id, _) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         fn check_status(req: Request, status_code: StatusCode) -> Response {
@@ -872,7 +857,7 @@ mod tests {
 
     #[test]
     fn handle_new() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -959,7 +944,7 @@ mod tests {
 
     #[test]
     fn handle_push_fetch() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -1034,7 +1019,7 @@ mod tests {
 
     #[test]
     fn handle_push_pull() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
         let payload = vec![1u8; flow::REF_SIZE * 10];
@@ -1097,7 +1082,7 @@ mod tests {
 
     #[test]
     fn handle_eof() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
@@ -1128,7 +1113,7 @@ mod tests {
 
     #[test]
     fn recycle_and_release() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         let (tx, rx) = mpsc::channel();
@@ -1159,7 +1144,7 @@ mod tests {
 
     #[test]
     fn dropped() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let payload1: &[u8] = b"The quick brown fox jumps\nover the lazy dog";
         let payload2: &[u8] = b"The guick yellow fox jumps\nover the fast cat";
@@ -1177,7 +1162,7 @@ mod tests {
 
     #[test]
     fn full_push() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         assert_eq!(req_push(prefix, flow_id, token, b"Hello"), (StatusCode::Ok, None));
@@ -1224,7 +1209,7 @@ mod tests {
 
     #[test]
     fn racing_pull() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
 
         let (send_tx, send_rx) = mpsc::channel();
@@ -1304,7 +1289,7 @@ mod tests {
 
     #[test]
     fn overload() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -1339,7 +1324,7 @@ mod tests {
 
     #[test]
     fn handle_status() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let (ref flow_id, ref token) = create_flow(prefix, DEFL_FLOW_PARAM);
         let fake_id = "bdc62e9323003d0f5cb44c8c745a0470";
         assert_eq!(req_status(prefix, fake_id), (StatusCode::NotFound, None));
@@ -1361,7 +1346,7 @@ mod tests {
 
     #[test]
     fn fixed_length() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
@@ -1408,28 +1393,12 @@ mod tests {
 
     #[test]
     fn multi_workers() {
-        let res = thread::spawn(|| {
-            start_service(
-                "127.0.0.1:0".parse().unwrap(),
-                4,
-                None,
-                None,
-                MAX_CAPACITY,
-                MAX_CAPACITY,
-                false,
-            ).unwrap();
-        }).join()
-            .is_ok();
-        if cfg!(unix) {
-            assert_eq!(res, true);
-        } else {
-            assert_eq!(res, false);
-        }
+        start_service("127.0.0.1:0".parse().unwrap(), 4, None, None, MAX_CAPACITY, MAX_CAPACITY);
     }
 
     #[test]
     fn preserve_mode() {
-        let prefix = &spawn_server().0;
+        let prefix = &spawn_server();
         let mut core = Core::new().unwrap();
         let client = Client::new(&core.handle());
 
