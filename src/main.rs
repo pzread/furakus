@@ -15,6 +15,7 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core as tokio;
+extern crate tokio_proto;
 extern crate tokio_tls;
 extern crate url;
 extern crate uuid;
@@ -26,7 +27,7 @@ mod utils;
 use auth::{Authorizer, HMACAuthorizer};
 use dotenv::dotenv;
 use flow::Flow;
-use futures::{future, stream, Future, Sink, Stream};
+use futures::{future, stream, Future, Sink, Stream, Then};
 use hyper::{Method, StatusCode};
 use hyper::header::{AcceptRanges, AccessControlAllowMethods, AccessControlAllowOrigin,
                     ByteRangeSpec, CacheControl, CacheDirective, Charset, ContentDisposition,
@@ -44,10 +45,11 @@ use serde::de::DeserializeOwned;
 use std::{env, thread};
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::reactor::{self, Core};
-use tokio_tls::TlsAcceptorExt;
+use tokio_proto::BindServer;
 use utils::BoxedFuture;
 
 #[derive(Debug)]
@@ -57,12 +59,13 @@ pub enum Error {
     Internal(hyper::Error),
 }
 
-struct FlowService {
+struct FlowService<ProtoReq, ProtoRes, ProtoErr> {
     pool: Arc<RwLock<Pool>>,
     remote: reactor::Remote,
     meta_capacity: u64,
     data_capacity: u64,
     authorizer: Arc<Authorizer>,
+    _marker: PhantomData<(ProtoReq, ProtoRes, ProtoErr)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,7 +95,7 @@ struct ErrorResponse {
 
 type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
 
-impl FlowService {
+impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
     fn new(
         pool: Arc<RwLock<Pool>>,
         remote: reactor::Remote,
@@ -106,6 +109,7 @@ impl FlowService {
             meta_capacity,
             data_capacity,
             authorizer,
+            _marker: PhantomData,
         }
     }
 
@@ -420,13 +424,23 @@ impl FlowService {
     }
 }
 
-impl Service for FlowService {
-    type Request = Request;
-    type Response = Response;
-    type Error = hyper::Error;
-    type Future = ResponseFuture;
+impl<ProtoReq, ProtoRes, ProtoErr> Service for FlowService<ProtoReq, ProtoRes, ProtoErr>
+where
+    Request: From<ProtoReq>,
+    Response: Into<ProtoRes>,
+    hyper::Error: Into<ProtoErr>,
+{
+    type Request = ProtoReq;
+    type Response = ProtoRes;
+    type Error = ProtoErr;
+    type Future = Then<
+        ResponseFuture,
+        Result<ProtoRes, ProtoErr>,
+        fn(Result<Response, hyper::Error>)
+            -> Result<ProtoRes, ProtoErr>,
+    >;
 
-    fn call(&self, req: Request) -> Self::Future {
+    fn call(&self, req: Self::Request) -> Self::Future {
         lazy_static! {
             static ref PATTERN_NEW: Regex = Regex::new(r"^/new$").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/push$").unwrap();
@@ -437,7 +451,7 @@ impl Service for FlowService {
                 .unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/pull$").unwrap();
         }
-
+        let req = Request::from(req);
         let path = &req.path().to_owned();
         match req.method() {
             &Method::Post => if let Some(route) = PATTERN_NEW.captures(path) {
@@ -467,8 +481,10 @@ impl Service for FlowService {
                 vec![Method::Post, Method::Put, Method::Get, Method::Options],
             ))).boxed2(),
             _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed2(),
-        }.map(|res| res.with_header(AccessControlAllowOrigin::Any))
-            .boxed2()
+        }.then(|result| match result {
+            Ok(res) => Ok(res.with_header(AccessControlAllowOrigin::Any).into()),
+            Err(err) => Err(err.into()),
+        })
     }
 }
 
@@ -504,7 +520,6 @@ fn start_service(
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
     let auth_ptr = Arc::new(HMACAuthorizer::new());
-    let tls_ptr = tls_config.map(|tls_config| Arc::new(tls_config));
     let mut workers = Vec::with_capacity(num_worker);
 
     for idx in 0..num_worker {
@@ -512,16 +527,22 @@ fn start_service(
         let (io_tx, io_rx) = futures::sync::mpsc::channel::<std::net::TcpStream>(64);
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
-        let tls_ptr = tls_ptr.clone();
+        let tls_config = tls_config.clone();
         thread::spawn(move || {
             let mut core = Core::new().unwrap();
+            let handle = core.handle();
             let remote = core.remote();
-            let handle = &core.handle();
-            let http = &Http::new();
+            let http = Http::new();
+            // Create the corresponding binding function.
+            let bind_fn: Box<Fn(_, _, _) -> ()> = if let Some(tls_config) = tls_config {
+                let proto = tokio_tls::proto::Server::new(http, tls_config);
+                Box::new(move |handle, io, service| proto.bind_server(handle, io, service))
+            } else {
+                Box::new(move |handle, io, service| http.bind_server(handle, io, service))
+            };
             println!("Worker #{} is started.", idx);
-            core.run(io_rx.for_each::<_, Box<Future<Item = (), Error = ()>>>(|io| {
-                let io = tokio::net::TcpStream::from_stream(io, handle).unwrap();
-                let addr = io.peer_addr().unwrap();
+            core.run(io_rx.for_each(|io| {
+                let io = tokio::net::TcpStream::from_stream(io, &handle).unwrap();
                 // 4x REF_SIZE should be enough for sending a chunk.
                 io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                 let service = FlowService::new(
@@ -531,16 +552,8 @@ fn start_service(
                     data_capacity,
                     auth_ptr.clone(),
                 );
-                if let Some(ref tls_ptr) = tls_ptr {
-                    let fut = tls_ptr
-                        .accept_async(io)
-                        .map(move |io| { http.bind_connection(handle, io, addr, service); })
-                        .or_else(|_| Ok(()));
-                    Box::new(fut)
-                } else {
-                    http.bind_connection(handle, io, addr, service);
-                    Box::new(future::ok(()))
-                }
+                bind_fn(&handle, io, service);
+                Ok(())
             })).unwrap();
         });
         workers.push(io_tx);
