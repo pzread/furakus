@@ -13,6 +13,7 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core as tokio;
+extern crate tokio_proto;
 extern crate url;
 extern crate uuid;
 mod auth;
@@ -23,7 +24,7 @@ mod utils;
 use auth::{Authorizer, HMACAuthorizer};
 use dotenv::dotenv;
 use flow::Flow;
-use futures::{future, stream, Future, Sink, Stream};
+use futures::{future, stream, Future, Sink, Stream, Then};
 use hyper::{Method, StatusCode};
 use hyper::header::{AcceptRanges, AccessControlAllowMethods, AccessControlAllowOrigin,
                     ByteRangeSpec, CacheControl, CacheDirective, Charset, ContentDisposition,
@@ -34,9 +35,11 @@ use pool::Pool;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use std::{env, mem, thread};
+use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::reactor::{self, Core};
+use tokio_proto::BindServer;
 use utils::BoxedFuture;
 
 #[derive(Debug)]
@@ -46,12 +49,13 @@ pub enum Error {
     Internal(hyper::Error),
 }
 
-struct FlowService {
+struct FlowService<ProtoReq, ProtoRes, ProtoErr> {
     pool: Arc<RwLock<Pool>>,
     remote: reactor::Remote,
     meta_capacity: u64,
     data_capacity: u64,
     authorizer: Arc<Authorizer>,
+    _marker: PhantomData<(ProtoReq, ProtoRes, ProtoErr)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,7 +85,7 @@ struct ErrorResponse {
 
 type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
 
-impl FlowService {
+impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
     fn new(
         pool: Arc<RwLock<Pool>>,
         remote: reactor::Remote,
@@ -95,6 +99,7 @@ impl FlowService {
             meta_capacity,
             data_capacity,
             authorizer,
+            _marker: PhantomData,
         }
     }
 
@@ -434,13 +439,23 @@ impl FlowService {
     }
 }
 
-impl Service for FlowService {
-    type Request = Request;
-    type Response = Response;
-    type Error = hyper::Error;
-    type Future = ResponseFuture;
+impl<ProtoReq, ProtoRes, ProtoErr> Service for FlowService<ProtoReq, ProtoRes, ProtoErr>
+where
+    Request: From<ProtoReq>,
+    Response: Into<ProtoRes>,
+    hyper::Error: Into<ProtoErr>,
+{
+    type Request = ProtoReq;
+    type Response = ProtoRes;
+    type Error = ProtoErr;
+    type Future = Then<
+        ResponseFuture,
+        Result<ProtoRes, ProtoErr>,
+        fn(Result<Response, hyper::Error>)
+            -> Result<ProtoRes, ProtoErr>,
+    >;
 
-    fn call(&self, req: Request) -> Self::Future {
+    fn call(&self, req: Self::Request) -> Self::Future {
         lazy_static! {
             static ref PATTERN_NEW: Regex = Regex::new(r"^/new$").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/push$").unwrap();
@@ -451,7 +466,7 @@ impl Service for FlowService {
                 .unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/pull$").unwrap();
         }
-
+        let req = Request::from(req);
         let path = &req.path().to_owned();
         match req.method() {
             &Method::Post => if let Some(route) = PATTERN_NEW.captures(path) {
@@ -481,8 +496,10 @@ impl Service for FlowService {
                 vec![Method::Post, Method::Put, Method::Get, Method::Options],
             ))).boxed2(),
             _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed2(),
-        }.map(|res| res.with_header(AccessControlAllowOrigin::Any))
-            .boxed2()
+        }.then(|result| match result {
+            Ok(res) => Ok(res.with_header(AccessControlAllowOrigin::Any).into()),
+            Err(err) => Err(err.into()),
+        })
     }
 }
 
@@ -512,7 +529,8 @@ fn start_service(
             println!("Worker #{} is started.", idx);
             core.run(io_rx.for_each(|io| {
                 let io = tokio::net::TcpStream::from_stream(io, &handle).unwrap();
-                let addr = io.peer_addr().unwrap();
+                // 4x REF_SIZE should be enough for sending a chunk.
+                io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
                 let service = FlowService::new(
                     pool_ptr.clone(),
                     remote.clone(),
@@ -520,9 +538,7 @@ fn start_service(
                     data_capacity,
                     auth_ptr.clone(),
                 );
-                // 4x REF_SIZE should be enough for sending a chunk.
-                io.set_send_buffer_size(flow::REF_SIZE * 4).unwrap();
-                http.bind_connection(&handle, io, addr, service);
+                http.bind_server(&handle, io, service);
                 Ok(())
             })).unwrap();
         });
