@@ -138,15 +138,18 @@ impl Pool {
 
         let droplist = iter::repeat(())
             .scan(self.timelink_tail.clone(), |tail_weakref, _| {
-                tail_weakref.as_ref().and_then(|weakref| weakref.upgrade()).and_then(|tail_ptr| {
-                    let node = tail_ptr.lock().unwrap();
-                    if node.timestamp.elapsed() <= deactive_timeout {
-                        None
-                    } else {
-                        *tail_weakref = node.prev.clone();
-                        Some(node.key.to_owned())
-                    }
-                })
+                tail_weakref
+                    .as_ref()
+                    .and_then(|weakref| weakref.upgrade())
+                    .and_then(|tail_ptr| {
+                        let node = tail_ptr.lock().unwrap();
+                        if node.timestamp.elapsed() <= deactive_timeout {
+                            None
+                        } else {
+                            *tail_weakref = node.prev.clone();
+                            Some(node.key.to_owned())
+                        }
+                    })
             })
             .collect::<Vec<String>>();
 
@@ -205,13 +208,9 @@ mod tests {
         let flow_a = Flow::new(FLOW_CONFIG);
         let flow_b = Flow::new(FLOW_CONFIG);
         let flow_c = Flow::new(FLOW_CONFIG);
-        let (flowa_id, flowb_id, flowc_id) = {
-            (
-                flow_a.read().unwrap().id.to_owned(),
-                flow_b.read().unwrap().id.to_owned(),
-                flow_c.read().unwrap().id.to_owned(),
-            )
-        };
+        let flowa_id = flow_a.read().unwrap().id.to_owned();
+        let flowb_id = flow_b.read().unwrap().id.to_owned();
+        let flowc_id = flow_c.read().unwrap().id.to_owned();
         {
             let mut pool = ptr.write().unwrap();
             assert_eq!(pool.insert(flow_a.clone()), Ok(()));
@@ -245,9 +244,7 @@ mod tests {
         let mut core = Core::new().unwrap();
         let ptr = Pool::new(None, None);
         let flow = Flow::new(FLOW_CONFIG);
-        let flow_id = {
-            flow.read().unwrap().id.to_owned()
-        };
+        let flow_id = flow.read().unwrap().id.to_owned();
         {
             let mut pool = ptr.write().unwrap();
             pool.insert(flow.clone()).unwrap();
@@ -261,10 +258,7 @@ mod tests {
             let fut = flow.read().unwrap().pull(0, Some(0));
             core.run(fut).is_err();
         }
-        {
-            let pool = ptr.read().unwrap();
-            assert!(pool.get(&flow_id).is_none());
-        }
+        assert!(ptr.read().unwrap().get(&flow_id).is_none());
     }
 
     #[test]
@@ -273,18 +267,13 @@ mod tests {
         let flow = Flow::new(FLOW_CONFIG);
         {
             let ptr = Pool::new(None, None);
-            let flow_id = {
-                flow.read().unwrap().id.to_owned()
-            };
+            let flow_id = flow.read().unwrap().id.to_owned();
             {
                 let mut pool = ptr.write().unwrap();
                 pool.insert(flow.clone()).unwrap();
                 pool.remove(&flow_id).unwrap();
             }
-            {
-                let pool = ptr.read().unwrap();
-                assert!(pool.get(&flow_id).is_none());
-            }
+            assert!(ptr.read().unwrap().get(&flow_id).is_none());
             {
                 let fut = flow.write().unwrap().close();
                 core.run(fut).unwrap();
