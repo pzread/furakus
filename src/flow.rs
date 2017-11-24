@@ -25,8 +25,8 @@ pub enum Chunk {
 }
 
 impl Chunk {
-    fn data(data: Bytes) -> Self {
-        Chunk::Data(0, data)
+    fn data(data: Vec<u8>) -> Self {
+        Chunk::Data(0, Bytes::from(data))
     }
 
     fn eof() -> Self {
@@ -253,7 +253,11 @@ impl Flow {
         while self.sanitize_index < next_index {
             let closed = {
                 // Get should always success.
-                let chunk = self.bucket.get(&self.sanitize_index).unwrap().lock().unwrap();
+                let chunk = self.bucket
+                    .get(&self.sanitize_index)
+                    .unwrap()
+                    .lock()
+                    .unwrap();
                 if chunk.count() < keepcount {
                     break;
                 }
@@ -274,8 +278,12 @@ impl Flow {
             // If there isn't overflow, benignly keep chunks alive.
             while self.tail_index < self.sanitize_index && self.check_overflow() {
                 {
-                    let chunk_len =
-                        self.bucket.get(&self.tail_index).unwrap().lock().unwrap().len();
+                    let chunk_len = self.bucket
+                        .get(&self.tail_index)
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .len();
                     // Update statistic.
                     self.statistic.dropped += chunk_len;
                 }
@@ -308,7 +316,7 @@ impl Flow {
         }
     }
 
-    pub fn push(&mut self, data: Bytes) -> FlowFuture<u64> {
+    pub fn push(&mut self, data: Vec<u8>) -> FlowFuture<u64> {
         let chunk = Chunk::data(data);
         // Acquire the chunk. Return if failed.
         let (chunk_index, chunk_end) = match self.acquire_chunk(chunk) {
@@ -331,7 +339,9 @@ impl Flow {
         let fut = if is_overflow {
             let (tx, rx) = oneshot::channel();
             self.waiting_push.push_back((chunk_index, chunk_end, tx));
-            rx.map(move |_| chunk_index).map_err(|_| Error::Other).boxed2()
+            rx.map(move |_| chunk_index)
+                .map_err(|_| Error::Other)
+                .boxed2()
         } else {
             future::ok(chunk_index).boxed2()
         };
