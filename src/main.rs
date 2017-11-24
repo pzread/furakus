@@ -13,7 +13,6 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core as tokio;
-extern crate tokio_proto;
 extern crate url;
 extern crate uuid;
 mod auth;
