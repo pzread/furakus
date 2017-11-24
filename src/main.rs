@@ -1317,21 +1317,13 @@ mod tests {
                 tx.send(()).unwrap();
             });
         }
-        {
-            let prefix = prefix.clone();
-            let flow_id = flow_id.clone();
-            let token = token.clone();
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let prefix = &prefix;
-                let flow_id = &flow_id;
-                let token = &token;
-                req_push(prefix, flow_id, token, &vec![0u8; MAX_CAPACITY as usize]);
-                req_close(prefix, flow_id, token);
-                tx.send(()).unwrap();
-            });
+
+        loop {
+            let status = req_status(prefix, flow_id).1.unwrap();
+            if status.pushed >= MAX_CAPACITY {
+                break;
+            }
         }
-        rx.recv().unwrap();
 
         assert_eq!(
             req_push(prefix, flow_id, token, b"Hello"),
