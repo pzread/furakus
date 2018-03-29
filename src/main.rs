@@ -7,7 +7,6 @@ extern crate language_tags;
 #[macro_use]
 extern crate lazy_static;
 extern crate native_tls;
-extern crate openssl;
 extern crate regex;
 extern crate ring;
 extern crate serde;
@@ -22,6 +21,7 @@ extern crate uuid;
 mod auth;
 mod flow;
 mod pool;
+mod tls;
 mod utils;
 
 use auth::{Authorizer, HMACAuthorizer};
@@ -35,17 +35,11 @@ use hyper::header::{AcceptRanges, AccessControlAllowHeaders, AccessControlAllowM
                     ContentRange, ContentRangeSpec, ContentType, DispositionParam,
                     DispositionType, ETag, EntityTag, Range, RangeUnit};
 use hyper::server::{Http, Request, Response, Service};
-use native_tls::{TlsAcceptor, TlsAcceptorBuilder};
-use native_tls::backend::openssl::TlsAcceptorBuilderExt;
-use openssl::pkey::PKey;
-use openssl::ssl::{SslAcceptorBuilder, SslMethod};
-use openssl::x509::X509;
+use native_tls::TlsAcceptor;
 use pool::Pool;
 use regex::Regex;
 use serde::de::DeserializeOwned;
 use std::{env, mem, thread};
-use std::fs::File;
-use std::io::{BufReader, Read};
 use std::marker::PhantomData;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -534,26 +528,6 @@ where
     }
 }
 
-fn config_tls(cert_path: &str, priv_path: &str) -> TlsAcceptor {
-    let fullchain = {
-        let cert_file = File::open(cert_path).unwrap();
-        let mut buf = Vec::new();
-        BufReader::new(cert_file).read_to_end(&mut buf).unwrap();
-        X509::stack_from_pem(&buf).unwrap()
-    };
-    let privkey = {
-        let priv_file = File::open(priv_path).unwrap();
-        let mut buf = Vec::new();
-        BufReader::new(priv_file).read_to_end(&mut buf).unwrap();
-        PKey::private_key_from_pem(&buf).unwrap()
-    };
-    let cert = fullchain.first().unwrap();
-    let builder =
-        SslAcceptorBuilder::mozilla_modern(SslMethod::tls(), &privkey, &cert, &fullchain[1..])
-            .unwrap();
-    TlsAcceptorBuilder::from_openssl(builder).build().unwrap()
-}
-
 fn start_service(
     addr: std::net::SocketAddr,
     num_worker: usize,
@@ -561,7 +535,7 @@ fn start_service(
     deactive_timeout: Option<Duration>,
     meta_capacity: u64,
     data_capacity: u64,
-    tls_config: Option<TlsAcceptor>,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
@@ -573,15 +547,15 @@ fn start_service(
         let (io_tx, io_rx) = futures::sync::mpsc::channel::<std::net::TcpStream>(64);
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
-        let tls_config = tls_config.clone();
+        let tls_acceptor = tls_acceptor.clone();
         thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
             // Create the corresponding binding function.
-            let bind_fn: Box<Fn(_, _) -> _> = if let Some(tls_config) = tls_config {
+            let bind_fn: Box<Fn(_, _) -> _> = if let Some(tls_acceptor) = tls_acceptor {
                 Box::new(move |io, service| {
-                    tls_config
+                    tls_acceptor
                         .accept_async(io)
                         .map_err(|_| ())
                         .and_then(move |io| {
@@ -640,10 +614,7 @@ fn main() {
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
-    let tls_config = config_tls(
-        &env::var("TLS_CERT").unwrap(),
-        &env::var("TLS_PRIVATE").unwrap(),
-    );
+    let tls_acceptor = tls::build_tls_from_pfx(&env::var("TLS_PFX").unwrap());
     let (_, service_thd) = start_service(
         addr,
         num_worker,
@@ -651,7 +622,7 @@ fn main() {
         Some(Duration::from_secs(deactive_timeout)),
         meta_capacity,
         data_capacity,
-        Some(tls_config),
+        Some(tls_acceptor),
     );
     service_thd.join().unwrap();
 }
@@ -663,7 +634,8 @@ mod tests {
     use hyper::client::{Client, HttpConnector};
     use native_tls::{Certificate, TlsConnector};
     use std::collections::HashSet;
-    use std::io;
+    use std::fs::File;
+    use std::io::{self, Read};
     use std::sync::mpsc;
     use tokio::net::TcpStream;
     use tokio_tls::{TlsConnectorExt, TlsStream};
@@ -1719,7 +1691,7 @@ mod tests {
 
     #[test]
     fn tls_service() {
-        let tls_config = config_tls("./tests/cert.pem", "./tests/private.pem");
+        let tls_acceptor = tls::build_tls_from_pfx("./tests/cert.p12");
         let (bind_addr, _) = start_service(
             "127.0.0.1:0".parse().unwrap(),
             1,
@@ -1727,16 +1699,16 @@ mod tests {
             Some(Duration::from_secs(6)),
             MAX_CAPACITY,
             MAX_CAPACITY,
-            Some(tls_config),
+            Some(tls_acceptor),
         );
 
         let prefix = format!("https://127.0.0.1:{}", bind_addr.port());
         let mut core = Core::new().unwrap();
 
         let rootca = {
-            let cert_file = File::open("./tests/cert.der").unwrap();
+            let mut cert_file = File::open("./tests/cert.der").unwrap();
             let mut buf = Vec::new();
-            BufReader::new(cert_file).read_to_end(&mut buf).unwrap();
+            cert_file.read_to_end(&mut buf).unwrap();
             Certificate::from_der(&buf).unwrap()
         };
         let mut tls_builder = TlsConnector::builder().unwrap();
