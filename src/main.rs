@@ -614,7 +614,13 @@ fn main() {
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
+    #[cfg(target_os = "windows")]
     let tls_acceptor = tls::build_tls_from_pfx(&env::var("TLS_PFX").unwrap());
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    let tls_acceptor = tls::build_tls_from_pem(
+        &env::var("TLS_CERT").unwrap(),
+        &env::var("TLS_PRIVATE").unwrap(),
+    );
     let (_, service_thd) = start_service(
         addr,
         num_worker,
@@ -1691,7 +1697,10 @@ mod tests {
 
     #[test]
     fn tls_service() {
+        #[cfg(target_os = "windows")]
         let tls_acceptor = tls::build_tls_from_pfx("./tests/cert.p12");
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+        let tls_acceptor = tls::build_tls_from_pem("./tests/cert.pem", "./tests/private.pem");
         let (bind_addr, _) = start_service(
             "127.0.0.1:0".parse().unwrap(),
             1,
