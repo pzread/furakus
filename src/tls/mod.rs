@@ -7,8 +7,7 @@ mod imp;
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
 pub use self::imp::build_tls_from_pem;
 use native_tls::TlsAcceptor;
-use std::fs::File;
-use std::io::Read;
+use std::{fs::File, io::Read};
 
 #[allow(dead_code)]
 pub fn build_tls_from_pfx(pfx_path: &str) -> TlsAcceptor {

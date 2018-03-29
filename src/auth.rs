@@ -1,5 +1,4 @@
-use ring::{digest, hmac, rand};
-use ring::rand::SecureRandom;
+use ring::{digest, hmac, rand, rand::SecureRandom};
 use utils;
 
 pub trait Authorizer: Send + Sync + 'static {

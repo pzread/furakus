@@ -1,9 +1,6 @@
 use bytes::Bytes;
-use futures::{future, Future};
-use futures::sync::oneshot;
-use std::collections::{HashMap, VecDeque};
-use std::mem;
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use futures::{future, Future, sync::oneshot};
+use std::{mem, collections::{HashMap, VecDeque}, sync::{Arc, Mutex, RwLock, Weak}};
 use utils::BoxedFuture;
 use uuid::Uuid;
 
