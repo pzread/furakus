@@ -253,19 +253,20 @@ impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
                     }
                 }
             })
-            .and_then(|_| Ok(Self::response_ok()))
-            .or_else(|err| match err {
-                HyperError::Io(ref err)
+            .then(move |result| match result {
+                Ok(_) => future::ok(Self::response_ok()).boxed2(),
+                Err(HyperError::Io(ref err))
                     if err.get_ref()
                         .and_then(|inner| inner.downcast_ref::<FlowError>())
                         .map(|inner| *inner != FlowError::Other)
                         .unwrap_or(false) =>
                 {
-                    Ok(Self::response_error("Not Ready"))
+                    future::ok(Self::response_error("Not Ready")).boxed2()
                 }
-                _ => Err(err),
+                Err(err) => {
                     let mut flow = flow_ptr.write().unwrap();
                     flow.close().then(|_| Err(err))
+                }.boxed2(),
             })
             .boxed2()
     }
@@ -503,7 +504,8 @@ where
             static ref PATTERN_NEW: Regex = Regex::new(r"^/new$").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/push$").unwrap();
             static ref PATTERN_EOF: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/eof$").unwrap();
-            static ref PATTERN_STATUS: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/status$").unwrap();
+            static ref PATTERN_STATUS: Regex =
+                Regex::new(r"^/flow/([a-f0-9]{32})/status$").unwrap();
             static ref PATTERN_FETCH: Regex =
                 Regex::new(r"^/flow/([a-f0-9]{32})/fetch/(\d+)$").unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/pull$").unwrap();
