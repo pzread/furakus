@@ -2042,11 +2042,13 @@ mod tests {
                 assert!(res.starts_with("HTTP/1.1 500 Internal Server Error"));
             })
         };
+
         assert_eq!(
             req_fetch(prefix, flow_id, 0),
             (StatusCode::Ok, Some(payload))
         );
         assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::NotFound, None));
+
         thd.join().unwrap();
     }
 }
