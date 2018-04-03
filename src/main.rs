@@ -265,7 +265,9 @@ impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
                 }
                 Err(err) => {
                     let mut flow = flow_ptr.write().unwrap();
-                    flow.close().then(|_| Err(err))
+                    flow.close().then(|_| {
+                        future::ok(Response::new().with_status(StatusCode::InternalServerError))
+                    })
                 }.boxed2(),
             })
             .boxed2()
