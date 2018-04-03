@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures::{future, Future, sync::oneshot};
-use std::{mem, collections::{HashMap, VecDeque}, sync::{Arc, Mutex, RwLock, Weak}};
+use std::{error, fmt, mem, collections::{HashMap, VecDeque}, sync::{Arc, Mutex, RwLock, Weak}};
 use utils::BoxedFuture;
 use uuid::Uuid;
 
@@ -13,6 +13,24 @@ pub enum Error {
     NotReady,
     Eof,
     Other,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl error::Error for Error {
+    fn description(&self) -> &str {
+        match *self {
+            Error::Invalid => "Invalid",
+            Error::Dropped => "Dropped",
+            Error::NotReady => "NotReady",
+            Error::Eof => "Eof",
+            Error::Other => "Other",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,8 +113,8 @@ type FlowFuture<T> = Box<Future<Item = T, Error = Error> + Send>;
 impl Flow {
     pub fn new(config: Config) -> Arc<RwLock<Self>> {
         lazy_static! {
-            static ref META_SIZE: u64 = (mem::size_of::<Mutex<Chunk>>() +
-                                         mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
+            static ref META_SIZE: u64 =
+                (mem::size_of::<Mutex<Chunk>>() + mem::size_of::<Arc<Mutex<Chunk>>>()) as u64;
         }
         let bucket_capacity = if config.meta_capacity == 0 {
             0
@@ -425,7 +443,7 @@ mod tests {
         ($a:expr, $b:expr) => {
             let fut = $a;
             assert_eq!(fut.wait(), $b);
-        }
+        };
     }
 
     #[test]
