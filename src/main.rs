@@ -263,7 +263,7 @@ impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
                 {
                     future::ok(Self::response_error("Not Ready")).boxed2()
                 }
-                Err(err) => {
+                Err(_) => {
                     let mut flow = flow_ptr.write().unwrap();
                     flow.close().then(|_| {
                         future::ok(Response::new().with_status(StatusCode::InternalServerError))
@@ -668,14 +668,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::Uri;
-    use hyper::client::{Client, HttpConnector};
+    use hyper::{Uri, client::{Client, HttpConnector}};
     use native_tls::{Certificate, TlsConnector};
-    use std::collections::HashSet;
-    use std::fs::File;
-    use std::io::Read;
-    use std::sync::mpsc;
-    use std::u64;
+    use std::{collections::HashSet, fs::File, io::{Read, prelude::*}, sync::mpsc, u64};
     use tokio::net::TcpStream;
     use tokio_tls::{TlsConnectorExt, TlsStream};
 
@@ -1741,6 +1736,27 @@ mod tests {
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
     }
 
+    struct HttpsConnector {
+        tls: Arc<TlsConnector>,
+        http: HttpConnector,
+    }
+
+    impl Service for HttpsConnector {
+        type Request = Uri;
+        type Response = TlsStream<TcpStream>;
+        type Error = IoError;
+        type Future = Box<Future<Item = Self::Response, Error = IoError>>;
+
+        fn call(&self, uri: Uri) -> Self::Future {
+            let tls_connector = self.tls.clone();
+            Box::new(self.http.call(uri).and_then(move |io| {
+                tls_connector
+                    .connect_async("example.com", io)
+                    .map_err(|err| IoError::new(io::ErrorKind::Other, err))
+            }))
+        }
+    }
+
     #[test]
     fn tls_service() {
         #[cfg(target_os = "windows")]
@@ -1801,27 +1817,6 @@ mod tests {
                 Ok(())
             })
         })).unwrap();
-    }
-
-    struct HttpsConnector {
-        tls: Arc<TlsConnector>,
-        http: HttpConnector,
-    }
-
-    impl Service for HttpsConnector {
-        type Request = Uri;
-        type Response = TlsStream<TcpStream>;
-        type Error = IoError;
-        type Future = Box<Future<Item = Self::Response, Error = IoError>>;
-
-        fn call(&self, uri: Uri) -> Self::Future {
-            let tls_connector = self.tls.clone();
-            Box::new(self.http.call(uri).and_then(move |io| {
-                tls_connector
-                    .connect_async("example.com", io)
-                    .map_err(|err| IoError::new(io::ErrorKind::Other, err))
-            }))
-        }
     }
 
     #[test]
@@ -2003,5 +1998,55 @@ mod tests {
         }).unwrap();
 
         thd2.join().unwrap();
+    }
+
+    #[test]
+    fn early_drop() {
+        let prefix = &spawn_server();
+        // TODO: Refactor
+        let (host, port) = {
+            let url = url::Url::parse(prefix).unwrap();
+            (url.host_str().unwrap().to_owned(), url.port().unwrap())
+        };
+
+        let (ref flow_id, ref token) = create_flow(prefix, &DEFL_FLOW_PARAM);
+        let payload = vec![1u8; flow::REF_SIZE];
+
+        let thd = {
+            let flow_id = flow_id.to_owned();
+            let token = token.to_owned();
+            let payload = payload.clone();
+            thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect((host.as_str(), port)).unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "POST /flow/{}/push?token={} HTTP/1.1\r\n\
+                             Host: {}:{}\r\n\
+                             Accept: */*\r\n\
+                             Content-Type: application/octect-stream\r\n\
+                             Connection: keep-alive\r\n\
+                             Content-Length: 9223372036854775807\r\n\r\n",
+                            flow_id,
+                            token,
+                            host.as_str(),
+                            port
+                        ).as_bytes(),
+                    )
+                    .unwrap();
+                stream.write_all(&payload).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf).unwrap();
+                let res = String::from_utf8(buf).unwrap();
+                assert!(res.starts_with("HTTP/1.1 500 Internal Server Error"));
+            })
+        };
+        assert_eq!(
+            req_fetch(prefix, flow_id, 0),
+            (StatusCode::Ok, Some(payload))
+        );
+        assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::NotFound, None));
+        thd.join().unwrap();
     }
 }
