@@ -640,6 +640,7 @@ mod tests {
     use std::fs::File;
     use std::io::{self, Read};
     use std::sync::mpsc;
+    use std::u64;
     use tokio::net::TcpStream;
     use tokio_tls::{TlsConnectorExt, TlsStream};
 
@@ -1198,6 +1199,19 @@ mod tests {
             req_fetch(prefix, flow_id, 1),
             (StatusCode::Ok, Some(payload2.to_vec()))
         );
+
+        let req = Request::new(
+            Method::Get,
+            format!("{}/flow/{}/fetch/123{}", prefix, flow_id, u64::MAX)
+                .parse()
+                .unwrap(),
+        );
+        core.run({
+            let client = Client::new(handle);
+            client
+                .request(req)
+                .and_then(|res| check_error_response(res, "Invalid Parameter"))
+        }).unwrap();
 
         let mut req = Request::new(
             Method::Put,
