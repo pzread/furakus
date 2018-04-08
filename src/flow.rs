@@ -436,7 +436,10 @@ mod tests {
         let ptr = Flow::new(FLOW_CONFIG);
         sync_assert_eq!(ptr.write().unwrap().push(vec![1u8; 1234].into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(1));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(vec![1u8; 1234].into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(vec![1u8; 1234].into())
+        );
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok("hello".into()));
         sync_assert_eq!(ptr.read().unwrap().pull(100, Some(0)), Err(Error::NotReady));
     }
@@ -463,7 +466,10 @@ mod tests {
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok("hello".into()));
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::NotReady));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
-        sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Err(Error::Invalid));
+        sync_assert_eq!(
+            ptr.write().unwrap().push("hello".into()),
+            Err(Error::Invalid)
+        );
         sync_assert_eq!(ptr.read().unwrap().pull(2, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
         sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
@@ -478,7 +484,10 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push("hello".into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
         sync_assert_eq!(ptr.write().unwrap().close(), Err(Error::Invalid));
-        sync_assert_eq!(ptr.write().unwrap().push("world".into()), Err(Error::Invalid));
+        sync_assert_eq!(
+            ptr.write().unwrap().push("world".into()),
+            Err(Error::Invalid)
+        );
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
     }
 
@@ -498,13 +507,28 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload2.clone().into()), Ok(1));
         let fut = ptr.write().unwrap().push(payload3.clone().into());
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(1, Some(0)),
+            Ok(payload2.clone().into())
+        );
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(1, Some(0)),
+            Ok(payload2.clone().into())
+        );
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(payload1.clone().into())
+        );
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(payload1.clone().into())
+        );
         sync_assert_eq!(fut, Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(1, Some(0)),
+            Ok(payload2.clone().into())
+        );
         sync_assert_eq!(ptr.write().unwrap().push(payload3.clone().into()), Ok(3));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Dropped));
         assert_eq!(ptr.read().unwrap().get_range(), (2, 4));
@@ -533,10 +557,22 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
         sync_assert_eq!(ptr.write().unwrap().push(payload2.clone().into()), Ok(1));
         let fut = ptr.write().unwrap().push(payload3.clone().into());
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
-        sync_assert_eq!(ptr.write().unwrap().push(payload3.clone().into()), Err(Error::NotReady));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload2.clone().into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(payload1.clone().into())
+        );
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(payload1.clone().into())
+        );
+        sync_assert_eq!(
+            ptr.write().unwrap().push(payload3.clone().into()),
+            Err(Error::NotReady)
+        );
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(1, Some(0)),
+            Ok(payload2.clone().into())
+        );
         sync_assert_eq!(fut, Ok(2));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Dropped));
@@ -576,7 +612,10 @@ mod tests {
         sync_assert_eq!(ptr.write().unwrap().push("C".into()), Err(Error::NotReady));
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
         sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok("A".into()));
-        sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(1, Some(0)),
+            Ok(payload.clone().into())
+        );
         sync_assert_eq!(fut, Ok(base_idx + 1));
     }
 
@@ -602,7 +641,10 @@ mod tests {
         }
 
         let fut = ptr.write().unwrap().push("B".into());
-        sync_assert_eq!(ptr.read().unwrap().pull(next_index, Some(0)), Ok("B".into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(next_index, Some(0)),
+            Ok("B".into())
+        );
         sync_assert_eq!(fut, Ok(next_index));
     }
 
@@ -698,10 +740,16 @@ mod tests {
             sync_assert_eq!(ptr.write().unwrap().push("world".into()), Ok(16));
 
             sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Err(Error::Dropped));
-            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
+            sync_assert_eq!(
+                ptr.read().unwrap().pull(1, Some(0)),
+                Ok(payload.clone().into())
+            );
 
             sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
-            sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Ok(payload.clone().into()));
+            sync_assert_eq!(
+                ptr.read().unwrap().pull(1, Some(0)),
+                Ok(payload.clone().into())
+            );
             sync_assert_eq!(ptr.write().unwrap().push("!".into()), Err(Error::Invalid));
             assert_eq!(*ob1.0.lock().unwrap(), false);
             sync_assert_eq!(ptr.read().unwrap().pull(17, Some(0)), Err(Error::Eof));
@@ -763,7 +811,10 @@ mod tests {
         let payload2 = vec![1u8; REF_SIZE + 2];
         sync_assert_eq!(ptr.write().unwrap().push(payload1.clone().into()), Ok(0));
         let fut = ptr.write().unwrap().push(payload2.clone().into());
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload1.clone().into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(payload1.clone().into())
+        );
         sync_assert_eq!(fut, Ok(1));
 
         let payload3 = vec![2u8; REF_SIZE];
@@ -803,9 +854,15 @@ mod tests {
         });
         let payload = vec![0u8; 0];
         sync_assert_eq!(ptr.write().unwrap().push(payload.clone().into()), Ok(0));
-        sync_assert_eq!(ptr.write().unwrap().push(vec![0u8; 1].into()), Err(Error::Invalid));
+        sync_assert_eq!(
+            ptr.write().unwrap().push(vec![0u8; 1].into()),
+            Err(Error::Invalid)
+        );
         sync_assert_eq!(ptr.write().unwrap().close(), Ok(()));
-        sync_assert_eq!(ptr.read().unwrap().pull(0, Some(0)), Ok(payload.clone().into()));
+        sync_assert_eq!(
+            ptr.read().unwrap().pull(0, Some(0)),
+            Ok(payload.clone().into())
+        );
         sync_assert_eq!(ptr.read().unwrap().pull(1, Some(0)), Err(Error::Eof));
     }
 }
