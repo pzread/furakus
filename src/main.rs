@@ -6,6 +6,7 @@ extern crate hyper;
 extern crate language_tags;
 #[macro_use]
 extern crate lazy_static;
+extern crate native_tls;
 extern crate regex;
 extern crate ring;
 extern crate serde;
@@ -13,11 +14,14 @@ extern crate serde;
 extern crate serde_derive;
 extern crate serde_json;
 extern crate tokio_core as tokio;
+extern crate tokio_tls;
+extern crate unicase;
 extern crate url;
 extern crate uuid;
 mod auth;
 mod flow;
 mod pool;
+mod tls;
 mod utils;
 
 use auth::{Authorizer, HMACAuthorizer};
@@ -25,19 +29,19 @@ use dotenv::dotenv;
 use flow::Flow;
 use futures::{future, stream, Future, Sink, Stream, Then};
 use hyper::{Method, StatusCode};
-use hyper::header::{AcceptRanges, AccessControlAllowMethods, AccessControlAllowOrigin,
-                    ByteRangeSpec, CacheControl, CacheDirective, Charset, ContentDisposition,
-                    ContentLength, ContentRange, ContentRangeSpec, ContentType, DispositionParam,
+use hyper::header::{AcceptRanges, AccessControlAllowHeaders, AccessControlAllowMethods,
+                    AccessControlAllowOrigin, AccessControlRequestHeaders, ByteRangeSpec,
+                    CacheControl, CacheDirective, Charset, ContentDisposition, ContentLength,
+                    ContentRange, ContentRangeSpec, ContentType, DispositionParam,
                     DispositionType, ETag, EntityTag, Range, RangeUnit};
 use hyper::server::{Http, Request, Response, Service};
+use native_tls::TlsAcceptor;
 use pool::Pool;
 use regex::Regex;
 use serde::de::DeserializeOwned;
-use std::{env, mem, thread};
-use std::marker::PhantomData;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::{marker::PhantomData, sync::{Arc, RwLock}, time::Duration, {env, mem, thread}};
 use tokio::reactor::{self, Core};
+use tokio_tls::TlsAcceptorExt;
 use utils::BoxedFuture;
 
 #[derive(Debug)]
@@ -500,12 +504,18 @@ where
                 future::ok(Response::new().with_status(StatusCode::NotFound)).boxed2()
             },
             &Method::Options => {
-                future::ok(Response::new().with_header(AccessControlAllowMethods(vec![
+                let mut response = Response::new().with_header(AccessControlAllowMethods(vec![
                     Method::Post,
                     Method::Put,
                     Method::Get,
                     Method::Options,
-                ]))).boxed2()
+                ]));
+                if let Some(headers) = req.headers().get::<AccessControlRequestHeaders>() {
+                    response
+                        .headers_mut()
+                        .set(AccessControlAllowHeaders(headers.to_vec()));
+                };
+                future::ok(response).boxed2()
             }
             _ => future::ok(Response::new().with_status(StatusCode::MethodNotAllowed)).boxed2(),
         }.then(|result| match result {
@@ -522,6 +532,7 @@ fn start_service(
     deactive_timeout: Option<Duration>,
     meta_capacity: u64,
     data_capacity: u64,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
     let upstream_listener = std::net::TcpListener::bind(&addr).unwrap();
     let pool_ptr = Pool::new(pool_size, deactive_timeout);
@@ -533,11 +544,34 @@ fn start_service(
         let (io_tx, io_rx) = futures::sync::mpsc::channel::<std::net::TcpStream>(64);
         let pool_ptr = pool_ptr.clone();
         let auth_ptr = auth_ptr.clone();
+        let tls_acceptor = tls_acceptor.clone();
         thread::spawn(move || {
             let mut core = Core::new().unwrap();
             let handle = core.handle();
             let remote = core.remote();
-            let http = Http::<hyper::Chunk>::new();
+            // Create the corresponding binding function.
+            let bind_fn: Box<Fn(_, _) -> _> = if let Some(tls_acceptor) = tls_acceptor {
+                Box::new(move |io, service| {
+                    tls_acceptor
+                        .accept_async(io)
+                        .map_err(|_| ())
+                        .and_then(move |io| {
+                            let http = Http::<hyper::Chunk>::new();
+                            http.serve_connection(io, service)
+                                .map(|_| ())
+                                .map_err(|_| ())
+                        })
+                        .boxed2()
+                })
+            } else {
+                Box::new(move |io, service| {
+                    let http = Http::<hyper::Chunk>::new();
+                    http.serve_connection(io, service)
+                        .map(|_| ())
+                        .map_err(|_| ())
+                        .boxed2()
+                })
+            };
             println!("Worker #{} is started.", idx);
             core.run(io_rx.for_each(|io| {
                 let io = tokio::net::TcpStream::from_stream(io, &handle).unwrap();
@@ -550,10 +584,7 @@ fn start_service(
                     data_capacity,
                     auth_ptr.clone(),
                 );
-                let fut = http.serve_connection(io, service)
-                    .map(|_| ())
-                    .map_err(|_| ());
-                handle.spawn(fut);
+                handle.spawn(bind_fn(io, service));
                 Ok(())
             })).unwrap();
         });
@@ -580,6 +611,13 @@ fn main() {
     let deactive_timeout: u64 = env::var("DEACTIVE_TIMEOUT").unwrap().parse().unwrap();
     let meta_capacity: u64 = env::var("META_CAPACITY").unwrap().parse().unwrap();
     let data_capacity: u64 = env::var("DATA_CAPACITY").unwrap().parse().unwrap();
+    #[cfg(target_os = "windows")]
+    let tls_acceptor = tls::build_tls_from_pfx(&env::var("TLS_PFX").unwrap());
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+    let tls_acceptor = tls::build_tls_from_pem(
+        &env::var("TLS_CERT").unwrap(),
+        &env::var("TLS_PRIVATE").unwrap(),
+    );
     let (_, service_thd) = start_service(
         addr,
         num_worker,
@@ -587,6 +625,7 @@ fn main() {
         Some(Duration::from_secs(deactive_timeout)),
         meta_capacity,
         data_capacity,
+        Some(tls_acceptor),
     );
     service_thd.join().unwrap();
 }
@@ -594,9 +633,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::client::{Client, Request};
+    use hyper::Uri;
+    use hyper::client::{Client, HttpConnector};
+    use native_tls::{Certificate, TlsConnector};
     use std::collections::HashSet;
+    use std::fs::File;
+    use std::io::{self, Read};
     use std::sync::mpsc;
+    use std::u64;
+    use tokio::net::TcpStream;
+    use tokio_tls::{TlsConnectorExt, TlsStream};
 
     const MAX_CAPACITY: u64 = 1048576;
     const DEFL_FLOW_PARAM: &str = r#"{"preserve_mode": false}"#;
@@ -609,6 +655,7 @@ mod tests {
             Some(Duration::from_secs(6)),
             MAX_CAPACITY,
             MAX_CAPACITY,
+            None,
         );
         format!("http://127.0.0.1:{}", bind_addr.port())
     }
@@ -904,13 +951,18 @@ mod tests {
         let req = Request::new(Method::Put, format!("{}/new", prefix).parse().unwrap());
         check_status(req, StatusCode::NotFound);
 
-        let req = Request::new(Method::Options, format!("{}/abc", prefix).parse().unwrap());
+        let access_headers = vec![
+            unicase::Ascii::new("Content-Type".to_string()),
+            unicase::Ascii::new("Content-Encoding".to_string()),
+        ];
+        let mut req = Request::new(Method::Options, format!("{}/abc", prefix).parse().unwrap());
+        req.headers_mut()
+            .set(AccessControlRequestHeaders(access_headers.clone()));
         let res = check_status(req, StatusCode::Ok);
         let allow_methods: HashSet<_> = res.headers()
             .get::<AccessControlAllowMethods>()
             .unwrap()
-            .clone()
-            .0
+            .to_vec()
             .into_iter()
             .collect();
         assert_eq!(
@@ -919,6 +971,13 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+        let allow_headers: HashSet<_> = res.headers()
+            .get::<AccessControlAllowHeaders>()
+            .unwrap()
+            .to_vec()
+            .into_iter()
+            .collect();
+        assert_eq!(allow_headers, access_headers.into_iter().collect());
 
         let req = Request::new(Method::Patch, format!("{}/new", prefix).parse().unwrap());
         check_status(req, StatusCode::MethodNotAllowed);
@@ -1140,6 +1199,19 @@ mod tests {
             req_fetch(prefix, flow_id, 1),
             (StatusCode::Ok, Some(payload2.to_vec()))
         );
+
+        let req = Request::new(
+            Method::Get,
+            format!("{}/flow/{}/fetch/123{}", prefix, flow_id, u64::MAX)
+                .parse()
+                .unwrap(),
+        );
+        core.run({
+            let client = Client::new(handle);
+            client
+                .request(req)
+                .and_then(|res| check_error_response(res, "Invalid Parameter"))
+        }).unwrap();
 
         let mut req = Request::new(
             Method::Put,
@@ -1635,6 +1707,89 @@ mod tests {
     }
 
     #[test]
+    fn tls_service() {
+        #[cfg(target_os = "windows")]
+        let tls_acceptor = tls::build_tls_from_pfx("./tests/cert.p12");
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
+        let tls_acceptor = tls::build_tls_from_pem("./tests/cert.pem", "./tests/private.pem");
+        let (bind_addr, _) = start_service(
+            "127.0.0.1:0".parse().unwrap(),
+            1,
+            Some(32),
+            Some(Duration::from_secs(6)),
+            MAX_CAPACITY,
+            MAX_CAPACITY,
+            Some(tls_acceptor),
+        );
+
+        let prefix = format!("https://127.0.0.1:{}", bind_addr.port());
+        let mut core = Core::new().unwrap();
+
+        let rootca = {
+            let mut cert_file = File::open("./tests/cert.der").unwrap();
+            let mut buf = Vec::new();
+            cert_file.read_to_end(&mut buf).unwrap();
+            Certificate::from_der(&buf).unwrap()
+        };
+        let mut tls_builder = TlsConnector::builder().unwrap();
+        tls_builder.add_root_certificate(rootca).unwrap();
+        let tls_connector = tls_builder.build().unwrap();
+        let mut connector = HttpsConnector {
+            tls: Arc::new(tls_connector),
+            http: HttpConnector::new(2, &core.handle()),
+        };
+        connector.http.enforce_http(false);
+        let client = Client::configure()
+            .connector(connector)
+            .build(&core.handle());
+
+        let mut req = Request::new(Method::Post, format!("{}/new", prefix).parse().unwrap());
+        req.set_body(DEFL_FLOW_PARAM);
+        req.headers_mut()
+            .set(ContentLength(DEFL_FLOW_PARAM.len() as u64));
+        core.run(client.request(req).and_then(|res| {
+            assert_eq!(res.status(), StatusCode::Ok);
+            res.body().concat2().and_then(|body| {
+                let data = serde_json::from_slice::<NewResponse>(&body).unwrap();
+                assert!(
+                    Regex::new("^[a-f0-9]{32}$")
+                        .unwrap()
+                        .find(&data.id)
+                        .is_some()
+                );
+                assert!(
+                    Regex::new("^[a-f0-9]{64}$")
+                        .unwrap()
+                        .find(&data.token)
+                        .is_some()
+                );
+                Ok(())
+            })
+        })).unwrap();
+    }
+
+    struct HttpsConnector {
+        tls: Arc<TlsConnector>,
+        http: HttpConnector,
+    }
+
+    impl Service for HttpsConnector {
+        type Request = Uri;
+        type Response = TlsStream<TcpStream>;
+        type Error = io::Error;
+        type Future = Box<Future<Item = Self::Response, Error = io::Error>>;
+
+        fn call(&self, uri: Uri) -> Self::Future {
+            let tls_connector = self.tls.clone();
+            Box::new(self.http.call(uri).and_then(move |io| {
+                tls_connector
+                    .connect_async("example.com", io)
+                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+            }))
+        }
+    }
+
+    #[test]
     fn multi_workers() {
         start_service(
             "127.0.0.1:0".parse().unwrap(),
@@ -1643,6 +1798,7 @@ mod tests {
             None,
             MAX_CAPACITY,
             MAX_CAPACITY,
+            None,
         );
     }
 

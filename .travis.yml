@@ -1,6 +1,6 @@
 language: rust
 
-sudo: false
+sudo: required
 
 cache: cargo
 
@@ -9,7 +9,7 @@ rust:
 
 env:
   global:
-  - RUSTFLAGS="-C link-dead-code"
+  # - RUSTFLAGS="-C link-dead-code"
   - RUST_BACKTRACE="1"
 
 addons:
