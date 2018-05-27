@@ -26,20 +26,21 @@ mod utils;
 
 use auth::{Authorizer, HMACAuthorizer};
 use dotenv::dotenv;
-use flow::Flow;
+use flow::{Error as FlowError, Flow};
 use futures::{future, stream, Future, Sink, Stream, Then};
-use hyper::{Method, StatusCode};
-use hyper::header::{AcceptRanges, AccessControlAllowHeaders, AccessControlAllowMethods,
-                    AccessControlAllowOrigin, AccessControlRequestHeaders, ByteRangeSpec,
-                    CacheControl, CacheDirective, Charset, ContentDisposition, ContentLength,
-                    ContentRange, ContentRangeSpec, ContentType, DispositionParam,
-                    DispositionType, ETag, EntityTag, Range, RangeUnit};
+use hyper::{Error as HyperError, Method, StatusCode,
+            header::{AcceptRanges, AccessControlAllowHeaders, AccessControlAllowMethods,
+                     AccessControlAllowOrigin, AccessControlRequestHeaders, ByteRangeSpec,
+                     CacheControl, CacheDirective, Charset, ContentDisposition, ContentLength,
+                     ContentRange, ContentRangeSpec, ContentType, DispositionParam,
+                     DispositionType, ETag, EntityTag, Range, RangeUnit}};
 use hyper::server::{Http, Request, Response, Service};
 use native_tls::TlsAcceptor;
 use pool::Pool;
 use regex::Regex;
 use serde::de::DeserializeOwned;
-use std::{marker::PhantomData, sync::{Arc, RwLock}, time::Duration, {env, mem, thread}};
+use std::{error, fmt, io::{self, Error as IoError}, marker::PhantomData, sync::{Arc, RwLock},
+          time::Duration, {env, mem, thread}};
 use tokio::reactor::{self, Core};
 use tokio_tls::TlsAcceptorExt;
 use utils::BoxedFuture;
@@ -48,7 +49,23 @@ use utils::BoxedFuture;
 pub enum Error {
     Invalid,
     NotReady,
-    Internal(hyper::Error),
+    Internal(HyperError),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+impl error::Error for Error {
+    fn description(&self) -> &str {
+        match *self {
+            Error::Invalid => "Invalid",
+            Error::NotReady => "NotReady",
+            Error::Internal(ref err) => err.description(),
+        }
+    }
 }
 
 struct FlowService<ProtoReq, ProtoRes, ProtoErr> {
@@ -85,7 +102,7 @@ struct ErrorResponse {
     pub message: String,
 }
 
-type ResponseFuture = Box<Future<Item = Response, Error = hyper::Error> + Send>;
+type ResponseFuture = Box<Future<Item = Response, Error = HyperError> + Send>;
 
 impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
     fn new(
@@ -214,27 +231,45 @@ impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
                         let mut flow = flow_ptr.write().unwrap();
                         flow.push(chunk)
                             .map(|_| buf_chunk)
-                            .map_err(|_| hyper::error::Error::Incomplete)
+                            .map_err(|err| HyperError::Io(IoError::new(io::ErrorKind::Other, err)))
                             .boxed2()
                     } else {
                         future::ok(buf_chunk).boxed2()
                     }
                 }
             })
-            .and_then(move |chunk| {
-                // Flush remaining chunk.
-                if chunk.len() > 0 {
-                    let mut flow = flow_ptr.write().unwrap();
-                    flow.push(chunk)
-                        .map(|_| ())
-                        .map_err(|_| hyper::error::Error::Incomplete)
-                        .boxed2()
-                } else {
-                    future::ok(()).boxed2()
+            .and_then({
+                let flow_ptr = flow_ptr.clone();
+                move |chunk| {
+                    // Flush remaining chunk.
+                    if chunk.len() > 0 {
+                        let mut flow = flow_ptr.write().unwrap();
+                        flow.push(chunk)
+                            .map(|_| ())
+                            .map_err(|err| HyperError::Io(IoError::new(io::ErrorKind::Other, err)))
+                            .boxed2()
+                    } else {
+                        future::ok(()).boxed2()
+                    }
                 }
             })
-            .and_then(|_| Ok(Self::response_ok()))
-            .or_else(|_| Ok(Self::response_error("Not Ready")))
+            .then(move |result| match result {
+                Ok(_) => future::ok(Self::response_ok()).boxed2(),
+                Err(HyperError::Io(ref err))
+                    if err.get_ref()
+                        .and_then(|inner| inner.downcast_ref::<FlowError>())
+                        .map(|inner| *inner != FlowError::Other)
+                        .unwrap_or(false) =>
+                {
+                    future::ok(Self::response_error("Not Ready")).boxed2()
+                }
+                Err(_) => {
+                    let mut flow = flow_ptr.write().unwrap();
+                    flow.close().then(|_| {
+                        future::ok(Response::new().with_status(StatusCode::InternalServerError))
+                    })
+                }.boxed2(),
+            })
             .boxed2()
     }
 
@@ -257,7 +292,7 @@ impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
             flow.close()
                 .then(|result| match result {
                     Ok(_) => Ok(Self::response_ok()),
-                    Err(flow::Error::Invalid) => Ok(Self::response_error("Closed")),
+                    Err(FlowError::Invalid) => Ok(Self::response_error("Closed")),
                     _ => Ok(Response::new().with_status(StatusCode::InternalServerError)),
                 })
                 .boxed2()
@@ -316,7 +351,7 @@ impl<ProtoReq, ProtoRes, ProtoErr> FlowService<ProtoReq, ProtoRes, ProtoErr> {
                 })
                 .or_else(|err| {
                     let status = match err {
-                        flow::Error::Eof | flow::Error::Dropped => StatusCode::NotFound,
+                        FlowError::Eof | FlowError::Dropped => StatusCode::NotFound,
                         _ => StatusCode::InternalServerError,
                     };
                     future::ok(Response::new().with_status(status))
@@ -455,7 +490,7 @@ impl<ProtoReq, ProtoRes, ProtoErr> Service for FlowService<ProtoReq, ProtoRes, P
 where
     Request: From<ProtoReq>,
     Response: Into<ProtoRes>,
-    hyper::Error: Into<ProtoErr>,
+    HyperError: Into<ProtoErr>,
 {
     type Request = ProtoReq;
     type Response = ProtoRes;
@@ -463,7 +498,7 @@ where
     type Future = Then<
         ResponseFuture,
         Result<ProtoRes, ProtoErr>,
-        fn(Result<Response, hyper::Error>) -> Result<ProtoRes, ProtoErr>,
+        fn(Result<Response, HyperError>) -> Result<ProtoRes, ProtoErr>,
     >;
 
     fn call(&self, req: Self::Request) -> Self::Future {
@@ -471,10 +506,10 @@ where
             static ref PATTERN_NEW: Regex = Regex::new(r"^/new$").unwrap();
             static ref PATTERN_PUSH: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/push$").unwrap();
             static ref PATTERN_EOF: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/eof$").unwrap();
-            static ref PATTERN_STATUS: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/status$")
-                .unwrap();
-            static ref PATTERN_FETCH: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/fetch/(\d+)$")
-                .unwrap();
+            static ref PATTERN_STATUS: Regex =
+                Regex::new(r"^/flow/([a-f0-9]{32})/status$").unwrap();
+            static ref PATTERN_FETCH: Regex =
+                Regex::new(r"^/flow/([a-f0-9]{32})/fetch/(\d+)$").unwrap();
             static ref PATTERN_PULL: Regex = Regex::new(r"^/flow/([a-f0-9]{32})/pull$").unwrap();
         }
         let req = Request::from(req);
@@ -633,14 +668,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyper::Uri;
-    use hyper::client::{Client, HttpConnector};
+    use hyper::{Uri, client::{Client, HttpConnector}};
     use native_tls::{Certificate, TlsConnector};
-    use std::collections::HashSet;
-    use std::fs::File;
-    use std::io::{self, Read};
-    use std::sync::mpsc;
-    use std::u64;
+    use std::{collections::HashSet, fs::File, io::{Read, prelude::*}, sync::mpsc, u64};
     use tokio::net::TcpStream;
     use tokio_tls::{TlsConnectorExt, TlsStream};
 
@@ -857,7 +887,7 @@ mod tests {
     fn check_error_response(
         res: Response,
         error: &str,
-    ) -> Box<Future<Item = (), Error = hyper::Error>> {
+    ) -> Box<Future<Item = (), Error = HyperError>> {
         assert_eq!(res.status(), StatusCode::BadRequest);
         let error = error.to_owned();
         res.body()
@@ -1706,6 +1736,27 @@ mod tests {
         assert_eq!(req_close(prefix, flow_id, token), (StatusCode::Ok, None));
     }
 
+    struct HttpsConnector {
+        tls: Arc<TlsConnector>,
+        http: HttpConnector,
+    }
+
+    impl Service for HttpsConnector {
+        type Request = Uri;
+        type Response = TlsStream<TcpStream>;
+        type Error = IoError;
+        type Future = Box<Future<Item = Self::Response, Error = IoError>>;
+
+        fn call(&self, uri: Uri) -> Self::Future {
+            let tls_connector = self.tls.clone();
+            Box::new(self.http.call(uri).and_then(move |io| {
+                tls_connector
+                    .connect_async("example.com", io)
+                    .map_err(|err| IoError::new(io::ErrorKind::Other, err))
+            }))
+        }
+    }
+
     #[test]
     fn tls_service() {
         #[cfg(target_os = "windows")]
@@ -1766,27 +1817,6 @@ mod tests {
                 Ok(())
             })
         })).unwrap();
-    }
-
-    struct HttpsConnector {
-        tls: Arc<TlsConnector>,
-        http: HttpConnector,
-    }
-
-    impl Service for HttpsConnector {
-        type Request = Uri;
-        type Response = TlsStream<TcpStream>;
-        type Error = io::Error;
-        type Future = Box<Future<Item = Self::Response, Error = io::Error>>;
-
-        fn call(&self, uri: Uri) -> Self::Future {
-            let tls_connector = self.tls.clone();
-            Box::new(self.http.call(uri).and_then(move |io| {
-                tls_connector
-                    .connect_async("example.com", io)
-                    .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-            }))
-        }
     }
 
     #[test]
@@ -1968,5 +1998,57 @@ mod tests {
         }).unwrap();
 
         thd2.join().unwrap();
+    }
+
+    #[test]
+    fn early_drop() {
+        let prefix = &spawn_server();
+        // TODO: Refactor
+        let (host, port) = {
+            let url = url::Url::parse(prefix).unwrap();
+            (url.host_str().unwrap().to_owned(), url.port().unwrap())
+        };
+
+        let (ref flow_id, ref token) = create_flow(prefix, &DEFL_FLOW_PARAM);
+        let payload = vec![1u8; flow::REF_SIZE];
+
+        let thd = {
+            let flow_id = flow_id.to_owned();
+            let token = token.to_owned();
+            let payload = payload.clone();
+            thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect((host.as_str(), port)).unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "POST /flow/{}/push?token={} HTTP/1.1\r\n\
+                             Host: {}:{}\r\n\
+                             Accept: */*\r\n\
+                             Content-Type: application/octect-stream\r\n\
+                             Connection: keep-alive\r\n\
+                             Content-Length: 9223372036854775807\r\n\r\n",
+                            flow_id,
+                            token,
+                            host.as_str(),
+                            port
+                        ).as_bytes(),
+                    )
+                    .unwrap();
+                stream.write_all(&payload).unwrap();
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let mut buf = Vec::new();
+                stream.read_to_end(&mut buf).unwrap();
+                let res = String::from_utf8(buf).unwrap();
+                assert!(res.starts_with("HTTP/1.1 500 Internal Server Error"));
+            })
+        };
+
+        assert_eq!(
+            req_fetch(prefix, flow_id, 0),
+            (StatusCode::Ok, Some(payload))
+        );
+        assert_eq!(req_fetch(prefix, flow_id, 1), (StatusCode::NotFound, None));
+
+        thd.join().unwrap();
     }
 }
