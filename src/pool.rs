@@ -1,5 +1,10 @@
 use flow::{Flow, Observer};
-use std::{iter, collections::HashMap, sync::{Arc, Mutex, RwLock, Weak}, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    iter,
+    sync::{Arc, Mutex, RwLock, Weak},
+    time::{Duration, Instant},
+};
 
 pub type SharedFlow = Arc<RwLock<Flow>>;
 

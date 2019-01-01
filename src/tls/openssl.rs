@@ -1,7 +1,12 @@
 extern crate openssl;
 
-use native_tls::{TlsAcceptor, TlsAcceptorBuilder, backend::openssl::TlsAcceptorBuilderExt};
-use self::openssl::{pkcs12::Pkcs12, pkey::PKey, ssl::{SslAcceptorBuilder, SslMethod}, x509::X509};
+use self::openssl::{
+    pkcs12::Pkcs12,
+    pkey::PKey,
+    ssl::{SslAcceptorBuilder, SslMethod},
+    x509::X509,
+};
+use native_tls::{backend::openssl::TlsAcceptorBuilderExt, TlsAcceptor, TlsAcceptorBuilder};
 use std::{fs::File, io::Read};
 
 fn build_acceptor(privkey: &PKey, cert: &X509, chain: &[X509]) -> TlsAcceptor {

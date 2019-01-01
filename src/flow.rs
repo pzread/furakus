@@ -1,6 +1,11 @@
 use bytes::Bytes;
-use futures::{future, Future, sync::oneshot};
-use std::{error, fmt, mem, collections::{HashMap, VecDeque}, sync::{Arc, Mutex, RwLock, Weak}};
+use futures::{future, sync::oneshot, Future};
+use lazy_static::lazy_static;
+use std::{
+    collections::{HashMap, VecDeque},
+    error, fmt, mem,
+    sync::{Arc, Mutex, RwLock, Weak},
+};
 use utils::BoxedFuture;
 use uuid::Uuid;
 
@@ -123,7 +128,7 @@ impl Flow {
         };
         let flow = Flow {
             weakref: Weak::new(),
-            id: Uuid::new_v4().simple().to_string(),
+            id: Uuid::new_v4().to_simple().to_string(),
             config,
             statistic: Statistic {
                 pushed: 0,
@@ -224,10 +229,12 @@ impl Flow {
             }
         };
         // Check and update state. Return if failed.
-        if self.update_state(match chunk {
-            Chunk::Data(..) => State::Streaming,
-            Chunk::Eof(..) => State::Stop,
-        }).is_err()
+        if self
+            .update_state(match chunk {
+                Chunk::Data(..) => State::Streaming,
+                Chunk::Eof(..) => State::Stop,
+            })
+            .is_err()
         {
             return Err(Error::Invalid);
         }
@@ -268,7 +275,8 @@ impl Flow {
         while self.sanitize_index < next_index {
             let closed = {
                 // Get should always success.
-                let chunk = self.bucket
+                let chunk = self
+                    .bucket
                     .get(&self.sanitize_index)
                     .unwrap()
                     .lock()
@@ -293,7 +301,8 @@ impl Flow {
             // If there isn't overflow, benignly keep chunks alive.
             while self.tail_index < self.sanitize_index && self.check_overflow() {
                 {
-                    let chunk_len = self.bucket
+                    let chunk_len = self
+                        .bucket
                         .get(&self.tail_index)
                         .unwrap()
                         .lock()
@@ -423,7 +432,8 @@ impl Flow {
             }
 
             future::result(result)
-        }).boxed2()
+        })
+        .boxed2()
     }
 }
 

@@ -5,29 +5,18 @@ authors = ["PZ Read <netfirewall@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/pzread/furakus"
 
+[lib]
+name = "furakus"
+path = "src/lib.rs"
+
 [badges]
 travis-ci = { repository = "pzread/furakus" }
 appveyor = { repository = "pzread/furakus" }
 
 [dependencies]
 bytes = "0.4"
-dotenv = "0.11"
 futures = "0.1"
-hyper = "0.11"
-language-tags = "0.2"
-lazy_static = "1.0"
-mime = "0.3"
-native-tls = "0.1"
-regex = "0.2"
-ring = "0.12"
-serde = "1.0"
-serde_derive = "1.0"
-serde_json = "1.0"
+hyper = "0.12"
+lazy_static = "1.2"
 tokio-core = "0.1"
-tokio-tls = "0.1"
-unicase = "2.1"
-url = "1.6"
-uuid = { version = "0.6", features = ["v4"] }
-
-[target.'cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))'.dependencies]
-openssl = "0.9"
+uuid = { version = "0.7", features = ["v4"] }
