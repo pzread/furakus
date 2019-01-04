@@ -5,6 +5,10 @@ authors = ["PZ Read <netfirewall@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/pzread/furakus"
 
+[[bin]]
+name = "furakus"
+path = "src/server.rs"
+
 [lib]
 name = "furakus"
 path = "src/lib.rs"
@@ -16,7 +20,7 @@ appveyor = { repository = "pzread/furakus" }
 [dependencies]
 bytes = "0.4"
 futures = "0.1"
-hyper = "0.12"
+hyper = { version = "0.12", default-features = false }
 lazy_static = "1.2"
 tokio = "0.1"
 uuid = { version = "0.7", features = ["v4"] }
