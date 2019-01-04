@@ -194,7 +194,7 @@ mod tests {
     use super::*;
     use flow;
     use std::thread;
-    use tokio::reactor::Core;
+    use tokio::runtime::Runtime;
 
     const FLOW_CONFIG: flow::Config = flow::Config {
         length: None,
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn close_recycle() {
-        let mut core = Core::new().unwrap();
+        let mut runner = Runtime::new().unwrap();
         let ptr = Pool::new(None, None);
         let flow = Flow::new(FLOW_CONFIG);
         let flow_id = flow.read().unwrap().id.to_owned();
@@ -254,18 +254,18 @@ mod tests {
         }
         {
             let fut = flow.write().unwrap().close();
-            core.run(fut).unwrap();
+            runner.block_on(fut).unwrap();
         }
         {
             let fut = flow.read().unwrap().pull(0, Some(0));
-            core.run(fut).is_err();
+            runner.block_on(fut).is_err();
         }
         assert!(ptr.read().unwrap().get(&flow_id).is_none());
     }
 
     #[test]
     fn dropped() {
-        let mut core = Core::new().unwrap();
+        let mut runner = Runtime::new().unwrap();
         let flow = Flow::new(FLOW_CONFIG);
         {
             let ptr = Pool::new(None, None);
@@ -278,12 +278,12 @@ mod tests {
             assert!(ptr.read().unwrap().get(&flow_id).is_none());
             {
                 let fut = flow.write().unwrap().close();
-                core.run(fut).unwrap();
+                runner.block_on(fut).unwrap();
             }
         }
         {
             let fut = flow.read().unwrap().pull(0, Some(0));
-            assert_eq!(core.run(fut), Err(flow::Error::Eof));
+            assert_eq!(runner.block_on(fut), Err(flow::Error::Eof));
         }
     }
 
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn overload_time() {
-        let mut core = Core::new().unwrap();
+        let mut runner = Runtime::new().unwrap();
         let ptr = Pool::new(Some(3), Some(Duration::from_secs(6)));
         let flow_a = Flow::new(FLOW_CONFIG);
         let flow_b = Flow::new(FLOW_CONFIG);
@@ -318,7 +318,7 @@ mod tests {
         thread::sleep(Duration::from_secs(4));
         {
             let fut = flow_a.write().unwrap().push("Hello".into());
-            core.run(fut).unwrap();
+            runner.block_on(fut).unwrap();
         }
         thread::sleep(Duration::from_secs(4));
         {

@@ -18,5 +18,5 @@ bytes = "0.4"
 futures = "0.1"
 hyper = "0.12"
 lazy_static = "1.2"
-tokio-core = "0.1"
+tokio = "0.1"
 uuid = { version = "0.7", features = ["v4"] }
