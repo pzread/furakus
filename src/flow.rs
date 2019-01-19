@@ -345,7 +345,7 @@ impl Flow {
         // Acquire the chunk. Return if failed.
         let (chunk_index, chunk_end) = match self.acquire_chunk(chunk) {
             Ok((chunk_index, _, chunk_end)) => (chunk_index, chunk_end),
-            Err(err) => return future::err(err).boxed2(),
+            Err(err) => return future::err(err).into_box(),
         };
 
         // Get the overflow status first.
@@ -365,9 +365,9 @@ impl Flow {
             self.waiting_push.push_back((chunk_index, chunk_end, tx));
             rx.map(move |_| chunk_index)
                 .map_err(|_| Error::Other)
-                .boxed2()
+                .into_box()
         } else {
-            future::ok(chunk_index).boxed2()
+            future::ok(chunk_index).into_box()
         };
 
         // Try to sanitize the buffer.
@@ -377,7 +377,7 @@ impl Flow {
     }
 
     pub fn close(&mut self) -> FlowFuture<()> {
-        future::result(self.acquire_chunk(Chunk::eof()).map(|_| ())).boxed2()
+        future::result(self.acquire_chunk(Chunk::eof()).map(|_| ())).into_box()
     }
 
     pub fn pull(&self, chunk_index: u64, timeout: Option<u64>) -> FlowFuture<Bytes> {
@@ -386,20 +386,20 @@ impl Flow {
 
         // Try to get the chunk.
         let fut = if let Some(chunk) = chunk {
-            future::ok(chunk).boxed2()
+            future::ok(chunk).into_box()
         } else {
             if self.state != State::Streaming {
-                future::err(Error::Eof).boxed2()
+                future::err(Error::Eof).into_box()
             } else if chunk_index < self.next_index {
-                future::err(Error::Dropped).boxed2()
+                future::err(Error::Dropped).into_box()
             } else if timeout == Some(0) {
-                future::err(Error::NotReady).boxed2()
+                future::err(Error::NotReady).into_box()
             } else {
                 let (tx, rx) = oneshot::channel();
                 let mut waiting_pull = self.waiting_pull.lock().unwrap();
                 let waits = waiting_pull.entry(chunk_index).or_insert(Vec::new());
                 waits.push(tx);
-                rx.map_err(|_| Error::Other).boxed2()
+                rx.map_err(|_| Error::Other).into_box()
             }
         };
 
@@ -433,7 +433,7 @@ impl Flow {
 
             future::result(result)
         })
-        .boxed2()
+        .into_box()
     }
 }
 

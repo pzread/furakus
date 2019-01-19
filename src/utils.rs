@@ -1,7 +1,7 @@
 use futures::Future;
 
 pub trait BoxedFuture: Future + Send + Sized + 'static {
-    fn boxed2(self) -> Box<Future<Item = Self::Item, Error = Self::Error> + Send> {
+    fn into_box(self) -> Box<dyn Future<Item = Self::Item, Error = Self::Error> + Send> {
         Box::new(self)
     }
 }
