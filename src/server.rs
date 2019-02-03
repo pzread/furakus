@@ -5,7 +5,6 @@ extern crate lazy_static;
 extern crate native_tls;
 extern crate regex;
 extern crate tokio;
-extern crate tokio_io;
 extern crate tokio_tls;
 
 mod stream_adapter;
@@ -20,7 +19,7 @@ use std::{
     error::Error as StdError,
     sync::{Arc, Mutex},
 };
-use stream_adapter::{DummyStreamAdapter, StreamAdapter};
+use stream_adapter::{StreamAdapter, TlsStreamAdapter};
 
 struct FlowService {
     pool: Arc<Mutex<HashMap<String, future_mpsc::Receiver<Chunk>>>>,
@@ -46,7 +45,7 @@ impl FlowService {
     }
 
     fn handle_push(&self, req: ServiceRequest, route: regex::Captures) -> ResponseFuture {
-        let (tx, rx) = future_mpsc::channel(65536);
+        let (tx, rx) = future_mpsc::channel(2);
 
         let flow_id = route.get(1).unwrap().as_str();
         {
@@ -128,20 +127,23 @@ fn main() {
     let server = {
         let executor = runner.executor();
         let pool = Arc::new(Mutex::new(HashMap::new()));
-        let adapter = DummyStreamAdapter;
+        let adapter = TlsStreamAdapter::new("tests/cert.p12");
         let addr = ([0, 0, 0, 0], 3000).into();
         let listener = tokio::net::TcpListener::bind(&addr).unwrap();
         listener
             .incoming()
             .for_each(move |stream| {
                 let pool = pool.clone();
-                let fut = adapter.accept(stream).and_then(move |stream| {
-                    let service = FlowService::new(pool);
-                    let http = hyper::server::conn::Http::new();
-                    http.serve_connection(stream, service)
-                        .map_err(|err| Box::new(err) as Box<StdError + Send>)
-                });
-                executor.spawn(fut.map_err(|_| ()));
+                let fut = adapter
+                    .accept(stream)
+                    .and_then(move |stream| {
+                        let service = FlowService::new(pool);
+                        let http = hyper::server::conn::Http::new();
+                        http.serve_connection(stream, service)
+                            .map_err(|err| Box::new(err) as Box<StdError + Send>)
+                    })
+                    .map_err(|_| ());
+                executor.spawn(fut);
                 future::ok(())
             })
             .map_err(|_| ())

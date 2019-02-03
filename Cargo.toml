@@ -25,7 +25,9 @@ lazy_static = "1.0"
 native-tls = "0.2"
 regex = "1.0"
 tokio = "0.1"
-tokio-io = "0.1"
 tokio-tls = "0.2"
 url = "1.0"
 uuid = { version = "0.7", features = ["v4"] }
+
+[dev-dependencies]
+intra-pipe = "0.1"
