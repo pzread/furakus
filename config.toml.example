@@ -1,0 +1,5 @@
+listen_addr = "127.0.0.1:3000"
+num_worker = 4
+
+[tls]
+pkcs12_path = "./tests/cert.p12"

@@ -1,7 +1,7 @@
 use furakus::utils::*;
 use futures::{future, prelude::*};
 use native_tls;
-use std::{fs::File, io::Read};
+use std::{fs::File, io::Read, marker::PhantomData};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tls;
 
@@ -15,17 +15,18 @@ type AdapterFuture =
     Box<Future<Item = Box<dyn AdapterStream + Send>, Error = BoxedStdError> + Send>;
 
 pub trait StreamAdapter {
-    fn accept<T>(&self, stream: T) -> AdapterFuture
-    where
-        T: AsyncRead + AsyncWrite + Send + 'static;
+    type InputStream: AsyncRead + AsyncWrite + Send + 'static;
+
+    fn accept(&self, stream: Self::InputStream) -> AdapterFuture;
 }
 
-pub struct TlsStreamAdapter {
+pub struct TlsStreamAdapter<T: AsyncRead + AsyncWrite + Send + 'static> {
     acceptor: tokio_tls::TlsAcceptor,
+    phantom: PhantomData<T>,
 }
 
-impl TlsStreamAdapter {
-    pub fn new<P: AsRef<std::path::Path>>(pfx_path: P) -> TlsStreamAdapter {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> TlsStreamAdapter<T> {
+    pub fn new<P: AsRef<std::path::Path>>(pfx_path: P) -> TlsStreamAdapter<T> {
         let mut pfx_file = File::open(pfx_path).unwrap();
         let mut buf = Vec::new();
         pfx_file.read_to_end(&mut buf).unwrap();
@@ -36,15 +37,15 @@ impl TlsStreamAdapter {
             .unwrap();
         TlsStreamAdapter {
             acceptor: acceptor.into(),
+            phantom: PhantomData,
         }
     }
 }
 
-impl StreamAdapter for TlsStreamAdapter {
-    fn accept<T>(&self, stream: T) -> AdapterFuture
-    where
-        T: AsyncRead + AsyncWrite + Send + 'static,
-    {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamAdapter for TlsStreamAdapter<T> {
+    type InputStream = T;
+
+    fn accept(&self, stream: Self::InputStream) -> AdapterFuture {
         self.acceptor
             .accept(stream)
             .map(|stream| Box::new(stream) as Box<dyn AdapterStream + Send>)
@@ -53,13 +54,22 @@ impl StreamAdapter for TlsStreamAdapter {
     }
 }
 
-pub struct DummyStreamAdapter;
+pub struct DummyStreamAdapter<T: AsyncRead + AsyncWrite + Send + 'static> {
+    phantom: PhantomData<T>,
+}
 
-impl StreamAdapter for DummyStreamAdapter {
-    fn accept<T>(&self, stream: T) -> AdapterFuture
-    where
-        T: AsyncRead + AsyncWrite + Send + 'static,
-    {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> DummyStreamAdapter<T> {
+    pub fn new() -> DummyStreamAdapter<T> {
+        DummyStreamAdapter {
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamAdapter for DummyStreamAdapter<T> {
+    type InputStream = T;
+
+    fn accept(&self, stream: Self::InputStream) -> AdapterFuture {
         future::ok(Box::new(stream) as Box<AdapterStream + Send>).into_box()
     }
 }
@@ -140,7 +150,7 @@ mod tests {
     #[test]
     fn dummy_stream_adapter() {
         let source = Cursor::new(TEST_INIT_DATA.to_vec());
-        let adapter = DummyStreamAdapter;
+        let adapter = DummyStreamAdapter::new();
         let fut = adapter.accept(source);
         let mut runner = Runtime::new().unwrap();
         let stream = runner.block_on(fut).unwrap();

@@ -4,8 +4,12 @@ extern crate hyper;
 extern crate lazy_static;
 extern crate native_tls;
 extern crate regex;
+extern crate serde;
+extern crate serde_derive;
+extern crate structopt;
 extern crate tokio;
 extern crate tokio_tls;
+extern crate toml;
 
 mod stream_adapter;
 
@@ -14,12 +18,16 @@ use futures::{future, prelude::*, sync::mpsc as future_mpsc};
 use hyper::{Body, Chunk, Method, Request, Response, StatusCode};
 use lazy_static::lazy_static;
 use regex::Regex;
+use serde_derive::Deserialize;
 use std::{
     collections::HashMap,
     error::Error as StdError,
+    io::Read,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
-use stream_adapter::{StreamAdapter, TlsStreamAdapter};
+use stream_adapter::{DummyStreamAdapter, StreamAdapter, TlsStreamAdapter};
+use structopt::StructOpt;
 
 struct FlowService {
     pool: Arc<Mutex<HashMap<String, future_mpsc::Receiver<Chunk>>>>,
@@ -119,17 +127,40 @@ impl hyper::service::Service for FlowService {
     }
 }
 
-fn main() {
+#[derive(Deserialize)]
+struct TlsConfig {
+    pkcs12_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct Config {
+    listen_addr: std::net::SocketAddr,
+    num_worker: usize,
+    tls: Option<TlsConfig>,
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "Furakus")]
+struct Argument {
+    #[structopt(short = "c", long = "config", parse(from_os_str))]
+    config_path: PathBuf,
+}
+
+fn start_server(config: Config) {
     let runner = tokio::runtime::Builder::new()
-        .core_threads(4)
+        .core_threads(config.num_worker)
         .build()
         .unwrap();
     let server = {
         let executor = runner.executor();
         let pool = Arc::new(Mutex::new(HashMap::new()));
-        let adapter = TlsStreamAdapter::new("tests/cert.p12");
-        let addr = ([0, 0, 0, 0], 3000).into();
-        let listener = tokio::net::TcpListener::bind(&addr).unwrap();
+        let adapter: Box<dyn StreamAdapter<InputStream = _> + Send> =
+            if let Some(tls_config) = config.tls {
+                Box::new(TlsStreamAdapter::new(&tls_config.pkcs12_path))
+            } else {
+                Box::new(DummyStreamAdapter::new())
+            };
+        let listener = tokio::net::TcpListener::bind(&config.listen_addr).unwrap();
         listener
             .incoming()
             .for_each(move |stream| {
@@ -149,4 +180,15 @@ fn main() {
             .map_err(|_| ())
     };
     runner.block_on_all(server).unwrap();
+}
+
+fn main() {
+    let config: Config = {
+        let args = Argument::from_args();
+        let mut config_file = std::fs::File::open(args.config_path).unwrap();
+        let mut buf = Vec::new();
+        config_file.read_to_end(&mut buf).unwrap();
+        toml::from_slice(&buf).unwrap()
+    };
+    start_server(config);
 }
