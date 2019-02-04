@@ -1,7 +1,7 @@
 use furakus::utils::*;
 use futures::{future, prelude::*};
 use native_tls;
-use std::{error::Error as StdError, fs::File, io::Read};
+use std::{fs::File, io::Read};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tls;
 
@@ -9,8 +9,10 @@ pub trait AdapterStream: AsyncRead + AsyncWrite {}
 
 impl<T: AsyncRead + AsyncWrite> AdapterStream for T {}
 
+type BoxedStdError = Box<dyn std::error::Error + Send>;
+
 type AdapterFuture =
-    Box<Future<Item = Box<dyn AdapterStream + Send>, Error = Box<dyn StdError + Send>> + Send>;
+    Box<Future<Item = Box<dyn AdapterStream + Send>, Error = BoxedStdError> + Send>;
 
 pub trait StreamAdapter {
     fn accept<T>(&self, stream: T) -> AdapterFuture
@@ -28,8 +30,12 @@ impl TlsStreamAdapter {
         let mut buf = Vec::new();
         pfx_file.read_to_end(&mut buf).unwrap();
         let identity = native_tls::Identity::from_pkcs12(&buf, "").unwrap();
+        let acceptor = native_tls::TlsAcceptor::builder(identity)
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()
+            .unwrap();
         TlsStreamAdapter {
-            acceptor: native_tls::TlsAcceptor::new(identity).unwrap().into(),
+            acceptor: acceptor.into(),
         }
     }
 }
@@ -42,7 +48,7 @@ impl StreamAdapter for TlsStreamAdapter {
         self.acceptor
             .accept(stream)
             .map(|stream| Box::new(stream) as Box<dyn AdapterStream + Send>)
-            .map_err(|err| Box::new(err) as Box<dyn StdError + Send>)
+            .map_err(|err| Box::new(err) as BoxedStdError)
             .into_box()
     }
 }
@@ -90,8 +96,10 @@ mod tests {
                 cert_file.read_to_end(&mut buf).unwrap();
                 Certificate::from_der(&buf).unwrap()
             };
-            let mut builder = TlsConnector::builder();
-            let connector = builder.add_root_certificate(rootca).build().unwrap();
+            let connector = TlsConnector::builder()
+                .add_root_certificate(rootca)
+                .build()
+                .unwrap();
             let mut stream = connector.connect(TEST_DOMAIN, client).unwrap();
             stream.write_all(TEST_EXPECT_DATA).unwrap();
         });
@@ -100,13 +108,32 @@ mod tests {
         let fut = future::lazy(move || {
             adapter.accept(server).and_then(|stream| {
                 read_exact(stream, vec![0u8; TEST_EXPECT_DATA.len()])
-                    .map_err(|err| Box::new(err) as Box<dyn StdError + Send>)
+                    .map_err(|err| Box::new(err) as BoxedStdError)
             })
         });
 
         let mut runner = Runtime::new().unwrap();
         let (_, buf) = runner.block_on(fut).unwrap();
         assert_eq!(buf, TEST_EXPECT_DATA);
+        thd.join().unwrap();
+    }
+
+    #[test]
+    fn insecure_tls_connection() {
+        let (server, client): (AsyncChannel, SyncChannel) = intra_pipe::channel();
+
+        let thd = thread::spawn(move || {
+            let connector = TlsConnector::builder()
+                .max_protocol_version(Some(native_tls::Protocol::Tlsv10))
+                .build()
+                .unwrap();
+            assert!(connector.connect(TEST_DOMAIN, client).is_err());
+        });
+
+        let adapter = TlsStreamAdapter::new(TEST_PKCS12_PATH);
+        let fut = future::lazy(move || adapter.accept(server));
+        let mut runner = Runtime::new().unwrap();
+        assert!(runner.block_on(fut).is_err());
         thd.join().unwrap();
     }
 
