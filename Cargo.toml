@@ -35,3 +35,4 @@ uuid = { version = "0.7", features = ["v4"] }
 
 [dev-dependencies]
 intra-pipe = "0.1"
+reqwest = "0.9"

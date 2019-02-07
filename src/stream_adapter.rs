@@ -14,10 +14,8 @@ type BoxedStdError = Box<dyn std::error::Error + Send>;
 type AdapterFuture =
     Box<Future<Item = Box<dyn AdapterStream + Send>, Error = BoxedStdError> + Send>;
 
-pub trait StreamAdapter {
-    type InputStream: AsyncRead + AsyncWrite + Send + 'static;
-
-    fn accept(&self, stream: Self::InputStream) -> AdapterFuture;
+pub trait StreamAdapter<T: AsyncRead + AsyncWrite + Send + 'static> {
+    fn accept(&self, stream: T) -> AdapterFuture;
 }
 
 pub struct TlsStreamAdapter<T: AsyncRead + AsyncWrite + Send + 'static> {
@@ -42,10 +40,8 @@ impl<T: AsyncRead + AsyncWrite + Send + 'static> TlsStreamAdapter<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamAdapter for TlsStreamAdapter<T> {
-    type InputStream = T;
-
-    fn accept(&self, stream: Self::InputStream) -> AdapterFuture {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamAdapter<T> for TlsStreamAdapter<T> {
+    fn accept(&self, stream: T) -> AdapterFuture {
         self.acceptor
             .accept(stream)
             .map(|stream| Box::new(stream) as Box<dyn AdapterStream + Send>)
@@ -66,10 +62,8 @@ impl<T: AsyncRead + AsyncWrite + Send + 'static> DummyStreamAdapter<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamAdapter for DummyStreamAdapter<T> {
-    type InputStream = T;
-
-    fn accept(&self, stream: Self::InputStream) -> AdapterFuture {
+impl<T: AsyncRead + AsyncWrite + Send + 'static> StreamAdapter<T> for DummyStreamAdapter<T> {
+    fn accept(&self, stream: T) -> AdapterFuture {
         future::ok(Box::new(stream) as Box<AdapterStream + Send>).into_box()
     }
 }
@@ -91,8 +85,8 @@ mod tests {
     const TEST_INIT_DATA: &[u8] = b"Hello World";
     const TEST_WRITE_DATA: &[u8] = b"Ello";
     const TEST_EXPECT_DATA: &[u8] = b"o World";
-    const TEST_ROOTCA_PATH: &str = "./tests/cert.der";
-    const TEST_PKCS12_PATH: &str = "./tests/cert.p12";
+    const TEST_ROOTCA_PATH: &str = "./tests/ca.der";
+    const TEST_PKCS12_PATH: &str = "./tests/test.p12";
     const TEST_DOMAIN: &str = "example.com";
 
     #[test]
@@ -101,9 +95,11 @@ mod tests {
 
         let thd = thread::spawn(move || {
             let rootca = {
-                let mut cert_file = File::open(TEST_ROOTCA_PATH).unwrap();
                 let mut buf = Vec::new();
-                cert_file.read_to_end(&mut buf).unwrap();
+                File::open(TEST_ROOTCA_PATH)
+                    .unwrap()
+                    .read_to_end(&mut buf)
+                    .unwrap();
                 Certificate::from_der(&buf).unwrap()
             };
             let connector = TlsConnector::builder()

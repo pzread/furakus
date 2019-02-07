@@ -1,6 +1,6 @@
 use furakus::utils::*;
 use futures::{future, prelude::*, sync::mpsc as future_mpsc, Future};
-use hyper::{service::Service, Body, Chunk, Method, Request, Response, StatusCode};
+use hyper::{service::Service as HyperService, Body, Chunk, Method, Request, Response, StatusCode};
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::{
@@ -16,7 +16,7 @@ type ResponseFuture = Box<dyn Future<Item = Response<Body>, Error = ServiceError
 pub trait ServiceFactory {
     type Error: Into<Box<dyn StdError + Send + Sync>>;
     type Future: Future<Item = Response<Body>, Error = Self::Error> + Send;
-    type Service: Service<
+    type Service: HyperService<
             ReqBody = Body,
             ResBody = Body,
             Error = Self::Error,
@@ -39,8 +39,8 @@ impl FlowServiceFactory {
 }
 
 impl ServiceFactory for FlowServiceFactory {
-    type Error = ServiceError;
-    type Future = ResponseFuture;
+    type Error = <Self::Service as HyperService>::Error;
+    type Future = <Self::Service as HyperService>::Future;
     type Service = FlowService;
 
     fn new_service(&self) -> Self::Service {
@@ -109,7 +109,7 @@ impl FlowService {
     }
 }
 
-impl hyper::service::Service for FlowService {
+impl HyperService for FlowService {
     type ReqBody = Body;
     type ResBody = Body;
     type Error = ServiceError;
