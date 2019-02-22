@@ -3,4 +3,12 @@ listen_addr = "127.0.0.1:3000"
 num_worker = 4
 
 [server.tls]
-pkcs12_path = "./tests/cert.p12"
+pkcs12_path = "./tests/test.p12"
+
+[service.pool]
+size = 65536
+deactive_timeout = 3600
+
+[service.flow]
+meta_capacity = 65536
+data_capacity = 1048576

@@ -4,6 +4,7 @@ extern crate hyper;
 extern crate lazy_static;
 extern crate native_tls;
 extern crate regex;
+extern crate ring;
 extern crate serde;
 extern crate serde_derive;
 extern crate structopt;
@@ -11,12 +12,13 @@ extern crate tokio;
 extern crate tokio_tls;
 extern crate toml;
 
+mod auth;
 mod service;
 mod stream_adapter;
 
 use futures::{future, prelude::*};
 use serde_derive::Deserialize;
-use service::{FlowServiceFactory, ServiceFactory};
+use service::{Config as ServiceConfig, FlowServiceFactory, ServiceFactory};
 use std::{error::Error as StdError, io::Read, net::SocketAddr, path::PathBuf};
 use stream_adapter::{DummyStreamAdapter, StreamAdapter, TlsStreamAdapter};
 use structopt::StructOpt;
@@ -36,6 +38,7 @@ struct ServerConfig {
 #[derive(Deserialize)]
 struct Config {
     server: ServerConfig,
+    service: ServiceConfig,
 }
 
 #[derive(StructOpt, Debug)]
@@ -92,7 +95,10 @@ fn main() {
         config_file.read_to_end(&mut buf).unwrap();
         toml::from_slice(&buf).unwrap()
     };
-    let (runner, _) = start_server(&config.server, FlowServiceFactory::new());
+    let (runner, _) = start_server(
+        &config.server,
+        FlowServiceFactory::new(&config.service, auth::HMACAuthorizer::new()),
+    );
     runner.block_on_all(future::ok::<(), ()>(())).unwrap();
 }
 

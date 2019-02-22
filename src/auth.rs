@@ -1,5 +1,5 @@
+use furakus::utils::*;
 use ring::{digest, hmac, rand, rand::SecureRandom};
-use utils;
 
 pub trait Authorizer: Send + Sync + 'static {
     fn sign(&self, flow_id: &str) -> String;
@@ -24,11 +24,11 @@ impl HMACAuthorizer {
 impl Authorizer for HMACAuthorizer {
     fn sign(&self, flow_id: &str) -> String {
         let signature = { hmac::sign(&self.signkey, &flow_id.as_bytes()) };
-        utils::hex(signature.as_ref())
+        hex(signature.as_ref())
     }
 
     fn verify(&self, flow_id: &str, token: &str) -> Result<(), ()> {
-        utils::unhex(token).map_err(|_| ()).and_then(|sig| {
+        unhex(token).map_err(|_| ()).and_then(|sig| {
             hmac::verify_with_own_key(&self.signkey, flow_id.as_bytes(), &sig).map_err(|_| ())
         })
     }
