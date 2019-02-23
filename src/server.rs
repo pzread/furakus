@@ -1,5 +1,6 @@
 extern crate furakus;
 extern crate futures;
+extern crate headers;
 extern crate hyper;
 extern crate lazy_static;
 extern crate native_tls;
@@ -7,12 +8,14 @@ extern crate regex;
 extern crate ring;
 extern crate serde;
 extern crate serde_derive;
+extern crate serde_json;
 extern crate structopt;
 extern crate tokio;
 extern crate tokio_tls;
 extern crate toml;
 
 mod auth;
+mod header_ext;
 mod service;
 mod stream_adapter;
 

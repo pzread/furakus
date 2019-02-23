@@ -5,13 +5,16 @@ use furakus::{
     utils::*,
 };
 use futures::{future, prelude::*, Future};
+use header_ext::HeaderBuilderExt;
+use headers::{ContentLength, ContentType, HeaderMapExt};
 use hyper::{
     error::Error as HyperError, service::Service as HyperService, Body, Chunk, Method, Request,
     Response, StatusCode,
 };
 use lazy_static::lazy_static;
 use regex::Regex;
-use serde_derive::Deserialize;
+use serde_derive::{Deserialize, Serialize};
+use serde_json;
 use std::{
     error::Error as StdError,
     fmt,
@@ -61,8 +64,9 @@ pub struct Config {
 }
 
 type ServiceRequest = Request<Body>;
+type ServiceResponse = Response<Body>;
 type ServiceError = Box<dyn StdError + Send + Sync>;
-type ResponseFuture = Box<dyn Future<Item = Response<Body>, Error = ServiceError> + Send>;
+type ResponseFuture = Box<dyn Future<Item = ServiceResponse, Error = ServiceError> + Send>;
 
 pub trait ServiceFactory {
     type Error: Into<ServiceError>;
@@ -110,11 +114,30 @@ impl ServiceFactory for FlowServiceFactory {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct NewRequest {
+    pub size: Option<u64>,
+    pub preserve_mode: bool,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct NewResponse {
+    pub id: String,
+    pub token: String,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct ErrorResponse {
+    pub message: String,
+}
+
 pub struct FlowService {
     config: FlowConfig,
     pool: Arc<RwLock<Pool>>,
     authorizer: Arc<Authorizer>,
 }
+
+type FT = future::FutureResult<ServiceResponse, ServiceError>;
 
 impl FlowService {
     fn new(
@@ -129,21 +152,53 @@ impl FlowService {
         }
     }
 
-    fn response_status(status: StatusCode) -> ResponseFuture {
+    fn response_status(status: StatusCode) -> FT {
         future::ok(
             Response::builder()
                 .status(status)
                 .body(Body::empty())
                 .unwrap(),
         )
-        .into_box()
     }
 
-    /*
+    fn response_error(error: &str) -> FT {
+        let data = serde_json::to_string(&ErrorResponse {
+            message: error.to_owned(),
+        })
+        .unwrap();
+        future::ok(
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .typed_header(ContentLength(data.len() as u64))
+                .body(Body::from(data))
+                .unwrap(),
+        )
+    }
+
+    fn parse_request_parameter<T>(
+        req: ServiceRequest,
+    ) -> Box<Future<Item = T, Error = Error> + Send>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let content_length = match req.headers().typed_get() {
+            Some(ContentLength(length)) => length,
+            None => return future::err(Error::Invalid).into_box(),
+        };
+        if content_length == 0 || content_length > 4096 {
+            return future::err(Error::Invalid).into_box();
+        }
+        req.into_body()
+            .concat2()
+            .map_err(|err| Error::Internal(err))
+            .and_then(|body| serde_json::from_slice::<T>(&body).map_err(|_| Error::Invalid))
+            .into_box()
+    }
+
     fn handle_new(&self, req: ServiceRequest, _route: regex::Captures) -> ResponseFuture {
         let pool_ptr = self.pool.clone();
-        let meta_capacity = self.meta_capacity;
-        let data_capacity = self.data_capacity;
+        let meta_capacity = self.config.meta_capacity;
+        let data_capacity = self.config.data_capacity;
         let authorizer = self.authorizer.clone();
         Self::parse_request_parameter::<NewRequest>(req)
             .and_then(move |param| {
@@ -168,20 +223,20 @@ impl FlowService {
                     .unwrap()
                     .into_bytes();
                 future::ok(
-                    Response::new()
-                        .with_header(ContentType::json())
-                        .with_header(ContentLength(body.len() as u64))
-                        .with_body(body),
+                    Response::builder()
+                        .typed_header(ContentType::json())
+                        .typed_header(ContentLength(body.len() as u64))
+                        .body(Body::from(body))
+                        .unwrap(),
                 )
             })
             .or_else(|err| match err {
-                Error::Invalid => Ok(Self::response_error("Invalid Parameter")),
-                Error::NotReady => Ok(Response::new().with_status(StatusCode::ServiceUnavailable)),
-                Error::Internal(err) => Err(err),
+                Error::Invalid => Self::response_error("Invalid Parameter"),
+                Error::NotReady => Self::response_status(StatusCode::SERVICE_UNAVAILABLE),
+                Error::Internal(err) => future::err(Box::new(err) as ServiceError),
             })
-            .boxed2()
+            .into_box()
     }
-    */
 
     /*
     fn handle_push(&self, req: ServiceRequest, route: regex::Captures) -> ResponseFuture {
@@ -242,13 +297,13 @@ impl HyperService for FlowService {
 
         let path = &req.uri().path().to_string();
         match req.method() {
-            /*&Method::POST => {
+            &Method::POST => {
                 if let Some(route) = PATTERN_NEW.captures(path) {
                     self.handle_new(req, route)
                 } else {
-                    Self::response_status(StatusCode::BAD_REQUEST)
+                    Self::response_status(StatusCode::BAD_REQUEST).into_box()
                 }
-            }*/
+            }
             /*&Method::PUT => {
                 if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
@@ -263,7 +318,7 @@ impl HyperService for FlowService {
                     Self::response_status(StatusCode::BAD_REQUEST)
                 }
             }*/
-            _ => Self::response_status(StatusCode::BAD_REQUEST),
+            _ => Self::response_status(StatusCode::BAD_REQUEST).into_box(),
         }
     }
 }
