@@ -267,3 +267,43 @@ impl HyperService for FlowService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, FlowConfig, FlowService, FlowServiceFactory, PoolConfig, ServiceFactory};
+    use auth::HMACAuthorizer;
+    use hyper::{service::Service, Body, Method, Request, StatusCode};
+    use tokio::runtime::Runtime;
+
+    const TEST_URI: &str = "http://example.com";
+
+    fn new_factory() -> FlowServiceFactory {
+        FlowServiceFactory::new(
+            &Config {
+                pool: PoolConfig {
+                    size: 65536,
+                    deactive_timeout: 5,
+                },
+                flow: FlowConfig {
+                    meta_capacity: 1 * 1024 * 1024,
+                    data_capacity: 1 * 1024 * 1024,
+                },
+            },
+            HMACAuthorizer::new(),
+        )
+    }
+
+    #[test]
+    fn unexpected_method() {
+        let mut service = new_factory().new_service();
+        let mut runner = Runtime::new().unwrap();
+
+        let req = Request::builder()
+            .uri(TEST_URI)
+            .method(Method::PATCH)
+            .body("".into())
+            .unwrap();
+        let res = runner.block_on(service.call(req)).unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+}
