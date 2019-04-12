@@ -1,10 +1,14 @@
 use auth::Authorizer;
 use furakus::{
-    flow::{self, Flow},
+    flow::{self, Error as FlowError, Flow},
     pool::Pool,
     utils::*,
 };
-use futures::{future, prelude::*, Future};
+use futures::{
+    future::{self, Loop},
+    prelude::*,
+    Future,
+};
 use header_ext::HeaderBuilderExt;
 use headers::{ContentLength, ContentType, HeaderMapExt};
 use hyper::{
@@ -21,12 +25,14 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
+use url;
 
 #[derive(Debug)]
 pub enum Error {
     Invalid,
     NotReady,
     Internal(HyperError),
+    Other,
 }
 
 impl fmt::Display for Error {
@@ -41,6 +47,7 @@ impl StdError for Error {
             Error::Invalid => "Invalid",
             Error::NotReady => "NotReady",
             Error::Internal(ref err) => err.description(),
+            Error::Other => "Other",
         }
     }
 }
@@ -170,9 +177,13 @@ impl FlowService {
             Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .typed_header(ContentLength(data.len() as u64))
-                .body(Body::from(data))
+                .body(data.into())
                 .unwrap(),
         )
+    }
+
+    fn check_authorization(&self, flow_id: &str, token: &str) -> bool {
+        self.authorizer.verify(flow_id, token).is_ok()
     }
 
     fn parse_request_parameter<T>(
@@ -193,6 +204,10 @@ impl FlowService {
             .map_err(|err| Error::Internal(err))
             .and_then(|body| serde_json::from_slice::<T>(&body).map_err(|_| Error::Invalid))
             .into_box()
+    }
+
+    fn parse_request_querystring(req: &ServiceRequest) -> url::form_urlencoded::Parse {
+        url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes())
     }
 
     fn handle_new(&self, req: ServiceRequest, _route: regex::Captures) -> ResponseFuture {
@@ -234,52 +249,68 @@ impl FlowService {
                 Error::Invalid => Self::response_error("Invalid Parameter"),
                 Error::NotReady => Self::response_status(StatusCode::SERVICE_UNAVAILABLE),
                 Error::Internal(err) => future::err(Box::new(err) as ServiceError),
+                Error::Other => Self::response_status(StatusCode::INTERNAL_SERVER_ERROR),
             })
             .into_box()
     }
 
-    /*
     fn handle_push(&self, req: ServiceRequest, route: regex::Captures) -> ResponseFuture {
-        let (tx, rx) = future_mpsc::channel(2);
-
-        let flow_id = route.get(1).unwrap().as_str();
+        let token = match Self::parse_request_querystring(&req).find(|&(ref key, _)| key == "token")
         {
-            let mut pool = self.pool.lock().unwrap();
-            pool.insert(flow_id.to_string(), rx);
-        }
-
-        tx.sink_map_err(|_| ())
-            .send_all(req.into_body().map(|chunk| chunk).map_err(|_| ()))
-            .then(|ret| {
-                if ret.is_ok() {
-                    Self::response_status(StatusCode::OK)
-                } else {
-                    Self::response_status(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            })
-            .into_box()
-    }
-
-    fn handle_pull(&self, _req: ServiceRequest, route: regex::Captures) -> ResponseFuture {
-        let flow_id = route.get(1).unwrap().as_str();
-        let rx = {
-            let mut pool = self.pool.lock().unwrap();
-            match pool.remove(flow_id) {
-                Some(rx) => rx,
-                None => return Self::response_status(StatusCode::NOT_FOUND),
-            }
+            Some((_, token)) => token.into_owned(),
+            None => return Self::response_error("Missing Token").into_box(),
         };
-        let body =
-            Body::wrap_stream(rx.map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "")));
-        future::ok(
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(body)
-                .unwrap(),
-        )
+        let flow_id = route.get(1).unwrap().as_str();
+        if !self.check_authorization(flow_id, &token) {
+            return Self::response_status(StatusCode::NOT_FOUND).into_box();
+        }
+        let flow_ptr = match self.pool.read().unwrap().get(flow_id) {
+            Some(flow) => flow.clone(),
+            None => return Self::response_status(StatusCode::NOT_FOUND).into_box(),
+        };
+
+        let init_buffer = Vec::with_capacity(flow::REF_SIZE * 2);
+        future::loop_fn((req.into_body(), init_buffer), move |(body, mut buffer)| {
+            body.into_future()
+                .map_err(|(err, _)| Error::Internal(err))
+                .map(|(chunk, body)| match chunk {
+                    Some(chunk) => {
+                        buffer.extend_from_slice(&chunk);
+                        if buffer.len() < flow::REF_SIZE {
+                            (None, Loop::Continue((body, buffer)))
+                        } else {
+                            let new_buffer = Vec::with_capacity(flow::REF_SIZE * 2);
+                            (Some(buffer), Loop::Continue((body, new_buffer)))
+                        }
+                    }
+                    None => (Some(buffer), Loop::Break(())),
+                })
+                .and_then({
+                    let flow_ptr = flow_ptr.clone();
+                    move |(chunk, ret)| match chunk {
+                        Some(chunk) => {
+                            let mut flow = flow_ptr.write().unwrap();
+                            flow.push(chunk)
+                                .map_err(|err| match err {
+                                    FlowError::Other => Error::Other,
+                                    _ => Error::NotReady,
+                                })
+                                .map(|_| ret)
+                                .into_box()
+                        }
+                        None => future::ok(ret).into_box(),
+                    }
+                })
+        })
+        .then(move |result| match result {
+            Ok(()) => Self::response_status(StatusCode::OK),
+            Err(Error::Invalid) => unreachable!(),
+            Err(Error::NotReady) => Self::response_error("Not Ready"),
+            Err(Error::Internal(err)) => future::err(Box::new(err) as ServiceError),
+            Err(Error::Other) => Self::response_status(StatusCode::INTERNAL_SERVER_ERROR),
+        })
         .into_box()
     }
-    */
 }
 
 impl HyperService for FlowService {
@@ -304,14 +335,14 @@ impl HyperService for FlowService {
                     Self::response_status(StatusCode::BAD_REQUEST).into_box()
                 }
             }
-            /*&Method::PUT => {
+            &Method::PUT => {
                 if let Some(route) = PATTERN_PUSH.captures(path) {
                     self.handle_push(req, route)
                 } else {
-                    Self::response_status(StatusCode::BAD_REQUEST)
+                    Self::response_status(StatusCode::BAD_REQUEST).into_box()
                 }
             }
-            &Method::GET => {
+            /*&Method::GET => {
                 if let Some(route) = PATTERN_PULL.captures(path) {
                     self.handle_pull(req, route)
                 } else {
@@ -325,12 +356,17 @@ impl HyperService for FlowService {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, FlowConfig, FlowService, FlowServiceFactory, PoolConfig, ServiceFactory};
+    use super::{
+        Config, FlowConfig, FlowService, FlowServiceFactory, NewRequest, NewResponse, PoolConfig,
+        ServiceFactory,
+    };
     use auth::HMACAuthorizer;
-    use hyper::{service::Service, Body, Method, Request, StatusCode};
+    use futures::Stream;
+    use hyper::{header::CONTENT_LENGTH, service::Service, Body, Method, Request, StatusCode};
     use tokio::runtime::Runtime;
 
     const TEST_URI: &str = "http://example.com";
+    const TEST_URI_NEW: &str = "http://example.com/new";
 
     fn new_factory() -> FlowServiceFactory {
         FlowServiceFactory::new(
@@ -360,5 +396,38 @@ mod tests {
             .unwrap();
         let res = runner.block_on(service.call(req)).unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn handle_new() {
+        let mut service = new_factory().new_service();
+        let mut runner = Runtime::new().unwrap();
+
+        let req = Request::post(TEST_URI_NEW)
+            .method(Method::POST)
+            .body("".into())
+            .unwrap();
+        let res = runner.block_on(service.call(req)).unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        let data = serde_json::to_string(&NewRequest {
+            size: None,
+            preserve_mode: false,
+        })
+        .unwrap();
+        let req = Request::post(TEST_URI_NEW)
+            .header(CONTENT_LENGTH, data.len())
+            .body(data.into())
+            .unwrap();
+        let res = runner.block_on(service.call(req)).unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        assert!(serde_json::from_slice::<NewResponse>(
+            &runner
+                .block_on(res.into_body().concat2())
+                .unwrap()
+                .into_bytes()
+        )
+        .is_ok());
     }
 }

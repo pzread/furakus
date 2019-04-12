@@ -13,6 +13,7 @@ extern crate structopt;
 extern crate tokio;
 extern crate tokio_tls;
 extern crate toml;
+extern crate url;
 
 mod auth;
 mod header_ext;
