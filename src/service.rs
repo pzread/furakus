@@ -1,16 +1,22 @@
-use super::{lib::pool::Pool, utils};
+use super::{
+    lib::{flow::Flow, pool::Pool},
+    utils,
+};
 use byteorder::{ByteOrder, LittleEndian};
+use bytes::Bytes;
 use futures::{compat::Stream01CompatExt, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use hyper::{
-    rt::{Future as HyperFuture, Stream as HyperStream},
-    service::Service as HyperService,
-    Body, Method, Request, Response, StatusCode,
+    rt::Future as HyperFuture, service::Service as HyperService, Body, Method, Request, Response,
+    StatusCode,
 };
 use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{collections::VecDeque, error::Error as StdError, sync::Arc};
+
+const CHUNK_DEFREGSIZE: usize = 256;
+const BLOCK_MAXSIZE: usize = 65536;
 
 pub trait ServiceFactory {
     type Future: HyperFuture<Item = Response<Body>, Error = Box<dyn StdError + Send + Sync>> + Send;
@@ -69,7 +75,9 @@ struct CreateResponse {
     token: String,
 }
 
-type ResponseResult = Result<Response<Body>, Box<dyn StdError + Send + Sync>>;
+type BoxError = Box<dyn StdError + Send + Sync>;
+type ResponseResult = Result<Response<Body>, BoxError>;
+type PullGeneratorState = (Arc<Flow>, u64, VecDeque<Bytes>);
 
 impl FlowService {
     fn new(pool: Arc<RwLock<Pool>>) -> Self {
@@ -117,6 +125,37 @@ impl FlowService {
         }))
     }
 
+    async fn push_loop(flow: Arc<Flow>, body: Body) -> Result<(), BoxError> {
+        let mut stream = body.compat();
+        let mut chunks = VecDeque::new();
+        let mut size = 0;
+        while let Some(Ok(chunk)) = stream.next().await {
+            let mut chunk = chunk.into_bytes();
+            while size + chunk.len() > BLOCK_MAXSIZE {
+                if size < BLOCK_MAXSIZE {
+                    chunks.push_back(chunk.split_to(BLOCK_MAXSIZE - size));
+                }
+                size = 0;
+                chunks = flow.push(chunks).await.map_err(|err| Box::new(err))?;
+            }
+            if chunk.len() > 0 {
+                size += chunk.len();
+                match chunks.back_mut() {
+                    Some(ref mut last_chunk) if chunk.len() < CHUNK_DEFREGSIZE => {
+                        last_chunk.extend_from_slice(&chunk);
+                    }
+                    _ => {
+                        chunks.push_back(chunk);
+                    }
+                }
+            }
+        }
+        if chunks.len() > 0 {
+            flow.push(chunks).await.map_err(|err| Box::new(err))?;
+        }
+        Ok(())
+    }
+
     async fn handle_push(
         &self,
         flow_id: u128,
@@ -142,30 +181,26 @@ impl FlowService {
         if flow.get_token() != token {
             return Ok(Self::response_status(StatusCode::NOT_FOUND));
         }
+        Self::push_loop(flow, body)
+            .await
+            .map(|_| Response::new(Body::empty()))
+    }
 
-        let mut body_stream = body.compat();
-        let mut chunks = VecDeque::new();
-        let mut size = 0;
-        while let Some(Ok(chunk)) = body_stream.next().await {
-            let mut chunk = chunk.into_bytes();
-            while size + chunk.len() > 65536 {
-                if size < 65536 {
-                    let front_chunk = chunk.split_to(65536 - size);
-                    chunks.push_back(front_chunk);
-                }
-                size = 0;
-                chunks = flow.push(chunks).await.unwrap();
-            }
-            if chunk.len() > 0 {
-                size += chunk.len();
-                chunks.push_back(chunk);
-            }
-        }
-        if chunks.len() > 0 {
-            flow.push(chunks).await.unwrap();
-        }
-
-        Ok(Response::new(Body::empty()))
+    async fn pull_generator(
+        state: PullGeneratorState,
+    ) -> Option<(Result<Bytes, BoxError>, PullGeneratorState)> {
+        let (flow, block_index, chunks) = state;
+        let (block_index, mut chunks) = if chunks.len() == 0 {
+            let chunks = match flow.pull(block_index).await {
+                Ok(chunks) => chunks,
+                Err(_) => return None,
+            };
+            (block_index + 1, chunks)
+        } else {
+            (block_index, chunks)
+        };
+        assert!(chunks.len() > 0);
+        Some((Ok(chunks.pop_front().unwrap()), (flow, block_index, chunks)))
     }
 
     async fn handle_pull(&self, flow_id: u128) -> ResponseResult {
@@ -173,20 +208,8 @@ impl FlowService {
             Some(flow) => flow,
             None => return Ok(Self::response_status(StatusCode::NOT_FOUND)),
         };
-        let stream = futures::stream::unfold(
-            (0, flow, VecDeque::new()),
-            async move |(block_index, flow, chunks)| {
-                let (block_index, mut chunks) = if chunks.len() == 0 {
-                    (block_index + 1, flow.pull(block_index).await.unwrap())
-                } else {
-                    (block_index, chunks)
-                };
-                Some((
-                    Ok::<hyper::Chunk, std::io::Error>(chunks.pop_front().unwrap().into()),
-                    (block_index, flow, chunks),
-                ))
-            },
-        );
+        let stream = futures::stream::unfold((flow, 0, VecDeque::new()), Self::pull_generator)
+            .map_ok(|chunk| hyper::Chunk::from(chunk));
         Ok(Response::new(Body::wrap_stream(stream.boxed().compat())))
     }
 

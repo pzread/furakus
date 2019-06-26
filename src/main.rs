@@ -25,7 +25,7 @@ fn main() {
         .unwrap();
     server::spawn(
         runner.executor(),
-        &"10.16.0.1:3000".parse().unwrap(),
+        &"127.0.0.1:3000".parse().unwrap(),
         service_factory,
     );
     runner.shutdown_on_idle().wait().unwrap();
