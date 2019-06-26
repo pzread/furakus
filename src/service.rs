@@ -1,6 +1,6 @@
 use super::{lib::pool::Pool, utils};
 use byteorder::{ByteOrder, LittleEndian};
-use futures::{compat::Stream01CompatExt, FutureExt, StreamExt, TryFutureExt};
+use futures::{compat::Stream01CompatExt, FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use hyper::{
     rt::{Future as HyperFuture, Stream as HyperStream},
     service::Service as HyperService,
@@ -10,7 +10,7 @@ use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::{error::Error as StdError, sync::Arc};
+use std::{collections::VecDeque, error::Error as StdError, sync::Arc};
 
 pub trait ServiceFactory {
     type Future: HyperFuture<Item = Response<Body>, Error = Box<dyn StdError + Send + Sync>> + Send;
@@ -72,7 +72,7 @@ struct CreateResponse {
 type ResponseResult = Result<Response<Body>, Box<dyn StdError + Send + Sync>>;
 
 impl FlowService {
-    pub fn new(pool: Arc<RwLock<Pool>>) -> Self {
+    fn new(pool: Arc<RwLock<Pool>>) -> Self {
         FlowService { pool }
     }
 
@@ -144,15 +144,25 @@ impl FlowService {
         }
 
         let mut body_stream = body.compat();
-        let mut buffer = bytes::Bytes::with_capacity(65536 * 2);
+        let mut chunks = VecDeque::new();
+        let mut size = 0;
         while let Some(Ok(chunk)) = body_stream.next().await {
-            buffer.extend_from_slice(&chunk.into_bytes());
-            while buffer.len() >= 65536 {
-                let data = buffer.split_to(65536);
+            let mut chunk = chunk.into_bytes();
+            while size + chunk.len() > 65536 {
+                if size < 65536 {
+                    let front_chunk = chunk.split_to(65536 - size);
+                    chunks.push_back(front_chunk);
+                }
+                size = 0;
+                chunks = flow.push(chunks).await.unwrap();
+            }
+            if chunk.len() > 0 {
+                size += chunk.len();
+                chunks.push_back(chunk);
             }
         }
-        if buffer.len() > 0 {
-            
+        if chunks.len() > 0 {
+            flow.push(chunks).await.unwrap();
         }
 
         Ok(Response::new(Body::empty()))
@@ -163,7 +173,21 @@ impl FlowService {
             Some(flow) => flow,
             None => return Ok(Self::response_status(StatusCode::NOT_FOUND)),
         };
-        Ok(Response::new(Body::empty()))
+        let stream = futures::stream::unfold(
+            (0, flow, VecDeque::new()),
+            async move |(block_index, flow, chunks)| {
+                let (block_index, mut chunks) = if chunks.len() == 0 {
+                    (block_index + 1, flow.pull(block_index).await.unwrap())
+                } else {
+                    (block_index, chunks)
+                };
+                Some((
+                    Ok::<hyper::Chunk, std::io::Error>(chunks.pop_front().unwrap().into()),
+                    (block_index, flow, chunks),
+                ))
+            },
+        );
+        Ok(Response::new(Body::wrap_stream(stream.boxed().compat())))
     }
 
     async fn dispatch(self: Arc<Self>, req: Request<Body>) -> ResponseResult {

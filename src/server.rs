@@ -2,6 +2,8 @@ use super::service::ServiceFactory;
 use hyper::rt::{Future, Stream};
 use tokio::runtime::TaskExecutor;
 
+use futures::{compat::Future01CompatExt, FutureExt, StreamExt, TryFutureExt};
+
 pub fn spawn<T: 'static + ServiceFactory + Send>(
     executor: TaskExecutor,
     bind_addr: &std::net::SocketAddr,
@@ -13,6 +15,7 @@ pub fn spawn<T: 'static + ServiceFactory + Send>(
         .for_each({
             let executor = executor.clone();
             move |stream| {
+                stream.set_recv_buffer_size(65536).unwrap();
                 let http = hyper::server::conn::Http::new();
                 let service = service_factory.new_service();
                 executor.spawn(http.serve_connection(stream, service).map_err(|_| ()));
