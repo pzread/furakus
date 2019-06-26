@@ -181,9 +181,10 @@ impl FlowService {
         if flow.get_token() != token {
             return Ok(Self::response_status(StatusCode::NOT_FOUND));
         }
-        Self::push_loop(flow, body)
-            .await
-            .map(|_| Response::new(Body::empty()))
+        Self::push_loop(flow.clone(), body).await.map(move |_| {
+            flow.close();
+            Response::new(Body::empty())
+        })
     }
 
     async fn pull_generator(

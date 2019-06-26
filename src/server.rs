@@ -17,8 +17,6 @@ pub fn spawn<T: 'static + ServiceFactory + Send>(
                 stream
                     .set_keepalive(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
-                stream.set_send_buffer_size(65536).unwrap();
-                stream.set_recv_buffer_size(65536).unwrap();
                 let http = hyper::server::conn::Http::new();
                 let service = service_factory.new_service();
                 executor.spawn(http.serve_connection(stream, service).map_err(|_| ()));

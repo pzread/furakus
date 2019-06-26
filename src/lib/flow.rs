@@ -5,7 +5,7 @@ use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use ring::{self, rand::SecureRandom};
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 const EMPTY_BLOCK_INDEX: u64 = std::u64::MAX;
@@ -13,9 +13,10 @@ const RING_BUFFER_LENGTH: u64 = 16;
 
 #[derive(Debug)]
 pub enum Error {
-    Occupied,
-    Invalid,
+    Closed,
     Dropped,
+    Invalid,
+    NotReady,
 }
 
 impl std::fmt::Display for Error {
@@ -36,10 +37,15 @@ struct Block {
     waits: Vec<oneshot::Sender<()>>,
 }
 
+const BUFFER_STATE_IDLE: u8 = 0;
+const BUFFER_STATE_PUSHING: u8 = 1;
+const BUFFER_STATE_CLOSING: u8 = 2;
+
 struct Buffer {
     ring_buffer: Vec<RwLock<Block>>,
     next_index: AtomicU64,
-    push_state: AtomicBool,
+    length: AtomicUsize,
+    state: AtomicU8,
 }
 
 impl Buffer {
@@ -55,8 +61,13 @@ impl Buffer {
         Buffer {
             ring_buffer,
             next_index: AtomicU64::new(0),
-            push_state: AtomicBool::new(false),
+            length: AtomicUsize::new(0),
+            state: AtomicU8::new(BUFFER_STATE_IDLE),
         }
+    }
+
+    fn close(&self) {
+        self.state.store(BUFFER_STATE_CLOSING, Ordering::SeqCst);
     }
 
     async fn fetch_write_block(target: &RwLock<Block>) -> RwLockWriteGuard<Block> {
@@ -76,35 +87,44 @@ impl Buffer {
     }
 
     async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
-        if self.push_state.swap(true, Ordering::SeqCst) {
-            return Err(Error::Occupied);
+        if self
+            .state
+            .compare_and_swap(BUFFER_STATE_IDLE, BUFFER_STATE_PUSHING, Ordering::SeqCst)
+            != BUFFER_STATE_IDLE
+        {
+            return Err(Error::Invalid);
         }
         let block_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let position = (block_index % RING_BUFFER_LENGTH) as usize;
         let mut block = Self::fetch_write_block(&self.ring_buffer[position]).await;
         block.index = block_index;
         let new_chunks = std::mem::replace::<VecDeque<Bytes>>(&mut block.chunks, chunks);
+        self.length.fetch_add(1, Ordering::SeqCst);
         while block.waits.len() > 0 {
             #[allow(unused_must_use)]
             {
                 block.waits.pop().unwrap().send(());
             }
         }
-        self.push_state.store(false, Ordering::SeqCst);
+        self.state
+            .compare_and_swap(BUFFER_STATE_PUSHING, BUFFER_STATE_IDLE, Ordering::SeqCst);
         Ok(new_chunks)
     }
 
     async fn fetch_read_block(
         target: &RwLock<Block>,
         block_index: u64,
-    ) -> Option<RwLockUpgradableReadGuard<Block>> {
+        nonblocking: bool,
+    ) -> Result<RwLockUpgradableReadGuard<Block>, Error> {
         loop {
             let rx = {
                 let block = target.upgradable_read();
                 if block.index == block_index {
-                    return Some(block);
+                    return Ok(block);
                 } else if block.index > block_index && block.index != EMPTY_BLOCK_INDEX {
-                    return None;
+                    return Err(Error::Dropped);
+                } else if nonblocking {
+                    return Err(Error::NotReady);
                 }
                 let (tx, rx) = oneshot::channel();
                 let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
@@ -119,16 +139,25 @@ impl Buffer {
         if block_index == EMPTY_BLOCK_INDEX {
             return Err(Error::Invalid);
         }
+        let is_closing = self.state.load(Ordering::SeqCst) == BUFFER_STATE_CLOSING;
         let position = (block_index % RING_BUFFER_LENGTH) as usize;
-        let block = match Self::fetch_read_block(&self.ring_buffer[position], block_index).await {
-            Some(block) => block,
-            None => return Err(Error::Dropped),
+        let block = match Self::fetch_read_block(
+            &self.ring_buffer[position],
+            block_index,
+            is_closing,
+        )
+        .await
+        {
+            Ok(block) => block,
+            Err(Error::NotReady) => return Err(Error::Closed),
+            Err(err) => return Err(err),
         };
         let chunks = block.chunks.clone();
         {
             let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
             block.index = EMPTY_BLOCK_INDEX;
             block.chunks.clear();
+            self.length.fetch_sub(1, Ordering::SeqCst);
             while block.waits.len() > 0 {
                 #[allow(unused_must_use)]
                 {
@@ -174,5 +203,9 @@ impl Flow {
 
     pub async fn pull(&self, block_index: u64) -> Result<VecDeque<Bytes>, Error> {
         self.buffer.pull(block_index).await
+    }
+
+    pub fn close(&self) {
+        self.buffer.close()
     }
 }
