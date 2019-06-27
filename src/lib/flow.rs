@@ -1,8 +1,7 @@
-use byteorder::{ByteOrder, LittleEndian};
+use super::pool::Observer;
 use bytes::Bytes;
 use futures::channel::oneshot;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
-use ring::{self, rand::SecureRandom};
 use std::{
     collections::VecDeque,
     sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -37,19 +36,44 @@ struct Block {
     waits: Vec<oneshot::Sender<()>>,
 }
 
-const BUFFER_STATE_IDLE: u8 = 0;
-const BUFFER_STATE_PUSHING: u8 = 1;
-const BUFFER_STATE_CLOSING: u8 = 2;
+struct PushGuard<'a>(&'a AtomicU8);
 
-struct Buffer {
+impl<'a> PushGuard<'a> {
+    pub fn lock(flow: &Flow) -> Result<PushGuard, Error> {
+        if flow
+            .state
+            .compare_and_swap(FLOW_STATE_IDLE, FLOW_STATE_PUSHING, Ordering::SeqCst)
+            != FLOW_STATE_IDLE
+        {
+            return Err(Error::NotReady);
+        }
+        Ok(PushGuard(&flow.state))
+    }
+}
+
+impl<'a> Drop for PushGuard<'a> {
+    fn drop(&mut self) {
+        self.0
+            .compare_and_swap(FLOW_STATE_PUSHING, FLOW_STATE_IDLE, Ordering::SeqCst);
+    }
+}
+
+const FLOW_STATE_IDLE: u8 = 0;
+const FLOW_STATE_PUSHING: u8 = 1;
+const FLOW_STATE_CLOSING: u8 = 2;
+
+pub struct Flow {
+    id: u128,
+    token: u128,
+    state: AtomicU8,
+    observer: Observer,
     ring_buffer: Vec<RwLock<Block>>,
     next_index: AtomicU64,
     length: AtomicUsize,
-    state: AtomicU8,
 }
 
-impl Buffer {
-    fn new() -> Self {
+impl Flow {
+    pub fn new(id: u128, token: u128, observer: Observer) -> Self {
         let mut ring_buffer = Vec::new();
         for _ in 0..RING_BUFFER_LENGTH {
             ring_buffer.push(RwLock::new(Block {
@@ -58,134 +82,14 @@ impl Buffer {
                 waits: Vec::new(),
             }));
         }
-        Buffer {
+        Flow {
+            id,
+            token,
+            state: AtomicU8::new(FLOW_STATE_IDLE),
+            observer,
             ring_buffer,
             next_index: AtomicU64::new(0),
             length: AtomicUsize::new(0),
-            state: AtomicU8::new(BUFFER_STATE_IDLE),
-        }
-    }
-
-    fn close(&self) {
-        self.state.store(BUFFER_STATE_CLOSING, Ordering::SeqCst);
-    }
-
-    async fn fetch_write_block(target: &RwLock<Block>) -> RwLockWriteGuard<Block> {
-        let rx = {
-            let mut block = target.write();
-            if block.index == EMPTY_BLOCK_INDEX {
-                return block;
-            }
-            let (tx, rx) = oneshot::channel();
-            block.waits.push(tx);
-            rx
-        };
-        rx.await.unwrap();
-        let block = target.write();
-        assert_eq!(block.index, EMPTY_BLOCK_INDEX);
-        block
-    }
-
-    async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
-        if self
-            .state
-            .compare_and_swap(BUFFER_STATE_IDLE, BUFFER_STATE_PUSHING, Ordering::SeqCst)
-            != BUFFER_STATE_IDLE
-        {
-            return Err(Error::Invalid);
-        }
-        let block_index = self.next_index.fetch_add(1, Ordering::SeqCst);
-        let position = (block_index % RING_BUFFER_LENGTH) as usize;
-        let mut block = Self::fetch_write_block(&self.ring_buffer[position]).await;
-        block.index = block_index;
-        let new_chunks = std::mem::replace::<VecDeque<Bytes>>(&mut block.chunks, chunks);
-        self.length.fetch_add(1, Ordering::SeqCst);
-        while block.waits.len() > 0 {
-            #[allow(unused_must_use)]
-            {
-                block.waits.pop().unwrap().send(());
-            }
-        }
-        self.state
-            .compare_and_swap(BUFFER_STATE_PUSHING, BUFFER_STATE_IDLE, Ordering::SeqCst);
-        Ok(new_chunks)
-    }
-
-    async fn fetch_read_block(
-        target: &RwLock<Block>,
-        block_index: u64,
-        nonblocking: bool,
-    ) -> Result<RwLockUpgradableReadGuard<Block>, Error> {
-        loop {
-            let rx = {
-                let block = target.upgradable_read();
-                if block.index == block_index {
-                    return Ok(block);
-                } else if block.index > block_index && block.index != EMPTY_BLOCK_INDEX {
-                    return Err(Error::Dropped);
-                } else if nonblocking {
-                    return Err(Error::NotReady);
-                }
-                let (tx, rx) = oneshot::channel();
-                let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
-                block.waits.push(tx);
-                rx
-            };
-            rx.await.unwrap();
-        }
-    }
-
-    async fn pull(&self, block_index: u64) -> Result<VecDeque<Bytes>, Error> {
-        if block_index == EMPTY_BLOCK_INDEX {
-            return Err(Error::Invalid);
-        }
-        let is_closing = self.state.load(Ordering::SeqCst) == BUFFER_STATE_CLOSING;
-        let position = (block_index % RING_BUFFER_LENGTH) as usize;
-        let block = match Self::fetch_read_block(
-            &self.ring_buffer[position],
-            block_index,
-            is_closing,
-        )
-        .await
-        {
-            Ok(block) => block,
-            Err(Error::NotReady) => return Err(Error::Closed),
-            Err(err) => return Err(err),
-        };
-        let chunks = block.chunks.clone();
-        {
-            let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
-            block.index = EMPTY_BLOCK_INDEX;
-            block.chunks.clear();
-            self.length.fetch_sub(1, Ordering::SeqCst);
-            while block.waits.len() > 0 {
-                #[allow(unused_must_use)]
-                {
-                    block.waits.pop().unwrap().send(());
-                }
-            }
-        }
-        Ok(chunks)
-    }
-}
-
-pub struct Flow {
-    id: u128,
-    token: u128,
-    buffer: Buffer,
-}
-
-impl Flow {
-    pub fn new() -> Self {
-        let rand = ring::rand::SystemRandom::new();
-        let mut id_buf = [0u8; 16];
-        rand.fill(&mut id_buf).unwrap();
-        let mut token_buf = [0u8; 16];
-        rand.fill(&mut token_buf).unwrap();
-        Flow {
-            id: LittleEndian::read_u128(&id_buf),
-            token: LittleEndian::read_u128(&token_buf),
-            buffer: Buffer::new(),
         }
     }
 
@@ -198,14 +102,105 @@ impl Flow {
     }
 
     pub async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
-        self.buffer.push(chunks).await
+        let _push_guard = PushGuard::lock(self)?;
+        let block_index = self.next_index.fetch_add(1, Ordering::SeqCst);
+        let new_chunks = {
+            let mut block = self.fetch_write_block(block_index).await?;
+            block.index = block_index;
+            let new_chunks = std::mem::replace::<VecDeque<Bytes>>(&mut block.chunks, chunks);
+            self.length.fetch_add(1, Ordering::SeqCst);
+            while block.waits.len() > 0 {
+                #[allow(unused_must_use)]
+                {
+                    block.waits.pop().unwrap().send(());
+                }
+            }
+            new_chunks
+        };
+        Ok(new_chunks)
     }
 
     pub async fn pull(&self, block_index: u64) -> Result<VecDeque<Bytes>, Error> {
-        self.buffer.pull(block_index).await
+        if block_index == EMPTY_BLOCK_INDEX {
+            return Err(Error::Invalid);
+        }
+        let chunks = {
+            let block = self.fetch_read_block(block_index).await?;
+            let chunks = block.chunks.clone();
+            let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
+            block.index = EMPTY_BLOCK_INDEX;
+            block.chunks.clear();
+            self.length.fetch_sub(1, Ordering::SeqCst);
+            self.check_and_notify_closed();
+            assert!(block.waits.len() <= 1);
+            block.waits.pop().map(|tx| tx.send(()));
+            chunks
+        };
+        Ok(chunks)
     }
 
     pub fn close(&self) {
-        self.buffer.close()
+        self.state.store(FLOW_STATE_CLOSING, Ordering::SeqCst);
+        for block in self.ring_buffer.iter() {
+            block.write().waits.clear();
+        }
+        self.check_and_notify_closed();
+    }
+
+    fn is_closing(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == FLOW_STATE_CLOSING
+    }
+
+    fn check_and_notify_closed(&self) {
+        if self.length.load(Ordering::SeqCst) == 0 {
+            if self.is_closing() {
+                self.observer.on_close();
+            }
+        }
+    }
+
+    async fn fetch_write_block(&self, block_index: u64) -> Result<RwLockWriteGuard<Block>, Error> {
+        let target = &self.ring_buffer[(block_index % RING_BUFFER_LENGTH) as usize];
+        let rx = {
+            let mut block = target.write();
+            if self.is_closing() {
+                return Err(Error::Closed);
+            } else if block.index == EMPTY_BLOCK_INDEX {
+                return Ok(block);
+            }
+            let (tx, rx) = oneshot::channel();
+            block.waits.push(tx);
+            rx
+        };
+        rx.await.map_err(|_| Error::Closed)?;
+        let block = target.write();
+        assert_eq!(block.index, EMPTY_BLOCK_INDEX);
+        Ok(block)
+    }
+
+    async fn fetch_read_block(
+        &self,
+        block_index: u64,
+    ) -> Result<RwLockUpgradableReadGuard<Block>, Error> {
+        let target = &self.ring_buffer[(block_index % RING_BUFFER_LENGTH) as usize];
+        loop {
+            let rx = {
+                let block = target.upgradable_read();
+                if block.index == block_index {
+                    return Ok(block);
+                } else if block.index > block_index && block.index != EMPTY_BLOCK_INDEX {
+                    return Err(Error::Dropped);
+                } else if self.is_closing() {
+                    return Err(Error::Closed);
+                }
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
+                    block.waits.push(tx);
+                }
+                rx
+            };
+            rx.await.map_err(|_| Error::Closed)?;
+        }
     }
 }

@@ -1,5 +1,8 @@
 use super::{
-    lib::{flow::Flow, pool::Pool},
+    lib::{
+        flow::Flow,
+        pool::{Pool, SharedPool},
+    },
     utils,
 };
 use byteorder::{ByteOrder, LittleEndian};
@@ -10,7 +13,6 @@ use hyper::{
     StatusCode,
 };
 use lazy_static::lazy_static;
-use parking_lot::RwLock;
 use regex::Regex;
 use serde::Serialize;
 use std::{collections::VecDeque, error::Error as StdError, sync::Arc};
@@ -31,14 +33,12 @@ pub trait ServiceFactory {
 }
 
 pub struct FlowServiceFactory {
-    pool: Arc<RwLock<Pool>>,
+    pool: SharedPool,
 }
 
 impl FlowServiceFactory {
     pub fn new() -> Self {
-        FlowServiceFactory {
-            pool: Arc::new(RwLock::new(Pool::new())),
-        }
+        FlowServiceFactory { pool: Pool::new() }
     }
 }
 
@@ -66,7 +66,7 @@ impl HyperService for FlowServiceWrapper {
 }
 
 struct FlowService {
-    pool: Arc<RwLock<Pool>>,
+    pool: SharedPool,
 }
 
 #[derive(Serialize, Debug)]
@@ -80,7 +80,7 @@ type ResponseResult = Result<Response<Body>, BoxError>;
 type PullGeneratorState = (Arc<Flow>, u64, VecDeque<Bytes>);
 
 impl FlowService {
-    fn new(pool: Arc<RwLock<Pool>>) -> Self {
+    fn new(pool: SharedPool) -> Self {
         FlowService { pool }
     }
 
@@ -166,7 +166,7 @@ impl FlowService {
             Some(query) => query,
             None => return Ok(Self::response_status(StatusCode::BAD_REQUEST)),
         };
-        let token = match url::form_urlencoded::parse(query.as_bytes())
+        let flow_token = match url::form_urlencoded::parse(query.as_bytes())
             .find(|&(ref key, _)| key == "token")
             .ok_or(())
             .and_then(|(_, token)| Self::decode_key(&token))
@@ -178,7 +178,7 @@ impl FlowService {
             Some(flow) => flow,
             None => return Ok(Self::response_status(StatusCode::NOT_FOUND)),
         };
-        if flow.get_token() != token {
+        if flow.get_token() != flow_token {
             return Ok(Self::response_status(StatusCode::NOT_FOUND));
         }
         Self::push_loop(flow.clone(), body).await.map(move |_| {
