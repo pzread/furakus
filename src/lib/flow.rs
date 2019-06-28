@@ -4,11 +4,14 @@ use futures::channel::oneshot;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::{
     collections::VecDeque,
-    sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
 };
 
 const EMPTY_BLOCK_INDEX: u64 = std::u64::MAX;
-const RING_BUFFER_LENGTH: u64 = 16;
+const BUFFER_LENGTH: u64 = 16;
+const BUFFER_STATE_OPEN: u8 = 0;
+const BUFFER_STATE_CLOSING: u8 = 1;
+const BUFFER_STATE_CLOSED: u8 = 2;
 
 #[derive(Debug)]
 pub enum Error {
@@ -36,73 +39,58 @@ struct Block {
     waits: Vec<oneshot::Sender<()>>,
 }
 
-struct PushGuard<'a>(&'a AtomicU8);
+struct PushGuard<'a>(&'a AtomicBool);
 
 impl<'a> PushGuard<'a> {
-    pub fn lock(flow: &Flow) -> Result<PushGuard, Error> {
-        if flow
-            .state
-            .compare_and_swap(FLOW_STATE_IDLE, FLOW_STATE_PUSHING, Ordering::SeqCst)
-            != FLOW_STATE_IDLE
+    fn lock(buffer: &Buffer) -> Result<PushGuard, Error> {
+        if !buffer.is_open() {
+            return Err(Error::Closed);
+        }
+        if buffer
+            .pushing
+            .compare_and_swap(false, true, Ordering::SeqCst)
         {
             return Err(Error::NotReady);
         }
-        Ok(PushGuard(&flow.state))
+        Ok(PushGuard(&buffer.pushing))
     }
 }
 
 impl<'a> Drop for PushGuard<'a> {
     fn drop(&mut self) {
-        self.0
-            .compare_and_swap(FLOW_STATE_PUSHING, FLOW_STATE_IDLE, Ordering::SeqCst);
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
-const FLOW_STATE_IDLE: u8 = 0;
-const FLOW_STATE_PUSHING: u8 = 1;
-const FLOW_STATE_CLOSING: u8 = 2;
-
-pub struct Flow {
-    id: u128,
-    token: u128,
+struct Buffer {
     state: AtomicU8,
-    observer: Observer,
-    ring_buffer: Vec<RwLock<Block>>,
-    next_index: AtomicU64,
+    pushing: AtomicBool,
+    buffer: Vec<RwLock<Block>>,
     length: AtomicUsize,
+    next_index: AtomicU64,
 }
 
-impl Flow {
-    pub fn new(id: u128, token: u128, observer: Observer) -> Self {
-        let mut ring_buffer = Vec::new();
-        for _ in 0..RING_BUFFER_LENGTH {
-            ring_buffer.push(RwLock::new(Block {
+impl Buffer {
+    fn new() -> Self {
+        let mut buffer = Vec::new();
+        for _ in 0..BUFFER_LENGTH {
+            buffer.push(RwLock::new(Block {
                 index: EMPTY_BLOCK_INDEX,
                 chunks: VecDeque::new(),
                 waits: Vec::new(),
             }));
         }
-        Flow {
-            id,
-            token,
-            state: AtomicU8::new(FLOW_STATE_IDLE),
-            observer,
-            ring_buffer,
-            next_index: AtomicU64::new(0),
+        Buffer {
+            state: AtomicU8::new(BUFFER_STATE_OPEN),
+            pushing: AtomicBool::new(false),
             length: AtomicUsize::new(0),
+            buffer,
+            next_index: AtomicU64::new(0),
         }
     }
 
-    pub fn get_id(&self) -> u128 {
-        self.id
-    }
-
-    pub fn get_token(&self) -> u128 {
-        self.token
-    }
-
-    pub async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
-        let _push_guard = PushGuard::lock(self)?;
+    async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
+        let _guard = PushGuard::lock(self)?;
         let block_index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let new_chunks = {
             let mut block = self.fetch_write_block(block_index).await?;
@@ -130,8 +118,10 @@ impl Flow {
             let mut block = parking_lot::RwLockUpgradableReadGuard::upgrade(block);
             block.index = EMPTY_BLOCK_INDEX;
             block.chunks.clear();
-            self.length.fetch_sub(1, Ordering::SeqCst);
-            self.check_and_notify_closed();
+            let length = self.length.fetch_sub(1, Ordering::SeqCst) - 1;
+            if !self.is_open() && length == 0 {
+                self.state.store(BUFFER_STATE_CLOSED, Ordering::SeqCst);
+            }
             assert!(block.waits.len() <= 1);
             block.waits.pop().map(|tx| tx.send(()));
             chunks
@@ -140,30 +130,28 @@ impl Flow {
     }
 
     pub fn close(&self) {
-        self.state.store(FLOW_STATE_CLOSING, Ordering::SeqCst);
-        for block in self.ring_buffer.iter() {
+        self.state.store(BUFFER_STATE_CLOSING, Ordering::SeqCst);
+        for block in self.buffer.iter() {
             block.write().waits.clear();
         }
-        self.check_and_notify_closed();
-    }
-
-    fn is_closing(&self) -> bool {
-        self.state.load(Ordering::SeqCst) == FLOW_STATE_CLOSING
-    }
-
-    fn check_and_notify_closed(&self) {
         if self.length.load(Ordering::SeqCst) == 0 {
-            if self.is_closing() {
-                self.observer.on_close();
-            }
+            self.state.store(BUFFER_STATE_CLOSED, Ordering::SeqCst);
         }
+    }
+
+    fn is_open(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == BUFFER_STATE_OPEN
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == BUFFER_STATE_CLOSED
     }
 
     async fn fetch_write_block(&self, block_index: u64) -> Result<RwLockWriteGuard<Block>, Error> {
-        let target = &self.ring_buffer[(block_index % RING_BUFFER_LENGTH) as usize];
+        let target = &self.buffer[(block_index % BUFFER_LENGTH) as usize];
         let rx = {
             let mut block = target.write();
-            if self.is_closing() {
+            if !self.is_open() {
                 return Err(Error::Closed);
             } else if block.index == EMPTY_BLOCK_INDEX {
                 return Ok(block);
@@ -182,7 +170,7 @@ impl Flow {
         &self,
         block_index: u64,
     ) -> Result<RwLockUpgradableReadGuard<Block>, Error> {
-        let target = &self.ring_buffer[(block_index % RING_BUFFER_LENGTH) as usize];
+        let target = &self.buffer[(block_index % BUFFER_LENGTH) as usize];
         loop {
             let rx = {
                 let block = target.upgradable_read();
@@ -190,7 +178,7 @@ impl Flow {
                     return Ok(block);
                 } else if block.index > block_index && block.index != EMPTY_BLOCK_INDEX {
                     return Err(Error::Dropped);
-                } else if self.is_closing() {
+                } else if !self.is_open() {
                     return Err(Error::Closed);
                 }
                 let (tx, rx) = oneshot::channel();
@@ -201,6 +189,51 @@ impl Flow {
                 rx
             };
             rx.await.map_err(|_| Error::Closed)?;
+        }
+    }
+}
+
+pub struct Flow {
+    id: u128,
+    token: u128,
+    observer: Observer,
+    buffer: Buffer,
+}
+
+impl Flow {
+    pub fn new(id: u128, token: u128, observer: Observer) -> Self {
+        Flow {
+            id,
+            token,
+            observer,
+            buffer: Buffer::new(),
+        }
+    }
+
+    pub fn get_id(&self) -> u128 {
+        self.id
+    }
+
+    pub fn get_token(&self) -> u128 {
+        self.token
+    }
+
+    pub async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
+        self.buffer.push(chunks).await
+    }
+
+    pub async fn pull(&self, block_index: u64) -> Result<VecDeque<Bytes>, Error> {
+        let ret = self.buffer.pull(block_index).await;
+        if self.buffer.is_closed() {
+            self.observer.on_close();
+        }
+        ret
+    }
+
+    pub fn close(&self) {
+        self.buffer.close();
+        if self.buffer.is_closed() {
+            self.observer.on_close();
         }
     }
 }

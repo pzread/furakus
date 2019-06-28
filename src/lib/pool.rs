@@ -57,7 +57,6 @@ impl Pool {
         };
         let flow = Arc::new(Flow::new(flow_id, flow_token, observer));
         self.pool.insert(flow.get_id(), flow.clone());
-        println!("{}", self.pool.len());
         Some(flow)
     }
 
