@@ -37,12 +37,12 @@ pub struct FlowServiceFactory {
 }
 
 impl FlowServiceFactory {
-    pub fn new() -> Self {
-        FlowServiceFactory { pool: Pool::new() }
+    pub fn new() -> Arc<Self> {
+        Arc::new(FlowServiceFactory { pool: Pool::new() })
     }
 }
 
-impl ServiceFactory for FlowServiceFactory {
+impl ServiceFactory for Arc<FlowServiceFactory> {
     type Service = FlowServiceWrapper;
     type Future = <Self::Service as HyperService>::Future;
 
@@ -115,7 +115,7 @@ impl FlowService {
     }
 
     async fn handle_create(&self) -> ResponseResult {
-        let flow = match self.pool.write().create() {
+        let flow = match Pool::create(&self.pool) {
             Some(flow) => flow,
             None => return Ok(Self::response_status(StatusCode::SERVICE_UNAVAILABLE)),
         };
@@ -174,7 +174,7 @@ impl FlowService {
             Ok(token) => token,
             Err(_) => return Ok(Self::response_status(StatusCode::BAD_REQUEST)),
         };
-        let flow = match self.pool.read().get(flow_id) {
+        let flow = match self.pool.get(flow_id) {
             Some(flow) => flow,
             None => return Ok(Self::response_status(StatusCode::NOT_FOUND)),
         };
@@ -205,7 +205,7 @@ impl FlowService {
     }
 
     async fn handle_pull(&self, flow_id: u128) -> ResponseResult {
-        let flow = match self.pool.read().get(flow_id) {
+        let flow = match self.pool.get(flow_id) {
             Some(flow) => flow,
             None => return Ok(Self::response_status(StatusCode::NOT_FOUND)),
         };

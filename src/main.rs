@@ -5,6 +5,7 @@ extern crate bytes;
 extern crate futures;
 extern crate hyper;
 extern crate lazy_static;
+extern crate owning_ref;
 extern crate parking_lot;
 extern crate regex;
 extern crate ring;
@@ -18,7 +19,6 @@ mod utils;
 use hyper::rt::Future;
 
 fn main() {
-    let service_factory = service::FlowServiceFactory::new();
     let runner = tokio::runtime::Builder::new()
         .core_threads(2)
         .build()
@@ -26,7 +26,7 @@ fn main() {
     server::spawn(
         runner.executor(),
         &"127.0.0.1:3000".parse().unwrap(),
-        service_factory,
+        service::FlowServiceFactory::new(),
     );
     runner.shutdown_on_idle().wait().unwrap();
 }

@@ -219,11 +219,18 @@ impl Flow {
     }
 
     pub async fn push(&self, chunks: VecDeque<Bytes>) -> Result<VecDeque<Bytes>, Error> {
-        self.buffer.push(chunks).await
+        let ret = self.buffer.push(chunks).await;
+        if ret.is_ok() {
+            self.observer.on_update();
+        }
+        ret
     }
 
     pub async fn pull(&self, block_index: u64) -> Result<VecDeque<Bytes>, Error> {
         let ret = self.buffer.pull(block_index).await;
+        if ret.is_ok() {
+            self.observer.on_update();
+        }
         if self.buffer.is_closed() {
             self.observer.on_close();
         }

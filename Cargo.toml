@@ -7,9 +7,10 @@ edition = "2018"
 [dependencies]
 byteorder = "1"
 bytes = "0.4"
-futures-preview = { version = "=0.3.0-alpha.16", features = ["async-await", "compat", "nightly"] }
+futures-preview = { version = "=0.3.0-alpha.17", features = ["async-await", "compat", "nightly"] }
 hyper = "0.12"
 lazy_static = "1"
+owning_ref = "0.4"
 parking_lot = "0.8"
 regex = "1"
 ring = "0.14"
